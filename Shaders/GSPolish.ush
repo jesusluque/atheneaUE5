@@ -37,6 +37,11 @@ struct FGSSurface
 	float MaterialRoughness;
 	float Metallic;
 	float3 Albedo;
+	// athenea: what of the body passes (transmission), whether it is a thin
+	// wall's, and the cloud's index of refraction (0: none).
+	float Transmission;
+	bool ThinWalled;
+	float Ior;
 };
 
 FGSSurface GSReadSurface(uint SplatIndex, float3 Albedo)
@@ -58,6 +63,11 @@ FGSSurface GSReadSurface(uint SplatIndex, float3 Albedo)
 	s.MaterialRoughness = GSResources.TransferSurface[b + 18];
 	s.Metallic = saturate(GSResources.TransferMetallic[SplatIndex]);
 	s.Albedo = Albedo;
+	// Slot 19: the transmission, plus 2 for a thin wall.
+	const float Passing = GSResources.TransferSurface[b + 19];
+	s.ThinWalled = Passing >= 1.5f;
+	s.Transmission = saturate(s.ThinWalled ? Passing - 2.0f : Passing);
+	s.Ior = GSResources.GlassIor;
 	return s;
 }
 

@@ -201,8 +201,16 @@ else.
   698 791 nodes in 233 pages) is a paged tree: every block a page of leaves
   and merges together, no chunks. Its `TREE` section counts each node's
   children; the decoder reads it and draws a merge at no opacity, so the
-  leaves alone are seen, until the levels are read. Its units are not metres
-  (the head is 2.2 units across): the level scales the actor by 100. At
+  leaves alone are seen, until the levels are read. Its two arrays of one
+  word are cut from the run of whole rows the writer lays down (a node's
+  page and its first child's place with count, side by side), so node e's
+  word w is that run's word 2e + w. Read as two columns, half the merges
+  counted no children, and in the whole pawn the coarse ones -- 1 to 2 cm
+  across a 4 cm piece, at 0.99 opacity -- stood behind it as a tilted quad
+  and a white ellipse. Its units are metres,
+  and the piece is small: a chess pawn's head, 2.2 cm across, so a camera
+  framing it came within UE's 10 cm near plane and drew nothing; the level
+  scales the actor by 100 (this note first called the units wrong). At
   degree 0 a v3 header says one harmonic word, as v2's dummy word; the first
   check refused it.
 - **A TX cloud from the web's file.** The sections are described once (their
@@ -419,6 +427,17 @@ upper half 1.051); its v2 keeps no curvature and stays at the residual's
 (1.085). `GPUTime` 11.84 ms against 12.07 ms with the residual off: inside
 the run-to-run noise.
 
+**Glass.** A TX cloud's glass came out opaque in UE: the plugin read no
+transmission. athenea's raster lens is ported as it is (`lensExit`,
+`lensExitThrough`, `lensFarReflection`, `transmittedRoughness`, the solid
+glass's branch and the body as `body2`), with the transmission and the
+thin-wall bit in the surface's spare slot and the index a value of the cloud.
+The dragon's crystal -- surfels with no mesh, baked by athenea's new
+`splat-transfer` -- draws in UE as the light lilac glass athenea's raster
+draws from the same camera. A thin wall is drawn at its file's opacity with
+its base polish scaled by athenea's `thinWallGain`; no thin-wall TX cloud
+was at hand to measure it against athenea's frame.
+
 Two mistakes first: the curvature primvar has three values a gaussian and
 was read with the one-a-gaussian reader, which dropped it (debug view 6 shows
 which condition holds); and a version 3 block grew by the `CURV` section to
@@ -488,17 +507,43 @@ file's bytes kept, a kernel a format to decode them (`GSDecodeSplatCS`,
   Interchange; dropped into the Content Browser, which of the two UE asks
   first has not been checked (the scripts name the factory).
 
+**The web scene's `.athz`.** What the web publishes is a zip of a scene and
+its `.athc` clouds, so with `.athc` v3 read, the scene is a loop over its
+files: each cloud through the same reader, the sky through UE's own HDR
+import. A UE import makes one asset, so the first cloud is the asset asked
+for and the rest are created beside it. The published pawn (`athenea-pawn.athz`,
+455 MB: two body pieces of 1.78 M nodes each, the top of 0.70 M, CPCA
+transfers, error-band pages) imports in one go, and relights under its sky.
+What it shows past the pawn (a large tilted quad and a white ellipse behind
+it) is not understood yet: probably merged nodes of the body pieces that are
+drawn when they should be hidden.
+
+**athenea's `.athz`, decoded in UE.** The decoder is athenea's
+(`athz_decode.slangh`, `athz_tables.slang`), ported to HLSL as it is: a group
+of 256 threads is eight runs of 32 lanes, each plane's rANS table in group
+memory, the lanes renormalising from one stream of words through a mask, the
+prefix transforms summed along a run, the parent transforms read from the
+level above. Its output is a `.athc` chunk's arrays in the scratch, so the
+splats then go through the version 3 decoders with one more encoding (4: the
+words are in the scratch already), the transfer included. The pawn's top
+(`top.athz`, version 3, 292 056 gaussians, 7 merged levels, 129 pages,
+transfer of 112 values) against its USD source (`M_Pawn_Top_W.usdc`) under
+the same sky: mean difference 0.0019 in a frame whose highlights reach 7; the
+`.athz` carries the reflected field the USD here does not. The merged levels
+are decoded only as the splats' parents.
+
 ## 13. Not done
 
-- **Transfer (TX), past the opaque polish:** a slope across a splat for the
-  lobes that are not sharp (athenea's `slopeX`, `slopeY`), a fold's widening
-  (its `bakeSpread`), a v2 file's curvature, analytic lights, glass and thin walls, the zonal transfer of skinned
+- **Transfer (TX), past the opaque polish:** a thin wall measured against
+  athenea's frame, a slope across a splat for the lobes that are not sharp (athenea's `slopeX`, `slopeY`), a fold's widening
+  (its `bakeSpread`), a v2 file's curvature, analytic lights, the zonal transfer of skinned
   clouds, and a real-time sky capture.
 - **`.athc` levels and streaming.** The merged levels, the per-frame cut and
   chunk streaming; the normals, emission and extras. In version 3 the
   curvature, the occlusion codebook, a zonal transfer, the skin and the
   compact tier; a paged tree's merges are decoded and hidden, not left out.
-- **Other formats.** `.athv` (HEVC video), `.athz` and `.athl` (the web's);
+- **Other formats.** `.athv` (HEVC video), `.athl` (the web's light layers),
+  an `.athz`'s CPCA transfer and its curvature;
   an SPZ's coordinate-system extension; a glTF node's transform, more than one
   gaussian primitive, sparse accessors and `EXT_meshopt_compression`.
 - **The ParticleField's transform** (a rotation would have to turn the

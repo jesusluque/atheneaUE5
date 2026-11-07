@@ -1,0 +1,435 @@
+// Copyright (c) 2026 jesus luque.
+//
+// athenea's .athz (lod/Athz.h on athenea's athz branch): a cloud with its levels
+// of detail in pages a GPU decodes. Versions 2 to 4 (version 1 is version 2
+// with no transforms, and is read as such).
+//
+//   [0]      header, 64 bytes: 'ATHZ', version, flags, layers, counts, the
+//            tables' offsets
+//   [asset]  the cloud's layout and bounds, its levels, each plane's coding
+//            for the two kinds (merged groups, splats), the rANS frequencies,
+//            where each layer's section is
+//   [pages]  64 bytes a page: count and band, its box and error, each layer's
+//            offset and bytes in its section, a CRC-32
+//
+// The CPU copies the pages' coded bytes (layers G and A, and T where the
+// transfer is lossless) and writes what says where they are: the page list,
+// the planes, the frequencies, a descriptor a level. The GPU expands the
+// tables, decodes every level coarsest first into Scratch -- a word may be
+// coded against its parent group -- and the cloud's splats last, laid out as a
+// .athc chunk's arrays, which the version 3 decoders read as encoding 4
+// (GSDecode.usf, GSAthzDecodeCS). The merged levels are decoded only as the
+// splats' parents: what is drawn is the splats. A CPCA layer T (its id and
+// weights) and layer K (a rig) are not read; neither is the curvature. The
+// header's and the pages' CRCs are checked before anything is decoded.
+
+#include "GSplatImporter.h"
+#include "GSplatImportData.h"
+
+#if WITH_EDITOR
+
+#include "GaussianData.h"
+#include "GaussiansEditorModule.h"
+#include "Misc/Crc.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
+
+namespace GSplatAthz
+{
+	struct FReader
+	{
+		const uint8* At;
+		const uint8* End;
+		bool bOk = true;
+		template <typename T> T Get()
+		{
+			T v{};
+			if (At + sizeof(T) > End)
+			{
+				bOk = false;
+				return v;
+			}
+			FMemory::Memcpy(&v, At, sizeof(T));
+			At += sizeof(T);
+			return v;
+		}
+	};
+	template <typename T> T GetAt(const TArray<uint8>& b, int64 At)
+	{
+		T v{};
+		FMemory::Memcpy(&v, &b[At], sizeof(T));
+		return v;
+	}
+	constexpr uint32 kFlagTransfer = 1, kFlagLinear = 8, kFlagEmission = 32;
+	constexpr uint32 kLayerG = 1, kLayerA = 2, kLayerT = 4;
+	constexpr uint32 kNone = 0xFFFFFFFFu;
+	constexpr uint32 kLevelWords = 40;
+	// The Athc3 descriptors (GSDecode.usf): section order and block size.
+	constexpr uint32 kSections = 9;
+	constexpr uint32 kBlockWords = 32;
+	constexpr uint32 kScratchWords = 4;   // encoding 4: the words are in Scratch already
+}
+
+bool GSplatImporter::ImportAthzCloud(const FString& Filename, UGSplatImportData& ImportData, FGaussianSplatData& Splats)
+{
+	using namespace GSplatAthz;
+	auto Fail = [&](const FString& Why)
+	{
+		UE_LOG(LogGSplatEditor, Error, TEXT("%s: %s"), *Filename, *Why);
+		return false;
+	};
+	TArray<uint8> File;
+	if (!FFileHelper::LoadFileToArray(File, *Filename))
+	{
+		return Fail(TEXT("cannot be read."));
+	}
+	if (File.Num() < 4096 || FMemory::Memcmp(File.GetData(), "ATHZ", 4) != 0)
+	{
+		return Fail(TEXT("no ATHZ header."));
+	}
+	// Every CRC is zlib's CRC-32 over the bytes as stored (FCrc::MemCrc32 is
+	// the same): the header's own over its first 60 bytes, and each page's
+	// over its layers' bytes in layer order. A corrupt or cut file is
+	// refused, never decoded.
+	if (FCrc::MemCrc32(File.GetData(), 60) != GetAt<uint32>(File, 60))
+	{
+		return Fail(TEXT("its header is corrupt (its CRC-32 does not match)."));
+	}
+	const uint16 Version = GetAt<uint16>(File, 4);
+	const uint32 Flags = GetAt<uint32>(File, 8), LayerMask = GetAt<uint32>(File, 12);
+	const uint64 Gaussians = GetAt<uint64>(File, 16);
+	const uint32 PageCount = GetAt<uint32>(File, 24);
+	const uint16 RunGaussians = GetAt<uint16>(File, 28), PageRuns = GetAt<uint16>(File, 30);
+	const uint64 AssetOffset = GetAt<uint64>(File, 32);
+	const uint32 AssetBytes = GetAt<uint32>(File, 40);
+	const uint64 PageTable = GetAt<uint64>(File, 44);
+	if (Version < 1 || Version > 4 || RunGaussians == 0 || RunGaussians % 32 != 0 || RunGaussians > 256 || PageRuns == 0
+		|| AssetOffset + AssetBytes > uint64(File.Num()) || PageTable + uint64(PageCount) * 64 > uint64(File.Num()))
+	{
+		return Fail(FString::Printf(TEXT("an ATHZ header this does not read (version %u)."), Version));
+	}
+
+	// The asset table, as athenea's decodeAsset reads it.
+	FReader R{ File.GetData() + AssetOffset, File.GetData() + AssetOffset + AssetBytes };
+	R.Get<uint32>();   // size
+	const uint32 Kinds = R.Get<uint32>(), Planes = R.Get<uint32>(), TableLog = R.Get<uint32>(), Tables = R.Get<uint32>();
+	const uint32 LevelCount = R.Get<uint32>(), Count = R.Get<uint32>(), FinestGroups = R.Get<uint32>();
+	const uint32 ChunkSplats = R.Get<uint32>(), RestPerColour = R.Get<uint32>(), SHWords = R.Get<uint32>();
+	const uint32 Normals = R.Get<uint32>() != 0 ? 1u : 0u, Emission = R.Get<uint32>() != 0 ? 1u : 0u;
+	const uint32 PbrWords = R.Get<uint32>(), LobesWords = R.Get<uint32>(), TransferCount = R.Get<uint32>();
+	const uint32 TransferWords = R.Get<uint32>(), ShadowWords = R.Get<uint32>();
+	uint32 CurvatureWords = 0, CodedTransferWords = 0, InfluenceWords = 0, GradientWords = 0;
+	if (Version >= 3)
+	{
+		CurvatureWords = R.Get<uint32>();
+		CodedTransferWords = R.Get<uint32>();
+		R.Get<uint32>(); R.Get<uint32>(); R.Get<float>(); R.Get<uint64>(); R.Get<uint64>();   // CPCA
+	}
+	if (Version >= 4)
+	{
+		InfluenceWords = R.Get<uint32>();
+		GradientWords = R.Get<uint32>();
+		R.Get<uint32>(); R.Get<uint32>(); R.Get<uint64>(); R.Get<uint64>();   // layer K
+	}
+	float BoundsLo[3], Extent, BoundsMin[3], BoundsMax[3];
+	for (float& v : BoundsLo) v = R.Get<float>();
+	Extent = R.Get<float>();
+	for (float& v : BoundsMin) v = R.Get<float>();
+	for (float& v : BoundsMax) v = R.Get<float>();
+	R.Get<uint64>();   // asset id
+	uint64 SectionOffset[4], SectionBytes[4];
+	for (uint64& v : SectionOffset) v = R.Get<uint64>();
+	for (uint64& v : SectionBytes) v = R.Get<uint64>();
+	R.Get<uint64>(); R.Get<uint64>();   // the finest level's starts
+	struct FLevel { uint32 Level, Groups, FirstPage, Pages; };
+	TArray<FLevel> Levels;
+	for (uint32 l = 0; l < LevelCount && l < 31; l++)
+	{
+		FLevel E;
+		E.Level = R.Get<uint32>(); E.Groups = R.Get<uint32>(); E.FirstPage = R.Get<uint32>(); E.Pages = R.Get<uint32>();
+		Levels.Add(E);
+	}
+	TArray<uint32> PlaneEntries;
+	PlaneEntries.SetNumUninitialized(int32(2 * Planes * 4));
+	for (uint32& v : PlaneEntries) v = R.Get<uint32>();
+	TArray<uint16> Frequencies;
+	Frequencies.SetNumUninitialized(int32(Tables * 256));
+	for (uint16& v : Frequencies) v = R.Get<uint16>();
+	const bool bCpca = CodedTransferWords != 0;
+	const uint32 CodedTransfer = bCpca ? CodedTransferWords : TransferWords;
+	const uint32 Words = 4 + 4 + SHWords + 1 + Normals + Emission + PbrWords + LobesWords + CodedTransfer + ShadowWords
+		+ CurvatureWords + InfluenceWords + GradientWords;
+	if (!R.bOk || Kinds != 2 || LevelCount == 0 || LevelCount > 30 || Count == 0 || uint64(Count) != Gaussians
+		|| Planes != 4 * Words || TableLog < 9 || TableLog > 12 || ChunkSplats != uint32(RunGaussians) * PageRuns
+		|| SHWords == 0 || SHWords > 64 || RunGaussians / 32 > 8)
+	{
+		return Fail(TEXT("an asset table that does not add up."));
+	}
+	if (Version < 2)
+	{
+		for (int32 p = 0; p < PlaneEntries.Num(); p += 4)
+		{
+			PlaneEntries[p + 3] = 0;   // version 1: no transforms
+		}
+	}
+	const uint32 LeafFirstPage = Levels.Last().FirstPage + Levels.Last().Pages;
+	const uint32 LeafPages = (Count + ChunkSplats - 1) / ChunkSplats;
+	if (PageCount < LeafFirstPage + LeafPages)
+	{
+		return Fail(TEXT("a prefix of its bands: the splats' pages are not all in the file."));
+	}
+
+	// The layers decoded: geometry and appearance, the transfer where it is
+	// lossless; and which carry a rANS plane, by kind.
+	const bool bTransfer = (Flags & kFlagTransfer) != 0 && !bCpca && TransferWords > 0;
+	const uint32 Layers = kLayerG | kLayerA | (bTransfer ? kLayerT : 0u);
+	uint32 HasRans[2] = { 0, 0 };
+	for (uint32 k = 0; k < 2; k++)
+	{
+		for (uint32 p = 0; p < Planes; p++)
+		{
+			const uint32 E = PlaneEntries[(k * Planes + p) * 4];
+			if ((E & 0xFF) == 1)
+			{
+				HasRans[k] |= 1u << (E >> 24);
+			}
+		}
+	}
+
+	// The scratch: the expanded tables, then every level's arrays and the
+	// splats', each array contiguous, in the fields' order.
+	const uint32 FieldWords[13] = { 4, 4, SHWords, 1, Normals, Emission, PbrWords, LobesWords, CodedTransfer, ShadowWords,
+		CurvatureWords, InfluenceWords, GradientWords };
+	uint64 Scratch = uint64(Tables) << TableLog << 2;
+	TArray<TArray<uint32>> FieldBases;
+	auto Lay = [&](uint32 N)
+	{
+		TArray<uint32> Bases;
+		for (uint32 f = 0; f < 13; f++)
+		{
+			Bases.Add(uint32(Scratch));
+			Scratch += uint64(N) * FieldWords[f] * 4;
+		}
+		return Bases;
+	};
+	for (const FLevel& L : Levels)
+	{
+		FieldBases.Add(Lay(L.Groups));
+	}
+	FieldBases.Add(Lay(Count));
+	if (Scratch > 0xFFFFFFF0ull)
+	{
+		return Fail(TEXT("more than 4 GB to decode into."));
+	}
+
+	// The bytes the device reads: the frequencies, the planes, the page list,
+	// the pages' coded bytes, a descriptor a level, the header, the Athc3
+	// descriptors.
+	TArray<uint8> Bytes;
+	auto Align4 = [&]() { Bytes.SetNumZeroed(Align(Bytes.Num(), 4)); };
+	const uint32 FreqAt = uint32(Bytes.Num());
+	Bytes.Append(reinterpret_cast<const uint8*>(Frequencies.GetData()), Frequencies.Num() * 2);
+	Align4();
+	const uint32 PlanesAt = uint32(Bytes.Num());
+	Bytes.Append(reinterpret_cast<const uint8*>(PlaneEntries.GetData()), PlaneEntries.Num() * 4);
+	// The pages: every level's, then the splats', in the file's order.
+	TArray<uint32> PageList;
+	TArray<uint8> Source;
+	for (uint32 Page = 0; Page < LeafFirstPage + LeafPages; Page++)
+	{
+		const int64 E = int64(PageTable) + int64(Page) * 64;
+		const uint32 Info0 = GetAt<uint32>(File, E);
+		uint32 First = 0;
+		if (Page >= LeafFirstPage)
+		{
+			First = (Page - LeafFirstPage) * ChunkSplats;
+		}
+		else
+		{
+			for (const FLevel& L : Levels)
+			{
+				if (Page >= L.FirstPage && Page < L.FirstPage + L.Pages)
+				{
+					First = (Page - L.FirstPage) * ChunkSplats;
+				}
+			}
+		}
+		uint32 Crc = 0;
+		for (uint32 L = 0; L < 4; L++)
+		{
+			const uint32 Offset = GetAt<uint32>(File, E + 24 + L * 4), Size = GetAt<uint32>(File, E + 40 + L * 4);
+			if (((LayerMask >> L) & 1u) == 0)
+			{
+				continue;
+			}
+			if (SectionOffset[L] + Offset + Size > uint64(File.Num()))
+			{
+				return Fail(FString::Printf(TEXT("page %u runs past the file."), Page));
+			}
+			Crc = FCrc::MemCrc32(File.GetData() + SectionOffset[L] + Offset, int32(Size), Crc);
+		}
+		if (Crc != GetAt<uint32>(File, E + 56))
+		{
+			return Fail(FString::Printf(TEXT("page %u is corrupt (its CRC-32 does not match)."), Page));
+		}
+		uint32 Src[4] = { kNone, kNone, kNone, kNone };
+		for (uint32 L = 0; L < 4; L++)
+		{
+			const uint32 Offset = GetAt<uint32>(File, E + 24 + L * 4), Size = GetAt<uint32>(File, E + 40 + L * 4);
+			if (((Layers >> L) & 1u) == 0 || ((LayerMask >> L) & 1u) == 0 || Size == 0)
+			{
+				continue;
+			}
+			if (SectionOffset[L] + Offset + Size > uint64(File.Num()))
+			{
+				return Fail(FString::Printf(TEXT("page %u runs past the file."), Page));
+			}
+			Src[L] = uint32(Source.Num());
+			Source.Append(File.GetData() + SectionOffset[L] + Offset, Size);
+			Source.SetNumZeroed(Align(Source.Num(), 4));
+		}
+		PageList.Append({ Src[0], Src[1], Src[2], Src[3], First, Info0 & 0xFFFF, 0u, 0u });
+	}
+	Align4();
+	const uint32 PageListAt = uint32(Bytes.Num());
+	Bytes.Append(reinterpret_cast<const uint8*>(PageList.GetData()), PageList.Num() * 4);
+	const uint32 SourceAt = uint32(Bytes.Num());
+	Bytes.Append(Source);
+	Source.Empty();
+	File.Empty();
+	Align4();
+	// A descriptor a level, then the splats': kind, first page, pages, the
+	// parents' count, leaves, 0, the level's bases, the parents' bases.
+	TArray<uint32> LevelWords;
+	for (int32 l = 0; l <= Levels.Num(); l++)
+	{
+		const bool bLeaves = l == Levels.Num();
+		TArray<uint32> D;
+		D.SetNumZeroed(kLevelWords);
+		D[0] = bLeaves ? 1u : 0u;
+		D[1] = bLeaves ? LeafFirstPage : Levels[l].FirstPage;
+		D[2] = bLeaves ? LeafPages : Levels[l].Pages;
+		D[3] = l > 0 ? Levels[l - 1].Groups : 0u;
+		D[4] = bLeaves ? 1u : 0u;
+		for (uint32 f = 0; f < 13; f++)
+		{
+			D[6 + f] = FieldBases[l][f];
+			D[19 + f] = l > 0 ? FieldBases[l - 1][f] : 0u;
+		}
+		LevelWords.Append(D);
+	}
+	const uint32 LevelsAt = uint32(Bytes.Num());
+	Bytes.Append(reinterpret_cast<const uint8*>(LevelWords.GetData()), LevelWords.Num() * 4);
+	// The fields decoded: everything but the curvature and layer K.
+	uint32 Bound = 0;
+	for (uint32 f = 0; f <= 9; f++)
+	{
+		Bound |= 1u << f;
+	}
+	if (!bTransfer)
+	{
+		Bound &= ~((1u << 8) | (1u << 9));
+	}
+	const uint32 Head[27] = { Tables, TableLog, Planes, Layers, HasRans[0], HasRans[1], 8 + SHWords,
+		SHWords, Normals, Emission, PbrWords, LobesWords, CodedTransfer, ShadowWords, CurvatureWords, InfluenceWords, GradientWords,
+		RunGaussians, PageRuns, FreqAt, PlanesAt, PageListAt, SourceAt, LevelsAt, uint32(Levels.Num()) + 1, 0u, Bound };
+	const uint32 HeadAt = uint32(Bytes.Num());
+	Bytes.Append(reinterpret_cast<const uint8*>(Head), sizeof(Head));
+
+	// The splats as a .athc v3 block whose sections are in Scratch.
+	const TArray<uint32>& Leaf = FieldBases.Last();
+	uint32 Desc[kSections][8];
+	FMemory::Memzero(Desc);
+	auto Set = [&](uint32 k, uint32 W, std::initializer_list<uint32> Arrays)
+	{
+		Desc[k][0] = W > 0 ? 1u : 0u;
+		Desc[k][1] = W;
+		uint32 a = 4;
+		for (const uint32 x : Arrays)
+		{
+			if (x > 0 && a < 8)
+			{
+				Desc[k][a++] = x;
+			}
+		}
+	};
+	const uint32 Material = Normals + Emission + PbrWords + LobesWords;
+	Set(0, 8, { 4, 4 });
+	Set(1, SHWords, { SHWords });
+	Set(3, Material, { Normals, Emission, PbrWords, LobesWords });
+	if (bTransfer)
+	{
+		Set(4, ShadowWords, { ShadowWords });
+		Set(5, TransferWords, { TransferWords });
+	}
+	TArray<uint32> Block;
+	Block.SetNumZeroed(kBlockWords);
+	Block[0] = 0;
+	Block[1] = Count;
+	auto Section = [&](uint32 k, uint32 Base)
+	{
+		Block[2 + k * 3] = 0;
+		Block[3 + k * 3] = kScratchWords;
+		Block[4 + k * 3] = Base;
+	};
+	for (uint32 k = 0; k < kSections; k++)
+	{
+		Block[2 + k * 3] = kNone;
+	}
+	Section(0, Leaf[0]);              // positions, then shape
+	Section(1, Leaf[2]);              // harmonics
+	Section(3, Leaf[4]);              // normals, emission, pbr, lobes
+	Section(4, Leaf[9]);              // open directions
+	Section(5, Leaf[8]);              // the transfer
+	const uint32 TableAt = uint32(Bytes.Num());
+	Bytes.Append(reinterpret_cast<const uint8*>(Desc), sizeof(Desc));
+	Bytes.Append(reinterpret_cast<const uint8*>(Block.GetData()), Block.Num() * 4);
+
+	ImportData.Swizzle = { EGSplatSwizzleAxis::X, EGSplatSwizzleAxis::Z, EGSplatSwizzleAxis::Y };
+	ImportData.ScaleFactor = 100.0f;
+	ImportData.bApplyGammaCorrection = (Flags & kFlagLinear) == 0;
+	ImportData.NumSplats = int32(Count);
+	ImportData.bHasHighOrderSH = RestPerColour > 0;
+	ImportData.bHasNormals = false;
+	ImportData.bHasMetallicRoughness = false;
+
+	Splats.Empty();
+	Splats.bPacked = true;
+	Splats.PackedFormat = 6;
+	Splats.SplatCount = Count;
+	Splats.bHasHighOrderSH = ImportData.bHasHighOrderSH && ImportData.bImportHighOrderSH;
+	Splats.PackedUnitsToCm = ImportData.ScaleFactor;
+	Splats.PackedBytes = MoveTemp(Bytes);
+	// The .athc flags the decoders read (normals bit 0, linear 1, emission 2, material 4, transfer 5).
+	const uint32 AthcFlags = (Normals ? 1u : 0u) | ((Flags & kFlagLinear) ? 2u : 0u) | (Emission ? 4u : 0u)
+		| (PbrWords > 0 ? 16u : 0u) | (bTransfer ? 32u : 0u);
+	Splats.PackedStreams = { TableAt, 1u, SHWords, Splats.bHasHighOrderSH ? RestPerColour : 0u,
+		uint32(Scratch), bTransfer ? TransferCount : 0u, AthcFlags, 0u };
+	Splats.PackedSpz = FIntVector(int32(HeadAt), 0, 0);
+	const uint32 Direct = (TransferCount == 9 || TransferCount == 36 || TransferCount == 84) ? 9u
+		: (TransferCount == 16 || TransferCount == 64 || TransferCount == 112) ? 16u : 0u;
+	if (bTransfer && Direct > 0)
+	{
+		Splats.bHasTransfer = true;
+		Splats.TransferDirectCount = Direct;
+		Splats.CellWords = (ShadowWords == 8 || ShadowWords == 32) ? ShadowWords : 0u;
+		Splats.bPackedTransferField = Direct == 16 && TransferCount == 112;
+		Splats.FileUnitsToCm = 100.0f;
+	}
+	const TArray<EGSplatSwizzleAxis>& Swizzle = ImportData.Swizzle;
+	Splats.FileAxisX = SwizzleVector(1.0f, 0.0f, 0.0f, Swizzle);
+	Splats.FileAxisY = SwizzleVector(0.0f, 1.0f, 0.0f, Swizzle);
+	Splats.FileAxisZ = SwizzleVector(0.0f, 0.0f, 1.0f, Swizzle);
+	Splats.bLinearizeColor = ImportData.bApplyGammaCorrection;
+	FBox Box(ForceInit);
+	Box += FVector(SwizzleVector(BoundsMin[0], BoundsMin[1], BoundsMin[2], Swizzle) * ImportData.ScaleFactor);
+	Box += FVector(SwizzleVector(BoundsMax[0], BoundsMax[1], BoundsMax[2], Swizzle) * ImportData.ScaleFactor);
+	Splats.SetBounds(FBoxSphereBounds(Box));
+
+	UE_LOG(LogGSplatEditor, Display, TEXT("%s: %u gaussians, .athz version %u, %d merged levels decoded as their parents, %u pages, transfer %s, CRCs checked; the curvature not read."),
+		*Filename, Count, Version, Levels.Num(), LeafFirstPage + LeafPages,
+		bTransfer ? *FString::Printf(TEXT("of %u values"), TransferCount) : bCpca ? TEXT("CPCA, not read") : TEXT("none"));
+	return true;
+}
+
+#endif // WITH_EDITOR

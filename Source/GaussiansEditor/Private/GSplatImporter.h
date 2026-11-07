@@ -33,6 +33,16 @@ namespace GSplatImporter
 	bool IsSogFile(const FString& Filename);
 	bool ImportSog(const FString& Filename, UGSplatImportData& ImportData, FGaussianSplatData& Splats);
 
+	// athenea: a zip's entries by name (stored or deflated, no zip64; GSplatSogImporter.cpp).
+	bool ReadZip(const TArray<uint8>& Zip, TMap<FString, TArray<uint8>>& Out, FString& Why);
+
+	// athenea: a .athz -- the web's scene (a zip: scene.json, its clouds as
+	// .athc, its sky) or athenea's paged cloud ('ATHZ'); GSplatSceneImporter.cpp.
+	bool IsAthzFile(const FString& Filename);
+	bool IsAthzScene(const FString& Filename);
+	bool ImportAthzScene(const FString& Filename, UObject* InParent, FName InName, EObjectFlags Flags, class UGSplatAsset& First);
+	bool ImportAthzCloud(const FString& Filename, UGSplatImportData& ImportData, FGaussianSplatData& Splats);
+
 	// athenea: glTF with KHR_gaussian_splatting, .glb or .gltf (GSplatGltfImporter.cpp).
 	bool IsGltfFile(const FString& Filename);
 	bool GltfHasSplats(const FString& Filename);

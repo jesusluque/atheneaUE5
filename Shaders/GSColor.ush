@@ -186,6 +186,96 @@ float GSSunReflectPdf(float3 Mirror, float3 ToSun, float Roughness, float DiscHa
 	return a2 / (PI * d * d) * 0.25f;
 }
 
+// THE GLASS, as athenea's raster draws a TX glass (splat_relight's lensExit,
+// lensExitThrough, lensFarReflection, transmittedRoughness and the solid
+// glass's lens): the near face bends the eye's ray in, the far face is
+// guessed from the near one's curvature (a sphere of that radius), and what
+// leaves is the sky along the bent way out where the reflected field says
+// the way through is open, the field itself where something stands there.
+float3 GSRefractDir(float3 i, float3 n, float eta)
+{
+	const float c = dot(-i, n);
+	const float k = 1.0f - eta * eta * (1.0f - c * c);
+	return k < 0.0f ? float3(0.0f, 0.0f, 0.0f) : eta * i + (eta * c - sqrt(k)) * n;
+}
+
+float3 GSLensExit(FGSSurface s, float3 n, float3 wo, float Curvature)
+{
+	const float Index = max(s.Ior, 1.0f);
+	const float3 Inside = GSRefractDir(-wo, n, 1.0f / Index);
+	if (!(dot(Inside, Inside) > 1.0e-8f) || !(Curvature > 1.0e-6f))
+	{
+		return -wo;
+	}
+	const float3 t1 = normalize(Inside);
+	const float Radius = 1.0f / Curvature;
+	const float Chord = 2.0f * Radius * max(dot(t1, -n), 0.0f);
+	const float3 FarNormal = normalize(t1 * (Chord / Radius) + n);
+	const float3 Out = GSRefractDir(t1, -FarNormal, Index);
+	return dot(Out, Out) > 1.0e-8f ? normalize(Out) : reflect(t1, -FarNormal);
+}
+
+float3 GSLensExitThrough(FGSSurface s, float3 n, float3 wo, float Curvature)
+{
+	const float3 Tint = lerp(float3(1.0f, 1.0f, 1.0f), saturate(s.Albedo), s.Transmission);
+	const float Index = max(s.Ior, 1.0f);
+	const float3 Inside = GSRefractDir(-wo, n, 1.0f / Index);
+	if (!(dot(Inside, Inside) > 1.0e-8f))
+	{
+		return Tint;
+	}
+	const float3 t1 = normalize(Inside);
+	float3 FarNormal = -n;
+	if (Curvature > 1.0e-6f)
+	{
+		const float Radius = 1.0f / Curvature;
+		const float Chord = 2.0f * Radius * max(dot(t1, -n), 0.0f);
+		FarNormal = normalize(t1 * (Chord / Radius) + n);
+	}
+	const float3 Out = GSRefractDir(t1, -FarNormal, Index);
+	if (!(dot(Out, Out) > 1.0e-8f))
+	{
+		return Tint;
+	}
+	return (1.0f - GSFresnelDielectric(saturate(dot(t1, FarNormal)), 1.0f / Index)) * Tint;
+}
+
+float3 GSLensFarReflection(FGSSurface s, float3 n, float3 wo, float Curvature)
+{
+	const float Index = max(s.Ior, 1.0f);
+	const float3 Inside = GSRefractDir(-wo, n, 1.0f / Index);
+	if (!(Curvature > 1.0e-6f) || !(dot(Inside, Inside) > 1.0e-8f))
+	{
+		return float3(0.0f, 0.0f, 0.0f);
+	}
+	const float3 t1 = normalize(Inside);
+	const float Radius = 1.0f / Curvature;
+	const float Chord = 2.0f * Radius * max(dot(t1, -n), 0.0f);
+	const float3 FarNormal = normalize(t1 * (Chord / Radius) + n);
+	const float3 r1 = reflect(t1, FarNormal);
+	const float3 ThirdNormal = normalize(r1 * (2.0f * max(dot(r1, -FarNormal), 0.0f)) + FarNormal);
+	const float3 Out = GSRefractDir(r1, -ThirdNormal, Index);
+	return dot(Out, Out) > 1.0e-8f ? normalize(Out) : float3(0.0f, 0.0f, 0.0f);
+}
+
+float GSTransmittedRoughness(float Roughness, float Ior)
+{
+	return Roughness * sqrt(saturate(0.70710678f * (max(Ior, 1.0f) - 1.0f)));
+}
+
+// The surface's mean curvature under a gaussian, on the face the eye sees
+// (half the shape operator's trace), 0 where the cloud keeps none.
+float GSMeanCurvature(uint SplatIndex, bool BackFacing)
+{
+	if (GSResources.HasCurvature == 0u)
+	{
+		return 0.0f;
+	}
+	const uint c = SplatIndex * 3u;
+	const float Mean = 0.5f * (GSResources.TransferCurvature[c] + GSResources.TransferCurvature[c + 2u]);
+	return BackFacing ? -Mean : Mean;
+}
+
 // A TX gaussian seen along d (the file's frame, from the eye): relitByDome's
 // opaque sum: the body under its layers, the polish of the base lobe and the
 // coat, each narrowed by the open directions and filled where they are closed
@@ -196,7 +286,8 @@ float3 GSTransferredRadiance(uint SplatIndex, float3 Albedo, float3 d)
 	FGSSurface s = GSReadSurface(SplatIndex, Albedo);
 	const float3 wo = -d;
 	float3 n = normalize(s.Normal);
-	n = dot(n, wo) < 0.0f ? -n : n;
+	const bool BackFacing = dot(n, wo) < 0.0f;
+	n = BackFacing ? -n : n;
 	const float NdotV = max(dot(n, wo), 1.0e-4f);
 	const float3 Mirror = reflect(d, n);
 
@@ -228,7 +319,52 @@ float3 GSTransferredRadiance(uint SplatIndex, float3 Albedo, float3 d)
 	const float3 Coupling = Field ? GSFieldCoupling(SplatIndex) : 0.0f;
 	const float Openness = GSOpenness(SplatIndex);
 
-	const float3 Body = Layers.Under * s.Albedo * (1.0f - s.Metallic) * Front;
+	// The glass (athenea's body2): what passes the near face, through the
+	// lens, and the far face's reflection, beside the opaque share.
+	const float Transmitted = s.ThinWalled ? 0.0f : s.Transmission;
+	float3 Through = 0.0f;
+	if (Transmitted > 0.0f)
+	{
+		const float Curvature = GSMeanCurvature(SplatIndex, BackFacing);
+		const float3 Bent = GSRefractDir(d, n, 1.0f / max(s.Ior, 1.0f));
+		float3 Behind = s.Ior > 1.0f && dot(Bent, Bent) > 1.0e-8f ? GSSkyRadiance(normalize(Bent), s.Roughness)
+		                                                         : GSSkyRadiance(d, 1.0f);
+		if (Field && s.Ior > 1.0f)
+		{
+			// A solid glass is a lens: the sharp sky through both faces where
+			// the field reads the way through open, the field coupled to the
+			// sky where it reads it closed.
+			const float3 White = GSFieldAlong(SplatIndex, d, s.Roughness);
+			const float3 Grey = float3(0.2126f, 0.7152f, 0.0722f);
+			const float FresnelIn = GSFresnelDielectric(saturate(NdotV), max(s.Ior, 1.0f));
+			const float3 TintIn = lerp(float3(1.0f, 1.0f, 1.0f), saturate(s.Albedo), s.Transmission);
+			const float Expected = max(dot((1.0f - FresnelIn) * (1.0f - FresnelIn) * TintIn * TintIn, Grey), 1.0e-3f);
+			const float Open = smoothstep(0.5f, 0.85f, saturate(dot(White, Grey) / Expected));
+			const float3 Sharp = Curvature > 0.0f
+				? GSSkyRadiance(GSLensExit(s, n, wo, Curvature), GSTransmittedRoughness(s.Roughness, s.Ior)) * GSLensExitThrough(s, n, wo, Curvature)
+				: Behind;
+			Behind = Open * Sharp + (1.0f - Open) * Coupling * White;
+		}
+		const float3 Passes = BackFacing && s.Ior > 1.0f ? 0.0f
+			: saturate(1.0f - GSEnvDielectricAt(s.Roughness, NdotV, s.SpecularIor) * s.SpecularWeight);
+		float3 FarSeen = GSSkyRadiance(Mirror, s.Roughness);
+		if (Curvature > 0.0f)
+		{
+			const float3 FarOut = GSLensFarReflection(s, n, wo, Curvature);
+			if (dot(FarOut, FarOut) > 0.5f)
+			{
+				FarSeen = GSSkyRadiance(FarOut, GSTransmittedRoughness(s.Roughness, s.Ior));
+			}
+		}
+		float3 FarFace = 0.0f;
+		if (!BackFacing && s.Ior > 1.0f)
+		{
+			const float r = GSFresnelDielectric(saturate(NdotV), s.Ior);
+			FarFace = (1.0f - r) * r * lerp(float3(1.0f, 1.0f, 1.0f), saturate(s.Albedo), s.Transmission) * (1.0f - r) * FarSeen;
+		}
+		Through = Transmitted * (Passes * Behind + FarFace);
+	}
+	const float3 Body = Layers.Under * s.Albedo * (1.0f - s.Metallic) * ((1.0f - s.Transmission) * Front + Through);
 
 	// The base lobe: the cells and the field only for a material rough enough
 	// (kPolishFieldRoughness); a smoother one is narrowed by the openness fit.
@@ -241,7 +377,13 @@ float3 GSTransferredRadiance(uint SplatIndex, float3 Albedo, float3 d)
 	const bool SunApart = HasSun && SkyResidualMips > 0.0f;
 	const float3 PolishSun = SunApart
 		? Irradiance * (SunShare * GSSunReflectPdf(Mirror, SunDirection, s.Roughness, SkySH[16].w)) : 0.0f;
-	const float3 Polish = Layers.Under * max(GSEnvironmentBrdf(s, NdotV)
+	// A thin wall's gaussians are drawn at what the sheet reflects head on
+	// (mesh2splat's coverage), so its reflection is scaled back up to the
+	// sheet's whole (athenea's thinWallGain), at its index or 1.5.
+	const float WallIor = s.Ior > 1.0f ? s.Ior : 1.5f;
+	const float WallR = (WallIor - 1.0f) / (WallIor + 1.0f);
+	const float Gain = s.ThinWalled ? 1.0f / max(WallR * WallR, 1.0e-3f) : 1.0f;
+	const float3 Polish = Gain * Layers.Under * max(GSEnvironmentBrdf(s, NdotV)
 		* (Narrowed * GSSkyRadiance(Mirror, s.Roughness) + (1.0f - Narrowed) * Closed + PolishSun), 0.0f);
 
 	// The coat: the cells wherever the cloud keeps them, and what its closed
@@ -296,7 +438,7 @@ float3 GSTransferredRadiance(uint SplatIndex, float3 Albedo, float3 d)
 			}
 			if (SharpPolish)
 			{
-				const float3 Brdf = Layers.Under * GSEnvironmentBrdf(s, NdotV);
+				const float3 Brdf = Gain * Layers.Under * GSEnvironmentBrdf(s, NdotV);
 				PolishW = Brdf * Narrowed;
 				Radiance -= PolishW * GSSkyRadiance(Mirror, s.Roughness);
 				if (SunApart)

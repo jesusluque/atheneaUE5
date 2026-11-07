@@ -37,6 +37,7 @@ public class GaussiansEditor: ModuleRules
             // athenea: gzip, zstd and WebP for .spz and .sog.
             "AtheneaCodecs",
             "Json",
+            "AssetTools",
         });
 
         bUseRTTI = true;

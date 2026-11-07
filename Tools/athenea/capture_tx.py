@@ -24,7 +24,7 @@ light.recapture_sky()
 rt = unreal.RenderingLibrary.create_render_target2d(world, 512, 512, unreal.TextureRenderTargetFormat.RTF_RGBA32F)
 cap = eas.spawn_actor_from_class(unreal.SceneCapture2D, cam.get_actor_location(), cam.get_actor_rotation())
 cc = cap.get_editor_property("capture_component2d")
-cc.set_editor_property("fov_angle", 38.66)
+cc.set_editor_property("fov_angle", cam.camera_component.get_editor_property("field_of_view"))   # the level camera's
 cc.set_editor_property("capture_source", unreal.SceneCaptureSource.SCS_FINAL_COLOR_HDR)
 cc.set_editor_property("texture_target", rt)
 cc.set_editor_property("capture_every_frame", True)

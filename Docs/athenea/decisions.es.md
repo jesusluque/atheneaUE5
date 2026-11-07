@@ -214,8 +214,17 @@ copia, nada más.
   paginado: cada bloque, una página de hojas y fusiones juntas, sin chunks. Su
   sección `TREE` cuenta los hijos de cada nodo; el decodificador la lee y
   dibuja una fusión sin opacidad, de modo que solo se ven las hojas, hasta que
-  se lean los niveles. Sus unidades no son metros (la cabeza mide 2,2 unidades
-  de ancho): el nivel escala el actor por 100. En el grado 0 una cabecera v3
+  se lean los niveles. Sus dos arrays de una palabra se cortan de la tira de
+  filas enteras que deja el escritor (la página de un nodo y el sitio de su
+  primer hijo con la cuenta, una junto a otra), así que la palabra w del nodo
+  e es la palabra 2e + w de esa tira. Leída como dos columnas, la mitad de
+  las fusiones no contaba hijos, y en el peón entero las gruesas -- de 1 a
+  2 cm sobre una pieza de 4 cm, con opacidad 0,99 -- quedaban detrás como un
+  cuadrilátero inclinado y una elipse blanca. Sus unidades son metros y la pieza es pequeña: la
+  cabeza de un peón de ajedrez, de 2,2 cm de ancho, así que una cámara que la
+  encuadraba quedaba dentro del plano cercano de 10 cm de UE y no dibujaba
+  nada; el nivel escala el actor por 100 (esta nota llamó primero mal a las
+  unidades). En el grado 0 una cabecera v3
   dice una palabra de armónicos, como la palabra ficticia de la v2; la primera
   comprobación la rechazó.
 - **Una nube TX desde el fichero de la web.** Las secciones se describen una
@@ -450,6 +459,18 @@ mitad superior 1,051); su v2 no conserva curvatura y se queda en la del
 residual (1,085). `GPUTime` 11,84 ms frente a 12,07 ms con el residual
 apagado: dentro del ruido entre ejecuciones.
 
+**Vidrio.** El vidrio de una nube TX salía opaco en UE: el plugin no leía la
+transmisión. La lente del raster de athenea se porta tal cual (`lensExit`,
+`lensExitThrough`, `lensFarReflection`, `transmittedRoughness`, la rama del
+vidrio sólido y el cuerpo como `body2`), con la transmisión y el bit de pared
+fina en la ranura libre de la superficie y el índice como un valor de la nube.
+El cristal del dragón -- surfels sin malla, horneados por el nuevo
+`splat-transfer` de athenea -- se dibuja en UE como el vidrio lila claro que
+dibuja el raster de athenea desde la misma cámara. Una pared fina se dibuja
+con la opacidad de su fichero y su pulido base escalado por el
+`thinWallGain` de athenea; no había a mano una nube TX con paredes finas para
+medirla contra el fotograma de athenea.
+
 Dos errores primero: la primvar de curvatura tiene tres valores por gaussiana
 y se leía con el lector de uno por gaussiana, que la descartaba (la vista de
 depuración 6 muestra qué condición se cumple); y un bloque de versión 3
@@ -524,21 +545,49 @@ bytes del fichero, y un kernel por formato los decodifica (`GSDecodeSplatCS`,
   Browser, cuál de los dos pregunta UE primero no se ha comprobado (los
   scripts nombran el factory).
 
+**El `.athz` de la escena web.** Lo que publica la web es un zip de una
+escena y sus nubes `.athc`, así que con `.athc` v3 leído, la escena es un
+bucle sobre sus ficheros: cada nube por el mismo lector, el cielo por el
+importador HDR propio de UE. Una importación de UE crea un solo asset, así que
+la primera nube es el asset pedido y las demás se crean a su lado. El pawn
+publicado (`athenea-pawn.athz`, 455 MB: dos piezas del cuerpo de 1,78 M nodos
+cada una, la parte superior de 0,70 M, transferencias CPCA, páginas de banda
+de error) se importa de una vez, y se reilumina bajo su cielo. Lo que muestra
+más allá del pawn (un cuadrado grande inclinado y una elipse blanca detrás) no
+se entiende todavía: probablemente son nodos fusionados de las piezas del
+cuerpo que se dibujan cuando deberían estar ocultos.
+
+**El `.athz` de athenea, decodificado en UE.** El decodificador es el de
+athenea (`athz_decode.slangh`, `athz_tables.slang`), portado a HLSL tal cual:
+un grupo de 256 hilos son ocho tandas de 32 carriles, la tabla rANS de cada
+plano en memoria de grupo, los carriles renormalizando desde un solo flujo de
+palabras mediante una máscara, las transformaciones de prefijo sumadas a lo
+largo de una tanda, las transformaciones de padre leídas del nivel superior. Su
+salida son los arrays de un chunk de `.athc` en el scratch, así que los splats
+pasan luego por los decodificadores de la versión 3 con una codificación más
+(4: las palabras ya están en el scratch), la transferencia incluida. La parte
+superior del peón (`top.athz`, versión 3, 292 056 gaussianas, 7 niveles
+fusionados, 129 páginas, transferencia de 112 valores) frente a su fuente USD
+(`M_Pawn_Top_W.usdc`) bajo el mismo cielo: diferencia media de 0,0019 en un
+frame cuyos brillos llegan a 7; el `.athz` lleva el campo reflejado que el USD
+de aquí no lleva. Los niveles fusionados se decodifican solo como padres de los
+splats.
+
 ## 13. Lo que no está hecho
 
-- **Transferencia (TX), más allá del pulido opaco:** una pendiente a lo largo
+- **Transferencia (TX), más allá del pulido opaco:** una pared fina medida
+  contra el fotograma de athenea, una pendiente a lo largo
   de un splat para los lóbulos que no son nítidos (`slopeX`, `slopeY` de
   athenea), el ensanchamiento de un pliegue (su `bakeSpread`), la curvatura de
-  un fichero v2, las luces analíticas, el vidrio y las paredes finas, la
-  transferencia zonal de las nubes con skinning, y una captura del cielo en
+  un fichero v2, las luces analíticas, la transferencia zonal de las nubes con skinning, y una captura del cielo en
   tiempo real.
 - **Niveles y streaming de `.athc`.** Los niveles fusionados, el corte por
   frame y el streaming de chunks; las normales, la emisión y los extras. En la
   versión 3 la curvatura, el codebook de oclusión, una transferencia zonal, el
   skin y el tier compacto; las fusiones de un árbol paginado se decodifican y
   se ocultan, no se omiten.
-- **Otros formatos.** `.athv` (vídeo HEVC), `.athz` y `.athl` (los de la
-  web); la extensión de sistema de coordenadas de un SPZ; la transformación de
+- **Otros formatos.** `.athv` (vídeo HEVC), `.athl` (las capas de luz de la
+  web), la transferencia CPCA de un `.athz` y su curvatura; la extensión de sistema de coordenadas de un SPZ; la transformación de
   un nodo de glTF, más de una primitiva de gaussianas, los accessors sparse y
   `EXT_meshopt_compression`.
 - **La transformación del ParticleField** (una rotación tendría que girar los

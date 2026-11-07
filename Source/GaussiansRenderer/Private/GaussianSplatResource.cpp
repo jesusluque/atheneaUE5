@@ -150,6 +150,31 @@ class FGSAthc3CpcaCS : public FGlobalShader
 };
 IMPLEMENT_GLOBAL_SHADER(FGSAthc3CpcaCS, "/Plugin/StarLightGS/GSDecode.usf", "GSAthc3CpcaCS", SF_Compute);
 
+// athenea: an .athz's tables and pages (GSDecode.usf's athz section).
+class FGSAthzTablesCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FGSAthzTablesCS);
+	SHADER_USE_PARAMETER_STRUCT(FGSAthzTablesCS, FGlobalShader);
+	using FParameters = FGSDecodeFileParameters;
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+};
+IMPLEMENT_GLOBAL_SHADER(FGSAthzTablesCS, "/Plugin/StarLightGS/GSDecode.usf", "GSAthzTablesCS", SF_Compute);
+
+class FGSAthzDecodeCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FGSAthzDecodeCS);
+	SHADER_USE_PARAMETER_STRUCT(FGSAthzDecodeCS, FGlobalShader);
+	using FParameters = FGSDecodeFileParameters;
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+};
+IMPLEMENT_GLOBAL_SHADER(FGSAthzDecodeCS, "/Plugin/StarLightGS/GSDecode.usf", "GSAthzDecodeCS", SF_Compute);
+
 // athenea: a .athc v3 TX cloud's streams into the transfer's buffers.
 class FGSDecodeAthc3TxCS : public FGlobalShader
 {
@@ -320,7 +345,8 @@ void FGaussianSplatResource::InitRHI(FRHICommandListBase& RHICmdList)
 		// A scratch the decoders may write words into before they read them: a
 		// .athc v3's delta-coded sections, summed (PackedStreams[4] bytes).
 		const TArray<uint32>& S = SplatData.PackedStreams;
-		const uint32 ScratchBytes = SplatData.PackedFormat == 5 && S.Num() > 4 ? S[4] : 0u;
+		const bool bAthc3 = SplatData.PackedFormat == 5 || SplatData.PackedFormat == 6;
+		const uint32 ScratchBytes = bAthc3 && S.Num() > 4 ? S[4] : 0u;
 		FBufferRHIRef ScratchBuffer;
 		FUnorderedAccessViewRHIRef ScratchUAV;
 		if (!bAthenea)
@@ -360,6 +386,30 @@ void FGaussianSplatResource::InitRHI(FRHICommandListBase& RHICmdList)
 			Parameters.OutSHAndOpacities = SHAndOpacitiesUAV;
 			Parameters.OutHighOrderSH = HighOrderSHUAV;
 			const FIntVector Groups(FMath::DivideAndRoundUp(FMath::Min(Batch, Count - Offset), 64u), 1, 1);
+			if (SplatData.PackedFormat == 6 && Offset == 0)
+			{
+				// An .athz: its tables, then each level coarsest first and its
+				// splats last, into the scratch the version 3 decoders read.
+				const uint32 HeadAt = uint32(SplatData.PackedSpz.X);
+				const uint32* Bytes = reinterpret_cast<const uint32*>(SplatData.PackedBytes.GetData());
+				const uint32 Tables = Bytes[HeadAt / 4], TableLog = Bytes[HeadAt / 4 + 1], PageRuns = Bytes[HeadAt / 4 + 18];
+				const uint32 LevelsAt = Bytes[HeadAt / 4 + 23], LevelCount = Bytes[HeadAt / 4 + 24];
+				Parameters.FractionalBits = HeadAt;
+				FComputeShaderUtils::Dispatch(Immediate, TShaderMapRef<FGSAthzTablesCS>(GetGlobalShaderMap(GMaxRHIFeatureLevel)), Parameters,
+					FIntVector(FMath::DivideAndRoundUp((Tables << TableLog), 256u), 1, 1));
+				Immediate.Transition(FRHITransitionInfo(ScratchUAV, ERHIAccess::UAVCompute, ERHIAccess::UAVCompute));
+				for (uint32 Level = 0; Level < LevelCount; Level++)
+				{
+					const uint32 Pages = Bytes[LevelsAt / 4 + Level * 40 + 2];
+					FGSDecodeFileParameters LevelParameters = Parameters;
+					LevelParameters.Offset = Level;
+					FComputeShaderUtils::Dispatch(Immediate, TShaderMapRef<FGSAthzDecodeCS>(GetGlobalShaderMap(GMaxRHIFeatureLevel)), LevelParameters,
+						FIntVector(FMath::DivideAndRoundUp(Pages * PageRuns, 8u), 1, 1));
+					Immediate.Transition(FRHITransitionInfo(ScratchUAV, ERHIAccess::UAVCompute, ERHIAccess::UAVCompute));
+				}
+				Parameters.Offset = Offset;
+				Parameters.FractionalBits = uint32(SplatData.PackedSpz.X);
+			}
 			if (!bScratchFilled)
 			{
 				// One group a block, a thread a word of a row.
@@ -374,7 +424,7 @@ void FGaussianSplatResource::InitRHI(FRHICommandListBase& RHICmdList)
 				FComputeShaderUtils::Dispatch(Immediate, TShaderMapRef<FGSAthc3CpcaCS>(GetGlobalShaderMap(GMaxRHIFeatureLevel)), Parameters, Groups);
 				Immediate.Transition(FRHITransitionInfo(ScratchUAV, ERHIAccess::UAVCompute, ERHIAccess::UAVCompute));
 			}
-			if (SplatData.PackedFormat == 5)
+			if (bAthc3)
 			{
 				FComputeShaderUtils::Dispatch(Immediate, TShaderMapRef<FGSDecodeAthc3CS>(GetGlobalShaderMap(GMaxRHIFeatureLevel)), Parameters, Groups);
 			}
@@ -398,7 +448,7 @@ void FGaussianSplatResource::InitRHI(FRHICommandListBase& RHICmdList)
 
 		// A .athc v3 TX cloud: its transfer, surface, cells and field written
 		// by the device into the buffers a USD TX cloud's arrays fill.
-		if (SplatData.PackedFormat == 5 && SplatData.bHasTransfer)
+		if ((SplatData.PackedFormat == 5 || SplatData.PackedFormat == 6) && SplatData.bHasTransfer)
 		{
 			const uint32 Stride = 4u * SplatData.TransferDirectCount;
 			FUnorderedAccessViewRHIRef TransferUAV, MetallicUAV, SurfaceUAV, CellsUAV, FieldUAV, CurvatureUAV;
@@ -483,7 +533,7 @@ void FGaussianSplatResource::InitRHI(FRHICommandListBase& RHICmdList)
 	// Uniform buffers do not allow null SRVs, has to point to a valid resource
 	NormalsBuffer = CreateBuffer(SplatData.Normals, TEXT("GaussianSplatsNormals"), SplatData.UseNormals());
 	MetallicRoughnessBuffer = CreateBuffer(SplatData.MetallicRoughness, TEXT("GaussianSplatMetallicRoughness"), SplatData.UseMetallicRoughness());
-	const bool bDeviceTransfer = SplatData.bPacked && SplatData.PackedFormat == 5 && SplatData.bHasTransfer;
+	const bool bDeviceTransfer = SplatData.bPacked && (SplatData.PackedFormat == 5 || SplatData.PackedFormat == 6) && SplatData.bHasTransfer;
 	if (bDeviceTransfer)
 	{
 		TransferBuffer = PackedTransfer;
@@ -529,6 +579,7 @@ void FGaussianSplatResource::InitRHI(FRHICommandListBase& RHICmdList)
 	Parameters.HasCurvature = (SplatData.bHasTransfer && (!SplatData.TransferCurvature.IsEmpty() || (bDeviceTransfer && SplatData.bPackedCurvature))) ? 1u : 0u;
 	Parameters.TransferCurvature = CurvatureBuffer.SRV;
 	Parameters.FileUnitsToCm = SplatData.FileUnitsToCm;
+	Parameters.GlassIor = SplatData.GlassIor;
 	Parameters.FileAxisX = SplatData.FileAxisX;
 	Parameters.FileAxisY = SplatData.FileAxisY;
 	Parameters.FileAxisZ = SplatData.FileAxisZ;

@@ -74,6 +74,8 @@ mediante **Import**, o desde Python con un `AssetImportTask`. Cada uno crea un
 | PLY 3DGS | `.ply` | sí, salvo en modo desatendido | el swizzle y la escala del diálogo; un PLY de athenea los indica en su comentario (4.2) | la opción de gamma del diálogo; un PLY de athenea lo indica | `f_rest_0..44`, grado 3 | arrays float |
 | ParticleField USD | `.usd` `.usda` `.usdc` | no | el `upAxis` y el `metersPerUnit` del stage | sRGB salvo que `primvars:athenea:splat:linear` sea true | `radiance:sphericalHarmonicsCoefficients`, grado 0 a 3 | arrays float |
 | nube por chunks de athenea | `.athc` (versiones 1 y 2, las de athenea; 3, la de la web) | no | los de athenea: y arriba, metros | sRGB salvo con el bit de flag 1 (lineal) | los coeficientes rest del fichero (0 a 15 por color) | el empaquetado de athenea, decodificado en la GPU |
+| nube paginada de athenea | `.athz` cuya cabecera es `ATHZ` (versiones 1 a 4) | no | los de athenea: y arriba, metros | sRGB salvo que sus flags digan lineal | los coeficientes rest del fichero | sus páginas codificadas, decodificadas en la GPU al cargar (cada nivel fusionado como padre de los splats) |
+| escena web de athenea | `.athz` que es un zip (`scene.json`, sus nubes como `.athc`, su cielo) | no | los de athenea: y arriba, metros | como dice cada `.athc` | como cada `.athc` | varios assets: uno una nube, y el cielo como un texture cube |
 | splat de antimatter15 | `.splat` | no | los de COLMAP (derecha, abajo, delante), como un PLY 3DGS; escala 100 | sRGB | ninguno | sus registros de 32 bytes, decodificados en la GPU |
 | PlayCanvas SOG | `.sog`, o el `meta.json` de un SOG sin empaquetar | no | como un PLY 3DGS (los de COLMAP) | sRGB | grado 0 a 3, a través de su paleta | los texels de sus imágenes y sus rangos y codebooks, decodificados en la GPU |
 | glTF | `.glb`, `.gltf` con `KHR_gaussian_splatting` | no | los de glTF (+Y arriba, +Z el frente): (z, −x, y) hacia UE, así que una nube cae como su SPZ | sRGB, o lineal donde `colorSpace` dice `lin_...` | `SH_DEGREE_l_COEF_n`, grado 0 a 3 | sus buffers y sus accessors, leídos en la GPU en cualquier tipo de componente |
@@ -129,12 +131,12 @@ Lo que se lee, del primer `ParticleField3DGaussianSplat` del stage:
 | `primvars:athenea:splat:shadowBits` | las direcciones abiertas: 8 o 32 palabras por gaussiana (una rejilla octaédrica de 16 × 16 o 32 × 32 sobre la esfera entera); las 2 palabras de la primera transferencia no se leen |
 | `primvars:athenea:splat:transferReflected` | el campo reflejado, 48 valores por gaussiana, junto a la mitad indirecta |
 | `primvars:athenea:splat:curvature` | con una transferencia: el operador de forma, 3 valores por gaussiana (`elementSize` 3: uu, uv, vv en los dos primeros ejes de la gaussiana, uno sobre las unidades del stage); con lo que los lóbulos nítidos giran a lo largo de un splat (§6.1) |
+| `primvars:athenea:splat:transmission`, `:thinWalled`, `:ior` (constante) | con una transferencia: lo que del cuerpo pasa, si es de una pared fina, y el índice de la nube; por encima de 1, sus gaussianas que transmiten son un vidrio sólido que dibuja la lente (§6.1) |
 | `upAxis` del stage | `Y` → (X, Z, Y); `Z` → (X, −Y, Z) |
 | `metersPerUnit` del stage | posiciones multiplicadas por él y por 100 |
 
-Todavía no se lee de una nube TX: las paredes finas, el vidrio
-(`transmission`, el índice), la emisión, ni la transferencia zonal de una nube
-con skinning.
+Todavía no se lee de una nube TX: la emisión, ni la transferencia zonal de
+una nube con skinning.
 
 Los valores se leen en la primera muestra de tiempo, así que una nube cuyos
 arrays están animados importa su primer frame. La transformación propia del
@@ -177,8 +179,10 @@ lee la curvatura de un fichero de versión 2 (la v2 de athenea y la de la web
 usan el bit de flag 6 para cosas distintas).
 
 No se leen: los niveles fusionados, `LODS`, `LODE`, `LODM`, `OCCL`,
-`SKIN`, el esqueleto y el tier compacto. Un fichero escrito en otras unidades
-que metros (las piezas web del peón) se coloca con la escala del actor.
+`SKIN`, el esqueleto y el tier compacto. Una nube mucho menor que el plano
+cercano de 10 cm de UE (las piezas web del peón: un peón de ajedrez de unos
+10 cm de alto) se coloca mejor con la escala del actor, para que una cámara
+que la encuadre quede más allá de ese plano.
 
 Una nube TX de versión 2 (bit de flag 5) también tiene leídos su material
 (bit 4), su transferencia y sus celdas abiertas, mediante los decodificadores
@@ -252,6 +256,57 @@ nivel más fino, completo.
   (`EXT_meshopt_compression`, ...) se rechazan. Los `.glb` de malla, sin la
   extensión, se dejan al importador de glTF propio de UE.
 
+### 4.5.1 El `.athz` propio de athenea
+
+La nube paginada de athenea (su rama `athz`: `lod/Athz.h`): los planos de bytes
+de cada página, empaquetados en bits sin más o codificados con rANS en 32
+carriles, cada palabra tras una transformación (una diferencia respecto al
+elemento anterior de la tanda o al grupo padre, una o exclusiva, o respecto a
+la palabra anterior). Se lee:
+
+- la cabecera, la tabla de assets (la disposición de la nube, los niveles, la
+  codificación de los planos de los dos tipos, las frecuencias de rANS) y la
+  tabla de páginas, en la CPU; los bytes codificados de las páginas de las
+  capas G y A, y T donde la transferencia es sin pérdida, se guardan tal como
+  están;
+- en el dispositivo cuando se crea el recurso: las tablas expandidas, cada
+  nivel fusionado decodificado empezando por el más grueso (una palabra puede
+  estar codificada respecto a su grupo padre), y luego los splats, en arrays
+  dispuestos como un chunk de `.athc`, que los decodificadores de la versión 3
+  dibujan y reiluminan (§4.4).
+
+Antes de decodificar nada se comprueban el CRC-32 de la cabecera (sobre sus
+primeros 60 bytes) y el de cada página (sobre los bytes de sus capas, en el
+orden de las capas): un fichero corrupto o cortado se rechaza, nombrando la
+página (`page N is corrupt`).
+
+No se lee: una capa T CPCA (su id de cluster y sus pesos: la nube se dibuja sin
+iluminar), la capa K (el rig de una nube con skinning), la curvatura, y un
+fichero que es un prefijo de sus bandas (se
+rechaza: no están todos sus splats).
+
+### 4.5.2 El `.athz` de una escena web
+
+La web publica una escena como un zip `.athz`: un `scene.json` (versión 2:
+unidades, eje arriba, objetos con sus ficheros y transformaciones, cámaras,
+cielo), las nubes de cada objeto como `.athc` versión 3, su cielo como una
+imagen HDR, y ficheros que el plugin no lee (la oclusión `.cmpa`, la sombra
+del suelo). Se importan:
+
+- cada nube `.athc` como un asset, la primera en el asset que pidió la
+  importación, las demás a su lado con el nombre `<asset>_<file>`, leídas como
+  el §4.4 lee un `.athc`;
+- el cielo como UE importa una imagen HDR (un texture cube) a su lado, para
+  un sky light (§6.1; su `intensity` y su `rotationY` se registran en el log);
+- la primera clave de la primera cámara y su campo de visión, registrados en
+  el log en el frame de la escena.
+
+La transformación de un objeto distinta de la identidad se registra, no se
+aplica, y no se crea ningún nivel: un nivel coloca los actores, un sky light y
+una cámara (`setup_scene.py`, development §6). El `.athz` propio de athenea,
+la nube paginada cuya cabecera es `ATHZ`, se distingue por sus primeros
+bytes.
+
 ### 4.6 Mensajes
 
 Los errores y avisos van a la categoría `LogGSplatEditor`.
@@ -267,6 +322,9 @@ Los errores y avisos van a la categoría `LogGSplatEditor`.
 | `Cannot open <file>.` | no se puede abrir el `.athc` |
 | `no ATHC magic.` | no es un `.athc` |
 | `version <v>, this reads 1 and 2.` | una versión de `.athc` que este plugin no conoce |
+| `no ATHZ header.` / `an ATHZ header this does not read (version <v>).` / `an asset table that does not add up.` | no es un `.athz`, o es uno que este lector no toma |
+| `a prefix of its bands: the splats' pages are not all in the file.` / `page <p> runs past the file.` / `more than 4 GB to decode into.` | un `.athz` cortado, o demasiado grande |
+| `no scene.json in the bundle.` / `scene.json does not parse.` / `its scene names no .athc cloud.` / `<path> is not in the bundle.` | un `.athz` de escena web sin su escena o sin una nube que ésta nombra |
 | `the extra header is cut short.` / `a transfer of <t> values in <w> words, which is not drawn.` / `chunk <c> is cut short.` / `its chunks hold <n> splats where the header says <m>, or past 4 GB.` | una nube TX de versión 2 que esto no lee |
 | `a version 3 header cut short.` / `ATH3 version <v>, this reads 3.` / `a version 3 header that does not add up (...)` | una cabecera `ATH3` que no lo es |
 | `the section table is cut short.` / `the block index is cut short.` / `no CORE section.` / `CORE of <w> words a splat, where 9 were due.` | las tablas de un fichero de versión 3, rotas |
@@ -328,9 +386,8 @@ Se muestran en el asset bajo **Gaussians**:
   del lóbulo base y del coat, cada uno el mip prefiltrado del sky light a lo
   largo de la dirección especular, estrechado por las direcciones abiertas y
   rellenado por el campo reflejado donde están cerradas; y el sheen. Se dibuja
-  por la ruta sin iluminar, translúcido y ordenado. Todavía no se dibujan: el
-  sol que athenea separa de un cielo, la pendiente de una reflexión a lo largo
-  de un splat, el vidrio ni las paredes finas.
+  por la ruta sin iluminar, translúcido y ordenado. El sol, los lóbulos
+  nítidos y el vidrio se dibujan como dice el §6.1.
 - **Iluminado** (el de upstream): el base colour como albedo, escrito en el
   GBuffer de UE donde la cobertura supera 0,3. No usa los armónicos.
 
@@ -361,6 +418,20 @@ Se muestran en el asset bajo **Gaussians**:
   estos no cambien; si cambia alguno, se reconstruye en el siguiente frame.
   `r.Gaussians.Athenea.Residual 0` lee en su lugar el cubo prefiltrado propio
   de UE, sol incluido.
+- **Vidrio.** Una gaussiana TX que transmite (`transmission`) en una nube con
+  un índice por encima de 1 (`primvars:athenea:splat:ior`; un `.athc` no
+  guarda ninguno, así que se fija `GlassIor` del asset para uno) se dibuja
+  como dibuja el raster de athenea un vidrio sólido: lo que pasa la cara
+  cercana (un Fresnel) es el cielo a lo largo del rayo desviado por las dos
+  caras -- la lejana estimada con la curvatura de la nube, una esfera de su
+  radio, o una sola desviación donde no la hay -- donde el campo reflejado
+  lee el camino por abierto, y el campo acoplado al cielo donde hay algo
+  detrás; el color lo tiñe en cada cara, y el reflejo de la cara lejana
+  vuelve por la cercana. Una pared fina (`thinWalled`) se dibuja con la
+  opacidad que su fichero da a sus gaussianas (lo que la lámina refleja de
+  frente, la cobertura de mesh2splat), con su pulido base escalado al de la
+  lámina entera (el `thinWallGain` de athenea: uno entre la reflectancia de
+  Fresnel en su índice, o 1,5); lo que deja pasar es lo de la mezcla.
 - **Lóbulos nítidos, por píxel.** Donde la nube conserva su curvatura, un coat
   más suave que 0,2 y un pulido de base más suave que 0,5 (no uno al que
   responda el campo reflejado) se leen por píxel, como los dibuja athenea: el

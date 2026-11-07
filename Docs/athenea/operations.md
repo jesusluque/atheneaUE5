@@ -73,6 +73,8 @@ draws.
 | 3DGS PLY | `.ply` | yes, unless unattended | the dialogue's swizzle and scale; an athenea PLY says them in its comment (4.2) | the dialogue's gamma option; an athenea PLY says it | `f_rest_0..44`, degree 3 | float arrays |
 | USD ParticleField | `.usd` `.usda` `.usdc` | no | the stage's `upAxis` and `metersPerUnit` | sRGB unless `primvars:athenea:splat:linear` is true | `radiance:sphericalHarmonicsCoefficients`, degree 0 to 3 | float arrays |
 | athenea chunked cloud | `.athc` (versions 1 and 2, athenea's; 3, the web's) | no | athenea's: y up, metres | sRGB unless flag bit 1 (linear) | the file's rest coefficients (0 to 15 a colour) | athenea's packing, decoded on the GPU |
+| athenea paged cloud | `.athz` whose header is `ATHZ` (versions 1 to 4) | no | athenea's: y up, metres | sRGB unless its flags say linear | the file's rest coefficients | its coded pages, decoded on the GPU at load (every merged level as the splats' parents) |
+| athenea web scene | `.athz` that is a zip (`scene.json`, its clouds as `.athc`, its sky) | no | athenea's: y up, metres | as each `.athc` says | as each `.athc` | several assets: one a cloud, and the sky as a texture cube |
 | antimatter15 splat | `.splat` | no | COLMAP's (right, down, front), as a 3DGS PLY; scale 100 | sRGB | none | its 32-byte records, decoded on the GPU |
 | PlayCanvas SOG | `.sog`, or an unbundled SOG's `meta.json` | no | as a 3DGS PLY (COLMAP's) | sRGB | degree 0 to 3, through its palette | its images' texels and its ranges and codebooks, decoded on the GPU |
 | glTF | `.glb`, `.gltf` with `KHR_gaussian_splatting` | no | glTF's (+Y up, +Z the front): (z, −x, y) into UE, so a cloud lands as its SPZ does | sRGB, or linear where `colorSpace` says `lin_...` | `SH_DEGREE_l_COEF_n`, degree 0 to 3 | its buffers and its accessors, read on the GPU in any component type |
@@ -127,11 +129,12 @@ What is read, from the stage's first `ParticleField3DGaussianSplat`:
 | `primvars:athenea:splat:shadowBits` | the open directions: 8 or 32 words a gaussian (a 16 × 16 or 32 × 32 octahedral grid over the whole sphere); the first transfer's 2 words are not read |
 | `primvars:athenea:splat:transferReflected` | the reflected field, 48 values a gaussian, beside the indirect half |
 | `primvars:athenea:splat:curvature` | with a transfer: the shape operator, 3 values a gaussian (`elementSize` 3: uu, uv, vv in the gaussian's first two axes, one over the stage's units); what the sharp lobes turn by across a splat (§6.1) |
+| `primvars:athenea:splat:transmission`, `:thinWalled`, `:ior` (constant) | with a transfer: what of the body passes, whether it is a thin wall's, and the cloud's index; over 1, its transmitting gaussians are a solid glass the lens draws (§6.1) |
 | stage `upAxis` | `Y` → (X, Z, Y); `Z` → (X, −Y, Z) |
 | stage `metersPerUnit` | positions times it times 100 |
 
-Not read yet from a TX cloud: thin walls, glass (`transmission`, the index),
-emission, and the zonal transfer of a skinned cloud.
+Not read yet from a TX cloud: emission, and the zonal transfer of a skinned
+cloud.
 
 Values are read at the earliest time sample, so a cloud whose arrays are
 animated imports its first frame. The prim's own transform is not applied;
@@ -169,8 +172,9 @@ relights under the sky light as §6 describes. A version 2 file's curvature is
 not read (athenea's v2 and the web's use flag bit 6 for different things).
 
 Not read: the merged levels, `LODS`, `LODE`, `LODM`, `OCCL`, `SKIN`,
-the skeleton and the compact tier. A file written in other units than metres
-(the pawn's web pieces) is placed with the actor's scale.
+the skeleton and the compact tier. A cloud far smaller than UE's 10 cm near
+plane (the pawn's web pieces: a chess pawn about 10 cm tall) is best placed
+with the actor's scale, so a camera that frames it stays past that plane.
 
 A version 2 TX cloud (flag bit 5) has its material (bit 4), transfer and open
 cells read as well, through version 3's decoders below with every section in
@@ -237,6 +241,50 @@ LoD sizes (bit 6). The cloud draws its finest level, whole.
   Mesh `.glb` files, without the extension, are left to UE's own glTF
   importer.
 
+### 4.5.1 athenea's own `.athz`
+
+athenea's paged cloud (its `athz` branch: `lod/Athz.h`): each page's byte
+planes raw bit-packed or rANS coded over 32 lanes, each word after a
+transform (a difference from the run's previous element or from the parent
+group, an exclusive or, or against the word before it). Read:
+
+- the header, the asset table (the cloud's layout, levels, the planes'
+  coding for both kinds, the rANS frequencies) and the page table, on the
+  CPU; the pages' coded bytes of layers G and A, and T where the transfer is
+  lossless, kept as they are;
+- on the device when the resource is made: the tables expanded, every merged
+  level decoded coarsest first (a word may be coded against its parent
+  group), then the splats, into arrays laid out as a `.athc` chunk's, which
+  the version 3 decoders draw and relight (§4.4).
+
+Before anything is decoded the header's CRC-32 (over its first 60 bytes) and
+each page's (over its layers' bytes, in layer order) are checked: a corrupt
+or cut file is refused, naming the page (`page N is corrupt`).
+
+Not read: a CPCA layer T (its cluster id and weights: the cloud draws
+unlit), layer K (a skinned cloud's rig), the curvature, and a file that is a prefix of its bands (refused: its splats are not all
+there).
+
+### 4.5.2 A web scene's `.athz`
+
+The web publishes a scene as a `.athz` zip: a `scene.json` (version 2:
+units, up axis, objects with their files and transforms, cameras, sky), each
+object's clouds as `.athc` version 3, its sky as an HDR image, and files the
+plugin does not read (the `.cmpa` occlusion, the ground shadow). Imported:
+
+- each `.athc` cloud as an asset, the first into the asset the import asked
+  for, the others beside it named `<asset>_<file>`, read as §4.4 reads a
+  `.athc`;
+- the sky as UE imports an HDR image (a texture cube) beside them, for a sky
+  light (§6.1; its `intensity` and `rotationY` are logged);
+- the first camera's first key and its field of view, logged in the scene's
+  frame.
+
+An object's transform other than the identity is logged, not applied, and no
+level is made: a level places the actors, a sky light and a camera
+(`setup_scene.py`, development §6). athenea's own `.athz`, the paged cloud
+whose header is `ATHZ`, is told apart by its first bytes.
+
 ### 4.6 Messages
 
 Errors and warnings go to the `LogGSplatEditor` category.
@@ -252,6 +300,9 @@ Errors and warnings go to the `LogGSplatEditor` category.
 | `Cannot open <file>.` | the `.athc` cannot be opened |
 | `no ATHC magic.` | not a `.athc` |
 | `version <v>, this reads 1 and 2.` | a `.athc` version this plugin does not know |
+| `no ATHZ header.` / `an ATHZ header this does not read (version <v>).` / `an asset table that does not add up.` | not an `.athz`, or one this reader does not take |
+| `a prefix of its bands: the splats' pages are not all in the file.` / `page <p> runs past the file.` / `more than 4 GB to decode into.` | an `.athz` cut short, or too large |
+| `no scene.json in the bundle.` / `scene.json does not parse.` / `its scene names no .athc cloud.` / `<path> is not in the bundle.` | a web scene's `.athz` missing its scene or a cloud it names |
 | `the extra header is cut short.` / `a transfer of <t> values in <w> words, which is not drawn.` / `chunk <c> is cut short.` / `its chunks hold <n> splats where the header says <m>, or past 4 GB.` | a version 2 TX cloud this does not read |
 | `a version 3 header cut short.` / `ATH3 version <v>, this reads 3.` / `a version 3 header that does not add up (...)` | an `ATH3` header that is not one |
 | `the section table is cut short.` / `the block index is cut short.` / `no CORE section.` / `CORE of <w> words a splat, where 9 were due.` | a version 3 file's tables broken |
@@ -312,8 +363,8 @@ Shown on the asset under **Gaussians**:
   lobe and of the coat, each the sky light's prefiltered mip along the
   mirror direction, narrowed by the open directions and filled where they
   are closed by the reflected field; and the sheen. Drawn on the unlit path,
-  translucent and sorted. Not drawn yet: the sun athenea separates from a
-  sky, a reflection's slope across a splat, glass and thin walls.
+  translucent and sorted. The sun, the sharp lobes and glass are drawn as
+  §6.1 says.
 - **Relit** (upstream's): the base colour as albedo, written into UE's GBuffer
   where coverage passes 0.3. It does not use the harmonics.
 
@@ -342,6 +393,20 @@ Shown on the asset under **Gaussians**:
   and colour and kept while they stay; changing either rebuilds it on the
   next frame. `r.Gaussians.Athenea.Residual 0` reads UE's own prefiltered
   cube instead, sun included.
+- **Glass.** A TX gaussian that transmits (`transmission`) in a cloud with
+  an index over 1 (`primvars:athenea:splat:ior`; a `.athc` keeps none, so set
+  the asset's `GlassIor` for one) is drawn as athenea's raster draws a solid
+  glass: what passes the near face (one Fresnel) is the sky along the ray
+  bent through both faces -- the far one guessed from the cloud's curvature,
+  a sphere of its radius, or one bend where there is none -- where the
+  reflected field reads the way through open, and the field coupled to the
+  sky where something stands behind; the colour tints it at each face, and
+  the far face's reflection comes back through the near one. A thin wall
+  (`thinWalled`) is drawn at the opacity its file gives its gaussians (what
+  the sheet reflects head on, mesh2splat's coverage), with its base polish
+  scaled back to the whole sheet's (athenea's `thinWallGain`: one over the
+  Fresnel reflectance at its index, or 1.5); what it lets through is the
+  blend's.
 - **Sharp lobes, per pixel.** Where the cloud keeps its curvature, a coat
   smoother than 0.2 and a base polish smoother than 0.5 (not one the
   reflected field answers) are read per pixel, as athenea draws them: the

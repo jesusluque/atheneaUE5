@@ -43,6 +43,7 @@ void FGaussianSplatData::CopyFrom(const FGaussianSplatData* Other)
 	TransferCurvature = Other->TransferCurvature;
 	bPackedCurvature = Other->bPackedCurvature;
 	FileUnitsToCm = Other->FileUnitsToCm;
+	GlassIor = Other->GlassIor;
 	Bounds = Other->Bounds;
 }
 
@@ -80,6 +81,7 @@ void FGaussianSplatData::Empty()
 	TransferCurvature.Empty();
 	bPackedCurvature = false;
 	FileUnitsToCm = 100.0f;
+	GlassIor = 0.0f;
 }
 
 void FGaussianSplatData::Resize(uint32 Num)

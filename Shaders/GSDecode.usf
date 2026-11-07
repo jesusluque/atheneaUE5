@@ -503,6 +503,15 @@ void Athc3Array(uint k, uint n, inout uint w, out uint Base, out uint Row)
 uint Athc3Word(uint b, uint k, uint n, uint e, uint w)
 {
 	const uint3 S = Athc3Section(b, k);
+	if (k == 2u)
+	{
+		// TREE's two arrays of one word are cut from a run of whole rows (the
+		// writer's section_bytes puts each node's two words together): node
+		// e's word w is the run's word 2e + w.
+		const uint r = e * 2u + w;
+		e = r % n;
+		w = r / n;
+	}
 	uint Base, Row;
 	Athc3Array(k, n, w, Base, Row);
 	if (S.y == 0u)
@@ -847,5 +856,443 @@ void GSDecodeAthc3TxCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	OutSurface[o + 16u] = LobeByte(Lobes.z, 3u);
 	OutSurface[o + 17u] = ((Pbr >> 25) & 1u) != 0u ? 1.0f : 0.0f;
 	OutSurface[o + 18u] = ((Pbr >> 26) & 1u) != 0u ? float(Pbr >> 27) / 31.0f : Roughness;
-	OutSurface[o + 19u] = 0.0f;
+	// What of the body passes (the pbr word's transmission byte), plus 2 for a
+	// thin wall (bit 24).
+	OutSurface[o + 19u] = (HasPbr ? float((Pbr >> 16) & 0xFFu) / 255.0f : 0.0f) + (((Pbr >> 24) & 1u) != 0u ? 2.0f : 0.0f);
+}
+
+// ---------------------------------------------------------------------------
+// athenea's .athz (lod/Athz.h, shaders/athenea/lod/athz_*.slang on athenea's
+// athz branch): a cloud with its levels of detail in pages a GPU decodes --
+// each byte plane of a run of elements raw bit-packed or rANS coded over 32
+// lanes, each word after a transform (a difference from the run's previous
+// element or from the parent group, an exclusive or, or against the word
+// before it). Decoded here level by level, coarsest first (a word may be coded
+// against its parent group), the cloud's splats last, each into Scratch as a
+// .athc chunk lays its arrays out (positions, shape, harmonics, tail, normals,
+// emission, pbr, lobes, transfer, open directions, curvature), where the
+// version 3 decoders above read them (encoding 4: words in Scratch).
+//
+// The athz header in InBytes at FractionalBits (GSplatAthzImporter.cpp), and
+// per level (Offset says which) a descriptor of 40 words: kind (0 merged
+// groups, 1 splats), its first entry in the page list, its pages, the
+// parents' count, whether the elements are the splats, 0, then the 13 fields'
+// bases in Scratch for the level and for its parents.
+
+#define ATHZ_LANES 32u
+#define ATHZ_LOW 65536u
+#define ATHZ_RUNS_PER_GROUP 8u
+#define ATHZ_TABLE_SIZE 4096u
+#define ATHZ_MAX_STEPS 8u
+
+groupshared uint AthzTable[ATHZ_TABLE_SIZE];
+groupshared uint AthzScan[ATHZ_RUNS_PER_GROUP * ATHZ_LANES];
+groupshared uint AthzMask[ATHZ_RUNS_PER_GROUP * 3u];
+
+uint AthzHead(uint k) { return InBytes.Load(FractionalBits + k * 4u); }
+uint AthzLevel(uint k) { return InBytes.Load(AthzHead(23u) + Offset * 160u + k * 4u); }
+
+// The 13 fields' words an element, in their order (athz_common's fields).
+uint AthzFieldWords(uint f)
+{
+	switch (f)
+	{
+	case 0u: return 4u;
+	case 1u: return 4u;
+	case 2u: return AthzHead(7u);
+	case 3u: return 1u;
+	case 4u: return AthzHead(8u);
+	case 5u: return AthzHead(9u);
+	case 6u: return AthzHead(10u);
+	case 7u: return AthzHead(11u);
+	case 8u: return AthzHead(12u);
+	case 9u: return AthzHead(13u);
+	case 10u: return AthzHead(14u);
+	case 11u: return AthzHead(15u);
+	default: return AthzHead(16u);
+	}
+}
+
+uint2 AthzField(uint w)
+{
+	for (uint f = 0; f < 13u; ++f)
+	{
+		const uint n = AthzFieldWords(f);
+		if (w < n)
+		{
+			return uint2(f, w);
+		}
+		w -= n;
+	}
+	return uint2(12u, 0u);
+}
+
+void AthzStore(uint e, uint w, uint value)
+{
+	const uint2 f = AthzField(w);
+	if (((AthzHead(26u) >> f.x) & 1u) == 0u)
+	{
+		return;
+	}
+	Scratch.Store(AthzLevel(6u + f.x) + (e * AthzFieldWords(f.x) + f.y) * 4u, value);
+}
+
+uint AthzParent(uint e, uint w)
+{
+	const uint2 f = AthzField(w);
+	if (f.x > 10u)
+	{
+		return 0u;
+	}
+	return Scratch.Load(AthzLevel(19u + f.x) + (e * AthzFieldWords(f.x) + f.y) * 4u);
+}
+
+uint AthzZig(uint d) { return (d << 1) ^ (0u - (d >> 31)); }
+uint AthzUnzig(uint z) { return (z >> 1) ^ (0u - (z & 1u)); }
+uint AthzUnzig16(uint z) { return ((z >> 1) ^ (0u - (z & 1u))) & 0xFFFFu; }
+uint AthzSub16x2(uint a, uint b) { return ((a - b) & 0xFFFFu) | ((((a >> 16) - (b >> 16)) & 0xFFFFu) << 16); }
+uint AthzAdd16x2(uint a, uint b) { return ((a + b) & 0xFFFFu) | ((((a >> 16) + (b >> 16)) & 0xFFFFu) << 16); }
+uint AthzUnzig16x2(uint z) { return AthzUnzig16(z & 0xFFFFu) | (AthzUnzig16(z >> 16) << 16); }
+
+uint AthzUnwithin(uint r, uint prev)
+{
+	const uint lo = (AthzUnzig16(r & 0xFFFFu) + (prev >> 16)) & 0xFFFFu;
+	const uint hi = (AthzUnzig16(r >> 16) + lo) & 0xFFFFu;
+	return lo | (hi << 16);
+}
+
+uint AthzStep(uint t, uint r)
+{
+	if (t == 1u || t == 4u) return AthzUnzig(r);
+	if (t == 2u || t == 5u) return AthzUnzig16x2(r);
+	return r;
+}
+
+uint AthzCombine(uint t, uint a, uint b)
+{
+	if (t == 1u || t == 4u) return a + b;
+	if (t == 2u || t == 5u) return AthzAdd16x2(a, b);
+	return a ^ b;
+}
+
+uint AthzPlaneAt(uint i, uint tailWord)
+{
+	if (i < 4u)
+	{
+		return tailWord * 4u + i;
+	}
+	uint w = (i - 4u) / 4u;
+	if (w >= tailWord)
+	{
+		w += 1u;
+	}
+	return w * 4u + (i & 3u);
+}
+
+uint AthzPreviousWord(uint w, uint tailWord)
+{
+	if (w == 0u)
+	{
+		return tailWord;
+	}
+	if (w == tailWord + 1u)
+	{
+		return tailWord > 0u ? tailWord - 1u : tailWord;
+	}
+	return w - 1u;
+}
+
+uint AthzLoad16(uint base, uint j)
+{
+	const uint at = base + 2u * j;
+	const uint w = InBytes.Load(at & ~3u);
+	return (at & 2u) != 0u ? (w >> 16) : (w & 0xFFFFu);
+}
+
+// The asset's rANS tables as the decoder looks them up: a slot each, symbol |
+// frequency << 8 | where its run starts << 20 (athz_tables.slang).
+[numthreads(256, 1, 1)]
+void GSAthzTablesCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint size = 1u << AthzHead(1u);
+	const uint table = DispatchThreadId.x / size;
+	const uint slot = DispatchThreadId.x % size;
+	if (table >= AthzHead(0u))
+	{
+		return;
+	}
+	uint cum = 0u;
+	uint entry = 0u;
+	for (uint s = 0; s < 256u; ++s)
+	{
+		const uint f = AthzLoad16(AthzHead(19u), table * 256u + s);
+		if (slot < cum + f)
+		{
+			entry = s | (f << 8) | (cum << 20);
+			break;
+		}
+		cum += f;
+	}
+	Scratch.Store(AthzHead(25u) + DispatchThreadId.x * 4u, entry);
+}
+
+// athz_decode.slangh's athzDecode: a group of 256 threads is eight runs of 32
+// lanes; each lane decodes its symbols of every plane, puts its words
+// together, undoes their transforms and stores them.
+[numthreads(256, 1, 1)]
+void GSAthzDecodeCS(uint3 GroupId : SV_GroupID, uint3 Local : SV_GroupThreadID)
+{
+	const uint pageRuns = AthzHead(18u);
+	const uint runGaussians = AthzHead(17u);
+	const uint tableLog = AthzHead(1u);
+	const uint planes = AthzHead(2u);
+	const uint layers = AthzHead(3u);
+	const uint kind = AthzLevel(0u);
+	const uint hasRans = AthzHead(4u + kind);
+	const uint tailWord = AthzHead(6u);
+	const uint planesAt = AthzHead(20u) + kind * planes * 16u;
+	const uint pageListAt = AthzHead(21u);
+	const uint sourceAt = AthzHead(22u);
+	const uint slotsAt = AthzHead(25u);
+	const uint firstEntry = AthzLevel(1u);
+	const uint pages = AthzLevel(2u);
+	const uint parentCount = AthzLevel(3u);
+	const uint leaves = AthzLevel(4u);
+
+	const uint sub = Local.x / ATHZ_LANES;
+	const uint lane = Local.x % ATHZ_LANES;
+	const uint run = GroupId.x * ATHZ_RUNS_PER_GROUP + sub;
+	const uint page = run / pageRuns;
+	const uint inPage = run % pageRuns;
+	const bool active = page < pages;
+	const uint slotMask = (1u << tableLog) - 1u;
+	const uint steps = runGaussians / ATHZ_LANES;
+	const uint R = runGaussians;
+
+	if (Local.x < ATHZ_RUNS_PER_GROUP * 3u)
+	{
+		AthzMask[Local.x] = 0u;
+	}
+
+	const uint first = inPage * R;
+	uint here = 0u;
+	uint dst = 0u;
+	uint state[4] = { 0u, 0u, 0u, 0u };
+	uint wordsAt[4] = { 0u, 0u, 0u, 0u };
+	uint rawAt[4] = { 0u, 0u, 0u, 0u };
+	uint words[4] = { 0u, 0u, 0u, 0u };
+	uint read[4] = { 0u, 0u, 0u, 0u };
+	const uint entry = pageListAt + (firstEntry + page) * 32u;
+	if (active)
+	{
+		const uint count = InBytes.Load(entry + 20u);
+		dst = InBytes.Load(entry + 16u);
+		here = count > first ? min(count - first, R) : 0u;
+		[unroll] for (uint L = 0; L < 4u; ++L)
+		{
+			const uint src = InBytes.Load(entry + L * 4u);
+			if (((layers >> L) & 1u) == 0u || src == 0xFFFFFFFFu)
+			{
+				continue;
+			}
+			const uint at = sourceAt + src;
+			const uint start = at + (inPage == 0u ? 4u * pageRuns : InBytes.Load(at + 4u * (inPage - 1u)));
+			if (((hasRans >> L) & 1u) != 0u)
+			{
+				words[L] = InBytes.Load(start);
+				state[L] = InBytes.Load(start + 4u + 4u * lane);
+				wordsAt[L] = start + 4u + 4u * ATHZ_LANES;
+				rawAt[L] = wordsAt[L] + 4u * ((words[L] + 1u) / 2u);
+			}
+			else
+			{
+				rawAt[L] = start;
+			}
+		}
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	uint acc[ATHZ_MAX_STEPS] = { 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u };
+	uint parent[ATHZ_MAX_STEPS] = { 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu };
+	uint prevValue[ATHZ_MAX_STEPS] = { 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u };
+	uint step = 0u;
+	for (uint i = 0; i < planes; ++i)
+	{
+		const uint b = AthzPlaneAt(i, tailWord);
+		const uint4 plane = InBytes.Load4(planesAt + b * 16u);
+		const uint L = plane.x >> 24;
+		const bool wanted = ((layers >> L) & 1u) != 0u;
+		const uint shift = (b & 3u) * 8u;
+		if (wanted && (plane.x & 0xFFu) == 1u)
+		{
+			const uint table = slotsAt + plane.y * (1u << tableLog) * 4u;
+			for (uint t = Local.x; t < (1u << tableLog); t += 256u)
+			{
+				AthzTable[t] = Scratch.Load(table + t * 4u);
+			}
+			GroupMemoryBarrierWithGroupSync();
+			for (uint k = 0; k < steps; ++k)
+			{
+				const uint g = lane * steps + k;
+				const bool live = active && g < here;
+				bool need = false;
+				uint sym = 0u;
+				if (live)
+				{
+					const uint x = state[L];
+					const uint slot = x & slotMask;
+					const uint e = AthzTable[slot];
+					sym = e & 0xFFu;
+					state[L] = ((e >> 8) & 0xFFFu) * (x >> tableLog) + slot - (e >> 20);
+					need = state[L] < ATHZ_LOW;
+				}
+				if (need)
+				{
+					InterlockedOr(AthzMask[sub * 3u + step % 3u], 1u << lane);
+				}
+				if (lane == 0u)
+				{
+					uint Dummy;
+					InterlockedExchange(AthzMask[sub * 3u + (step + 1u) % 3u], 0u, Dummy);
+				}
+				GroupMemoryBarrierWithGroupSync();
+				const uint mask = AthzMask[sub * 3u + step % 3u];
+				if (need)
+				{
+					const uint j = read[L] + countbits(mask & ((1u << lane) - 1u));
+					uint word = 0u;
+					if (j < words[L])
+					{
+						word = AthzLoad16(wordsAt[L], j);
+					}
+					state[L] = (state[L] << 16) | word;
+				}
+				read[L] += countbits(mask);
+				acc[k] |= sym << shift;
+				step += 1u;
+			}
+		}
+		else if (wanted && active)
+		{
+			const uint width = (plane.x >> 8) & 0xFFu;
+			const uint base = (plane.x >> 16) & 0xFFu;
+			for (uint k = 0; k < steps; ++k)
+			{
+				const uint g = lane * steps + k;
+				if (g >= here)
+				{
+					continue;
+				}
+				uint v = 0u;
+				if (width != 0u && rawAt[L] != 0u)
+				{
+					const uint bit = g * width;
+					const uint at = rawAt[L] + 4u * (plane.z + bit / 32u);
+					const uint off = bit % 32u;
+					v = InBytes.Load(at) >> off;
+					if (off + width > 32u)
+					{
+						v |= InBytes.Load(at + 4u) << (32u - off);
+					}
+					v &= (1u << width) - 1u;
+				}
+				acc[k] |= ((v + base) & 0xFFu) << shift;
+			}
+		}
+		if ((b & 3u) != 3u)
+		{
+			continue;
+		}
+		// The word whole: its transform undone, then stored.
+		const uint w = b >> 2;
+		const uint t = plane.w & 0xFFu;
+		if (t >= 1u && t <= 3u)
+		{
+			uint sum = 0u;
+			for (uint k = 0; k < steps; ++k)
+			{
+				sum = AthzCombine(t, sum, AthzStep(t, acc[k]));
+				acc[k] = sum;
+			}
+			AthzScan[sub * ATHZ_LANES + lane] = sum;
+			GroupMemoryBarrierWithGroupSync();
+			uint carry = 0u;
+			for (uint j2 = 0; j2 < lane; ++j2)
+			{
+				carry = AthzCombine(t, carry, AthzScan[sub * ATHZ_LANES + j2]);
+			}
+			GroupMemoryBarrierWithGroupSync();
+			for (uint k = 0; k < steps; ++k)
+			{
+				acc[k] = AthzCombine(t, carry, acc[k]);
+			}
+		}
+		else if ((t == 7u || t == 8u) && active)
+		{
+			const uint pw = AthzPreviousWord(w, tailWord);
+			for (uint k = 0; k < steps; ++k)
+			{
+				const uint g = lane * steps + k;
+				if (g < here)
+				{
+					if (t == 7u || parent[k] == 0xFFFFFFFFu)
+					{
+						acc[k] = AthzUnwithin(acc[k], prevValue[k]);
+					}
+					else
+					{
+						const uint u = AthzUnwithin(acc[k], AthzSub16x2(prevValue[k], AthzParent(parent[k], pw)));
+						acc[k] = AthzAdd16x2(u, AthzParent(parent[k], w));
+					}
+				}
+			}
+		}
+		else if (t >= 4u && active)
+		{
+			for (uint k = 0; k < steps; ++k)
+			{
+				const uint g = lane * steps + k;
+				if (g < here)
+				{
+					const uint pv = parent[k] != 0xFFFFFFFFu ? AthzParent(parent[k], w) : 0u;
+					acc[k] = AthzCombine(t, pv, AthzStep(t, acc[k]));
+				}
+			}
+		}
+		for (uint k = 0; k < steps; ++k)
+		{
+			const uint g = lane * steps + k;
+			if (active && g < here)
+			{
+				AthzStore(dst + first + g, w, acc[k]);
+				prevValue[k] = acc[k];
+				if (w == tailWord)
+				{
+					if (leaves != 0u)
+					{
+						parent[k] = parentCount > 0u ? min(acc[k], parentCount - 1u) : 0xFFFFFFFFu;
+					}
+					else if (parentCount > 0u)
+					{
+						const uint cell = acc[k] >> 3;
+						uint lo = 0u, hi = parentCount;
+						while (lo < hi)
+						{
+							const uint m = (lo + hi) / 2u;
+							if (Scratch.Load(AthzLevel(19u + 3u) + m * 4u) < cell)
+							{
+								lo = m + 1u;
+							}
+							else
+							{
+								hi = m;
+							}
+						}
+						parent[k] = min(lo, parentCount - 1u);
+					}
+				}
+			}
+			acc[k] = 0u;
+		}
+	}
 }

@@ -22,6 +22,7 @@
 #include "pxr/usd/usd/primRange.h"
 #include "pxr/usd/usdGeom/metrics.h"
 #include "pxr/usd/usdGeom/primvarsAPI.h"
+#include "pxr/usd/usdGeom/tokens.h"
 #include "pxr/usd/usdGeom/xformable.h"
 #include "pxr/base/gf/matrix4d.h"
 #include "pxr/usd/usdVol/particleField3DGaussianSplat.h"
@@ -203,6 +204,23 @@ bool GSplatImporter::ImportUsd(const FString& Filename, UGSplatImportData& Impor
 	const pxr::VtVec3fArray SheenColor = Triples("athenea:splat:sheenColor");
 	const pxr::VtFloatArray SheenRoughness = Floats("athenea:splat:sheenRoughness");
 	const pxr::VtFloatArray MaterialRoughness = Floats("athenea:splat:materialRoughness");
+	const pxr::VtFloatArray Transmission = Floats("athenea:splat:transmission");
+	pxr::VtIntArray ThinWalled;
+	{
+		const pxr::UsdGeomPrimvar P = Primvars.GetPrimvar(pxr::TfToken("athenea:splat:thinWalled"));
+		if (!(P && P.Get(&ThinWalled, At) && ThinWalled.size() == Count))
+		{
+			ThinWalled.clear();
+		}
+	}
+	float GlassIor = 0.0f;
+	{
+		const pxr::UsdGeomPrimvar P = Primvars.GetPrimvar(pxr::TfToken("athenea:splat:ior"));
+		if (P && P.GetInterpolation() == pxr::UsdGeomTokens->constant)
+		{
+			P.Get(&GlassIor, At);
+		}
+	}
 	// The shape operator is three values a gaussian (elementSize 3).
 	pxr::VtFloatArray Curvature;
 	{
@@ -351,6 +369,9 @@ bool GSplatImporter::ImportUsd(const FString& Filename, UGSplatImportData& Impor
 			S[16] = SheenRoughness.empty() ? 0.3f : SheenRoughness[i];
 			S[17] = SchlickMetal.empty() ? 0.0f : float(SchlickMetal[i] != 0);
 			S[18] = MaterialRoughness.empty() ? S[3] : MaterialRoughness[i];
+			// What of the body passes, plus 2 for a thin wall (GSPolish.ush).
+			S[19] = (Transmission.empty() ? 0.0f : FMath::Clamp(Transmission[i], 0.0f, 1.0f))
+				+ (!ThinWalled.empty() && ThinWalled[i] != 0 ? 2.0f : 0.0f);
 		}
 
 		if (!Reflected.empty() && !TransferIndirect.empty())
@@ -366,6 +387,7 @@ bool GSplatImporter::ImportUsd(const FString& Filename, UGSplatImportData& Impor
 			FMemory::Memcpy(Splats.TransferCurvature.GetData(), Curvature.cdata(), Count * 3 * sizeof(float));
 		}
 		Splats.FileUnitsToCm = ImportData.ScaleFactor;
+		Splats.GlassIor = GlassIor;
 
 		Splats.CellWords = CellWords;
 		if (CellWords > 0)

@@ -98,6 +98,7 @@ UGSplatFactory::UGSplatFactory()
 	Formats.Add(TEXT("splat;Gaussian splats (antimatter15)"));
 	Formats.Add(TEXT("spz;Gaussian splats (Niantic SPZ)"));
 	Formats.Add(TEXT("sog;Gaussian splats (PlayCanvas SOG)"));
+	Formats.Add(TEXT("athz;athenea scene (web) or paged cloud"));
 	Formats.Add(TEXT("glb;Gaussian splats (glTF KHR_gaussian_splatting)"));
 	Formats.Add(TEXT("gltf;Gaussian splats (glTF KHR_gaussian_splatting)"));
 	ImportPriority = DefaultImportPriority + 10;
@@ -135,7 +136,8 @@ bool UGSplatFactory::FactoryCanImport(const FString& Filename)
 	{
 		return GSplatImporter::GltfHasSplats(Filename);
 	}
-	if (GSplatImporter::IsAthcFile(Filename) || GSplatImporter::IsSplatFile(Filename) || GSplatImporter::IsSogFile(Filename))
+	if (GSplatImporter::IsAthcFile(Filename) || GSplatImporter::IsSplatFile(Filename) || GSplatImporter::IsSogFile(Filename)
+		|| GSplatImporter::IsAthzFile(Filename))
 	{
 		return true;
 	}
@@ -227,16 +229,31 @@ UObject* UGSplatFactory::ImportInternal(UClass* InClass, UObject* InParent, FNam
 		return nullptr;
 	}
 
+	// athenea: a web scene's .athz brings several clouds and its sky.
+	if (GSplatImporter::IsAthzFile(Filename) && GSplatImporter::IsAthzScene(Filename))
+	{
+		if (!GSplatImporter::ImportAthzScene(Filename, InParent, InName, Flags, *Object))
+		{
+			Object->Splats.Empty();
+			return nullptr;
+		}
+		Object->AssetImportData->Update(Filename);
+		GEditor->GetEditorSubsystem<UImportSubsystem>()->BroadcastAssetPostImport(this, Object);
+		return Object;
+	}
+
 	// athenea: a USD stage or a .athc carries its own axes, units and colour
 	// space, so it is read with no dialogue.
 	if (GSplatImporter::IsUsdFile(Filename) || GSplatImporter::IsAthcFile(Filename) || GSplatImporter::IsSplatFile(Filename)
-		|| GSplatImporter::IsSogFile(Filename) || GSplatImporter::IsGltfFile(Filename))
+		|| GSplatImporter::IsSogFile(Filename) || GSplatImporter::IsGltfFile(Filename) || GSplatImporter::IsAthzFile(Filename))
 	{
 		Object->Splats.Empty();
 		const bool bRead = GSplatImporter::IsUsdFile(Filename)
 			? GSplatImporter::ImportUsd(Filename, *Object->AssetImportData, Object->Splats)
 			: GSplatImporter::IsAthcFile(Filename)
 			? GSplatImporter::ImportAthc(Filename, *Object->AssetImportData, Object->Splats)
+			: GSplatImporter::IsAthzFile(Filename)
+			? GSplatImporter::ImportAthzCloud(Filename, *Object->AssetImportData, Object->Splats)
 			: GSplatImporter::IsGltfFile(Filename)
 			? GSplatImporter::ImportGltf(Filename, *Object->AssetImportData, Object->Splats)
 			: GSplatImporter::IsSogFile(Filename)

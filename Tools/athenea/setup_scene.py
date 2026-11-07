@@ -2,7 +2,7 @@
 # A level of several clouds under one HDRI, seen from a camera given in the
 # files' own frame (athenea's: y up, metres):
 #   py setup_scene.py LEVEL SKY.hdr SCALE EYE TARGET FOV file1 file2 ... [--quit]
-# EYE and TARGET as x,y,z; SCALE the actors' (and the camera's) scale, for a
+# EYE and TARGET as x:y:z (-ExecCmds splits on commas); SCALE the actors' (and the camera's) scale, for a
 # scene small against UE's 10 cm near plane; the sky light as setup_tx.py sets
 # it. Files in the home folder's athenea-unreal; the camera is named TxCamera,
 # so capture_tx.py captures from it.
@@ -10,8 +10,8 @@ import unreal, os, sys
 
 args = [a for a in sys.argv[1:] if not a.startswith("--")]
 level, sky_file, scale = args[0], args[1], float(args[2])
-eye_f = [float(v) for v in args[3].split(",")]
-target_f = [float(v) for v in args[4].split(",")]
+eye_f = [float(v) for v in args[3].split(":")]
+target_f = [float(v) for v in args[4].split(":")]
 fov = float(args[5])
 files = args[6:]
 home = os.path.join(os.path.expanduser("~"), "athenea-unreal")

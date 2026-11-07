@@ -195,6 +195,12 @@ struct GAUSSIANSRENDERER_API FGaussianSplatData
 	UPROPERTY()
 	float FileUnitsToCm = 100.0f;
 
+	// The cloud's index of refraction (`primvars:athenea:splat:ior`): over 1,
+	// its transmitting gaussians are a solid glass the lens draws (GSColor.ush).
+	// A .athc does not keep it; set it here for one.
+	UPROPERTY(EditAnywhere, Category = "Gaussians")
+	float GlassIor = 0.0f;
+
 	static constexpr uint32 SurfaceStride = 20;
 
 

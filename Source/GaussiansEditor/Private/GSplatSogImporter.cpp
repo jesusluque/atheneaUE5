@@ -161,6 +161,11 @@ namespace
 	}
 }
 
+bool GSplatImporter::ReadZip(const TArray<uint8>& Zip, TMap<FString, TArray<uint8>>& Out, FString& Why)
+{
+	return ::ReadZip(Zip, Out, Why);
+}
+
 bool GSplatImporter::IsSogFile(const FString& Filename)
 {
 	const FString Extension = FPaths::GetExtension(Filename).ToLower();
