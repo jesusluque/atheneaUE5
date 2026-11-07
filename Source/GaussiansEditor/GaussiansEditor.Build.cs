@@ -33,6 +33,10 @@ public class GaussiansEditor: ModuleRules
 
             // athenea: OpenUSD as UE bundles it, for USD ParticleFields.
             "UnrealUSDWrapper",
+
+            // athenea: gzip, zstd and WebP for .spz and .sog.
+            "AtheneaCodecs",
+            "Json",
         });
 
         bUseRTTI = true;

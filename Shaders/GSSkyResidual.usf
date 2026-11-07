@@ -1,0 +1,185 @@
+// Copyright (c) 2026 jesus luque.
+//
+// The sky light without its sun, prefiltered by roughness, for a TX cloud's
+// reflections, as athenea prefilters its residual sky (technique/
+// env_residual.slang, env_prefilter.slang). The split sum -- the sky
+// prefiltered with the eye along the normal, times the lobe's directional
+// albedo -- is right for a sky that changes slowly across a lobe and short for
+// a compact sun; so the map holds the sky without it, and the reflections add
+// the sun analytically (GSSunReflectPdf, GSColor.ush).
+//
+// Two cubes. The cut (GSSkyCutCS, GSSkyDownCS): the sky light's cube read at
+// 256 texels a face, the sun's texels set to nothing, then box-filtered down
+// its mips -- so no level of it holds the sun, where UE's own mips, prefiltered
+// from the whole sky, spread it into a halo under any threshold. The residual
+// (GSSkyResidualCS): one dispatch a mip of 256 texels a face: mip m holds the roughness
+// UE's reflection captures put there (ComputeReflectionCaptureMipFromRoughness,
+// mip = Mips - 1 - (1 - 1.2 log2 r)), so a lobe reads as fine a level as the
+// sky light's own cube would give it. A texel's direction is the mirror; GGX half vectors
+// about it (Hammersley, GS_RESIDUAL_SAMPLES of them) give the directions read,
+// each from the sky light's cubemap at the mip whose texels are as wide as the
+// sample's share of the lobe, weighted by the cosine. A direction is the sun's
+// -- and reads nothing -- where it lies within ten degrees of the sun GSSkySH
+// found and is as bright as the threshold it was found at (OutSkySH[16], [17],
+// in the file's frame, taken to the world here), as the harmonics leave it.
+// Mip 0 is the sky itself, read along the texel, the sun cut the same way.
+// Stored without the sky light's colour and intensity (View.SkyLightColor),
+// which the reads multiply in, as they do the sky light's own cube.
+
+#include "/Engine/Private/Common.ush"
+
+TextureCube SkyCubemap;
+SamplerState SkyCubemapSampler;
+TextureCube CutCube;            // the cut sky, its box mips
+Texture2DArray<float4> CutAbove; // the cut's level above the one written
+float CutMips;
+float SkySourceMips;      // the sky light cube's mips
+float SkySourceSize;      // its mip 0's texels a face
+StructuredBuffer<float4> SkySH;
+uint Mip;
+uint Mips;
+uint Size;                // this mip's texels a face
+RWTexture2DArray<float4> OutResidual;
+
+#define GS_RESIDUAL_SAMPLES 128u
+
+static const float3 kResidualGrey = float3(0.2126f, 0.7152f, 0.0722f);
+static const float kResidualWidest = 0.175f;
+
+float3 TexelDirection(uint2 p, uint Face)
+{
+	const float2 uv = (float2(p) + 0.5f) / float(Size) * 2.0f - 1.0f;
+	float3 d;
+	switch (Face)
+	{
+	case 0:  d = float3(1.0f, -uv.y, -uv.x); break;
+	case 1:  d = float3(-1.0f, -uv.y, uv.x); break;
+	case 2:  d = float3(uv.x, 1.0f, uv.y); break;
+	case 3:  d = float3(uv.x, -1.0f, -uv.y); break;
+	case 4:  d = float3(uv.x, -uv.y, 1.0f); break;
+	default: d = float3(-uv.x, -uv.y, -1.0f); break;
+	}
+	return normalize(d);
+}
+
+// The sun, in the world: its direction and the cosine of the cut's cone, and
+// the threshold; none where GSSkySH found none.
+struct FResidualSun
+{
+	bool Found;
+	float3 Direction;
+	float CosWidest;
+	float Threshold;
+};
+
+FResidualSun ResidualSun()
+{
+	FResidualSun Sun;
+	const float4 S16 = SkySH[16];
+	Sun.Found = S16.w > 0.0f;
+	const float3 Local = GSResources.FileAxisX * S16.x + GSResources.FileAxisY * S16.y + GSResources.FileAxisZ * S16.z;
+	Sun.Direction = normalize(mul(Local, (float3x3) Primitive.LocalToRelativeWorld) + 1.0e-12f);
+	Sun.CosWidest = cos(kResidualWidest);
+	Sun.Threshold = SkySH[17].w;
+	return Sun;
+}
+
+float3 SkyAlong(float3 World, float SourceMip, FResidualSun Sun)
+{
+	const float3 L = TextureCubeSampleLevel(SkyCubemap, SkyCubemapSampler, World, SourceMip).rgb;
+	if (Sun.Found && dot(World, Sun.Direction) >= Sun.CosWidest && dot(L * View.SkyLightColor.rgb, kResidualGrey) >= Sun.Threshold)
+	{
+		return 0.0f;
+	}
+	return L;
+}
+
+float2 Hammersley(uint i, uint N)
+{
+	return float2((float(i) + 0.5f) / float(N), float(reversebits(i)) * 2.3283064365386963e-10f);
+}
+
+// The cut's level 0: the sky light's cube at this size, the sun cut.
+[numthreads(8, 8, 1)]
+void GSSkyCutCS(uint3 Id : SV_DispatchThreadID)
+{
+	if (Id.x >= Size || Id.y >= Size || Id.z >= 6u)
+	{
+		return;
+	}
+	const float SourceMip = max(0.0f, log2(SkySourceSize / float(Size)));
+	OutResidual[Id] = float4(SkyAlong(TexelDirection(Id.xy, Id.z), SourceMip, ResidualSun()), 1.0f);
+}
+
+// A level of the cut from the one above: the mean of its four texels.
+[numthreads(8, 8, 1)]
+void GSSkyDownCS(uint3 Id : SV_DispatchThreadID)
+{
+	if (Id.x >= Size || Id.y >= Size || Id.z >= 6u)
+	{
+		return;
+	}
+	const uint2 p = Id.xy * 2u;
+	OutResidual[Id] = 0.25f * (CutAbove[uint3(p, Id.z)] + CutAbove[uint3(p + uint2(1, 0), Id.z)]
+		+ CutAbove[uint3(p + uint2(0, 1), Id.z)] + CutAbove[uint3(p + uint2(1, 1), Id.z)]);
+}
+
+[numthreads(8, 8, 1)]
+void GSSkyResidualCS(uint3 Id : SV_DispatchThreadID)
+{
+	if (Id.x >= Size || Id.y >= Size || Id.z >= 6u)
+	{
+		return;
+	}
+	const float3 R = TexelDirection(Id.xy, Id.z);
+	if (Mip == 0u)
+	{
+		OutResidual[Id] = float4(TextureCubeSampleLevel(CutCube, SkyCubemapSampler, R, 0.0f).rgb, 1.0f);
+		return;
+	}
+
+	const float Roughness = min(exp2((float(Mip) + 2.0f - float(Mips)) / 1.2f), 1.0f);
+	const float a = max(Roughness * Roughness, 1.0e-3f);
+	const float a2 = a * a;
+	float3 Up = abs(R.z) < 0.999f ? float3(0.0f, 0.0f, 1.0f) : float3(1.0f, 0.0f, 0.0f);
+	const float3 T = normalize(cross(Up, R));
+	const float3 B = cross(R, T);
+	const float TexelSolid = 4.0f * PI / (6.0f * float(Size << Mip) * float(Size << Mip));
+
+	float3 Sum = 0.0f;
+	float Weight = 0.0f;
+	for (uint i = 0u; i < GS_RESIDUAL_SAMPLES; ++i)
+	{
+		const float2 E = Hammersley(i, GS_RESIDUAL_SAMPLES);
+		const float Phi = 2.0f * PI * E.x;
+		const float CosTheta = sqrt((1.0f - E.y) / (1.0f + (a2 - 1.0f) * E.y));
+		const float SinTheta = sqrt(max(0.0f, 1.0f - CosTheta * CosTheta));
+		const float3 H = T * (SinTheta * cos(Phi)) + B * (SinTheta * sin(Phi)) + R * CosTheta;
+		const float3 L = 2.0f * dot(R, H) * H - R;
+		const float NdotL = dot(R, L);
+		if (NdotL <= 0.0f)
+		{
+			continue;
+		}
+		// The sample's share of the lobe, eye along the normal: pdf D / 4.
+		const float d = CosTheta * CosTheta * (a2 - 1.0f) + 1.0f;
+		const float Pdf = a2 / (PI * d * d) * 0.25f;
+		const float SampleSolid = 1.0f / (float(GS_RESIDUAL_SAMPLES) * Pdf + 1.0e-6f);
+		const float SourceMip = clamp(0.5f * log2(SampleSolid / TexelSolid) + 1.0f, 0.0f, CutMips - 1.0f);
+		Sum += TextureCubeSampleLevel(CutCube, SkyCubemapSampler, L, SourceMip).rgb * NdotL;
+		Weight += NdotL;
+	}
+	OutResidual[Id] = float4(Sum / max(Weight, 1.0e-6f), 1.0f);
+}
+
+// The sun in the world, for the raster's sharp lobes: (direction, half angle),
+// (irradiance, 0); a half angle of 0 where GSSkySH found none.
+RWStructuredBuffer<float4> OutSunWorld;
+
+[numthreads(1, 1, 1)]
+void GSSunWorldCS()
+{
+	const FResidualSun Sun = ResidualSun();
+	OutSunWorld[0] = float4(Sun.Direction, Sun.Found ? SkySH[16].w : 0.0f);
+	OutSunWorld[1] = float4(SkySH[17].rgb, 0.0f);
+}

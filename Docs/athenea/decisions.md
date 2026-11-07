@@ -18,7 +18,9 @@ plugin is in `operations.md`; how the code is laid out, in `development.md`.
 8. [.athc packed, decoded on the GPU](#8-athc-packed-decoded-on-the-gpu)
 9. [The sRGB curve, not a 2.2 power](#9-the-srgb-curve-not-a-22-power)
 10. [Timing](#10-timing)
-11. [Not done](#11-not-done)
+11. [Transfer, the body and the polish](#11-transfer-the-body-and-the-polish)
+12. [.splat, .spz, .sog and glTF](#12-splat-spz-sog-and-gltf)
+13. [Not done](#13-not-done)
 
 ## 1. The fork and where it runs
 
@@ -174,6 +176,76 @@ alike: mean absolute difference 3.8 × 10⁻⁶, RMS 3 × 10⁻⁴ on a 0 to 1 s
 the few pixels that differ more (at most 0.21) sit on splat edges, where the
 `.athc`'s 10-bit rotations and f16 log scales differ from USD's floats.
 
+**Version 3, the web's.** sparkwebGPU writes `.athc` v3 for the browser
+(its `docs/docs/athc-v3.md`): v2's values in sections and tiers, each block's
+sections gzipped and stored as v2's words, byte planes or byte planes of
+16-bit differences, so a published cloud is one of these. Rather than undo
+the planes on the CPU, the importer keeps each block's `CORE` and `SHRS` as
+stored after the gunzip, with a table of blocks, and one kernel reads a word
+in any encoding: in place for words, four bytes from four planes for byte
+planes, and from a scratch for differences, which a pass sums first, one
+thread a word of a block's rows (a word's two lanes have one owner, so no
+two threads write the same word). The CPU decompresses and copies, nothing
+else.
+
+- **Checked.** sparkwebGPU's fixture `every_stream` exists as v2 and as v3 in
+  each encoding, the same 300 splats (their decoded `CORE` and `SHRS` bytes
+  are identical). Shot from the same camera, each v3 differs from the v2 by
+  0.0001 to 0.005 on average, and the v2 differs from itself by 0.0007 from
+  one run to the next: a few splats larger than the frame, close to the
+  camera, are drawn or not from run to run (from another side, one of them
+  covered half the frame in some runs and none in others). The decode is
+  inside that noise; the fixture is no sharper a test than this from a
+  camera.
+- **Error-band pages.** A published piece (the pawn's top, `car_M_Pawn_Top_W`,
+  698 791 nodes in 233 pages) is a paged tree: every block a page of leaves
+  and merges together, no chunks. Its `TREE` section counts each node's
+  children; the decoder reads it and draws a merge at no opacity, so the
+  leaves alone are seen, until the levels are read. Its units are not metres
+  (the head is 2.2 units across): the level scales the actor by 100. At
+  degree 0 a v3 header says one harmonic word, as v2's dummy word; the first
+  check refused it.
+- **A TX cloud from the web's file.** The sections are described once (their
+  words and arrays) and each block names every section's place, encoding and
+  scratch, so one fetch reads any word of any section and one pass sums any
+  delta-coded word. A CPCA section (Sloan et al. 2003, the web's encoding 3)
+  is rebuilt by a thread an element into the scratch, in the web decoder's
+  order of operations: the mean, then each coefficient times its step times
+  its direction, in f32, then the nearest half. A last kernel writes the
+  transfer, metallic, the surface (normal, roughness, lobes, the pbr word's
+  bits), the cells and the field into the buffers the USD importer's arrays
+  fill, so the shading does not know where they came from.
+- **Checked against the USD.** athenea's TX test cloud (`paint_tx.usdc`,
+  272 907 gaussians, transfer of 112 values, 16 × 16 cells, the material)
+  written to `.athc` v3 by sparkwebGPU's `usd-athc` (v2's words, gzip), then
+  by its `athc-convert --planes` (each section in its smallest encoding:
+  `CORE` and `TXIN` byte planes, `MATL` delta planes, the rest words) and
+  `--cpca 16,48` (the transfer as CPCA: 51.8 MB to 6.7 MB). Each drawn under
+  the same sky light from the test camera, linear captures against the USD's:
+
+  | File | Mean | RMS |
+  |---|---|---|
+  | words, gzip | 0.00108 | 0.0045 |
+  | smallest encodings | 0.00109 | 0.0046 |
+  | CPCA | 0.00142 | 0.0052 |
+
+  On values up to 3. The first two are the file's f16 transfer, byte
+  material and 16-bit normals against USD's floats; CPCA adds 0.0003, its own
+  loss. A first CPCA import was refused: a CPCA section's raw size in the
+  block index is its decoded size, not its payload's, and the gunzip was
+  checked against it. The `.athc` holds metres, so its level takes no ×100
+  (the USD stage says centimetres over metres' numbers, and its actor does);
+  a first capture with ×100 put the camera inside the ground.
+- **athenea's own `.athc` v2 with a transfer** goes the same way: a v2 chunk
+  lays out the same arrays (positions, shape, harmonics, tail, the material,
+  the transfer, the cells), so the importer keeps each chunk's bytes and
+  describes the arrays where they are, every section in v2's words, the whole
+  transfer as one section. No kernel was added. The paint cloud written as v2
+  (`athc-convert --v2`, 115.8 MB) against the USD: mean 0.00113 (RMS 0.0049);
+  against the v3 in words, 0.0006. A v2 file of degree 0 written by the web's
+  tools keeps one harmonic word, which the v2 header check refused; it is
+  taken now.
+
 ## 9. The sRGB curve, not a 2.2 power
 
 athenea linearises a display-referred cloud with the sRGB curve
@@ -207,14 +279,228 @@ GPU to 87 °C and throttled it to 780 MHz during the run, giving 84.6 ms for
 the splats. Frames are now timed at a 30 fps cap on a GPU checked free, and
 the profiler's file is copied only once it stops growing.
 
-## 11. Not done
+## 11. Transfer, the body and the polish
 
-- **Transfer (TX).** athenea's relighting (`splat_relight`) ported to the
-  prepass, with UE's sky light as the sky. The largest piece left.
+A TX cloud carries no radiance: its colour is an albedo, and a frame lights it
+from the transfer athenea baked into each gaussian. The first stage of the
+port is the body: `albedo (1 − metallic) ⟨T_direct + T_indirect, L⟩`, with
+`L` the sky's radiance on the same 16 harmonics, athenea's `transferredBody`.
+
+**The sky.** UE's sky light, projected each frame by a compute pass onto those
+harmonics in the cloud's own frame (development §5.2.1). Checked by reading
+the 16 coefficients back from the GPU and projecting the same HDRI in Python
+with athenea's dome convention (UsdLux): at `SourceCubemapAngle` 180 they
+agree within 2.8 %, UE 2.8 % brighter. A search over the 48 signed axis
+mappings and turns about the vertical found no mirror: the angle is the only
+thing to set.
+
+**The test.** athenea's paint-ball scene converted with `mesh2splat
+--transfer` (272 946 gaussians, 16 direct and 48 indirect values each),
+under the same studio HDRI in both, from the scene's camera. The ball is a
+metal (metallic 1): it has no body, and draws black until the polish is
+ported. The ground (albedo 1, metallic 0):
+
+| | athenea raster | UE, the body |
+|---|---|---|
+| ground mean, linear | 1.046 | 0.92 |
+| the darkest 5 % (the ball's shadow) | 0.372 | 0.38 |
+
+UE's values are the capture's (operations §7.1) divided by its exposure,
+1.72, measured from the projected sky's mean radiance. The shadow agrees;
+the ground's mean is 12 % lower, which is what athenea adds through the sun it
+separates from this sky (its log: a sun 14.8° across) and lights through the
+open-direction bits, not yet ported.
+
+**The polish.** The rest of athenea's sum for an opaque surface came next,
+function by function (`GSPolish.ush`): the coat and sheen layers with
+OpenPBR's coat darkening, the environment BRDFs (dielectric with its exact
+Fresnel, conductor through MaterialX's artistic index, Schlick's metal),
+the open-direction cells read along the mirror lobe, and the reflected field
+coupled to the sky by the indirect transfer. The sky light's cubemap is
+raised to 1024 texels a face for it (128 by default). Measured on the same
+frame, against athenea, with the ball's disc fitted from UE's image:
+
+| | athenea | UE | UE / athenea | mean abs. rel. error |
+|---|---|---|---|---|
+| ball | 0.058 | 0.071 | 1.22 | 0.47 |
+| ball, upper half (the sky) | 0.081 | 0.102 | 1.26 | 0.60 |
+| ball, lower half (the ground, through the field) | 0.035 | 0.041 | 1.16 | 0.16 |
+| ground | 1.032 | 0.934 | 0.91 | 0.11 |
+
+Before the field the ball's lower half was black: its closed directions
+reflected nothing.
+
+**The sun.** athenea takes a sky's sun out of its harmonics and gives it back
+as a directional light, shadowed by the cells along it and bounced through
+the indirect transfer (`env_sun`, `transferViewless`). The sky pass now does
+the same (development §5.2.1): over 16384 directions, a histogram of log
+luminance gives the median, the sun is what stands past max(16 median,
+0.02 peak) within ten degrees of the peak where the peak is 32 times the
+median, and it is kept only where it is as compact as a disc. For this HDRI
+UE finds it at (−0.37, 0.58, 0.72), 17.4° across, irradiance 1.49; athenea
+at (−0.51, 0.63, 0.59), 14.8°, 1.35 (its own walk of the lat-long). The
+reflections still read UE's prefiltered mips, which keep the sun in them.
+
+**A vignette, not the transfer.** The tables above were measured through
+UE's post-processing, whose vignette (0.4 by default) darkens the frame
+towards its edges: a debug view of one flat colour read 1.27 at the centre
+and 0.95 at the bottom. With the vignette off on the capture, the flat colour
+is the same everywhere and the capture's exposure factor is 2.02. Measured
+again, sun included:
+
+| | athenea | UE | UE / athenea | mean abs. rel. error |
+|---|---|---|---|---|
+| ground | 1.032 | 1.048 | 1.016 | 0.024 |
+| ball, lower half (the field) | 0.036 | 0.037 | 1.046 | 0.091 |
+| ball, upper half (the sky's reflection) | 0.082 | 0.094 | 1.156 | 0.554 |
+| ball | 0.059 | 0.066 | 1.123 | 0.413 |
+| the ball's shadow (athenea's darkest 5 %) | 0.270 | 0.304 | 1.127 | 0.172 |
+
+The body and the field agree; what is left is in the sky's reflection on the
+ball: the sun still in UE's prefiltered mips and unshadowed there, and the
+slope of a sharp reflection across a splat, which athenea draws and this does
+not (its windows blur).
+
+**The sky without its sun in the reflections.** athenea prefilters its sky
+with the sun cut out (`env_residual`) and reflects the sun analytically
+through each lobe (`sunReflectPdf`): the split sum is a quarter short for a
+compact sun. The plugin does the same: a cut cube, the sky light's cube read
+at 256 texels a face with the sun's texels (env_sun's cut: within ten degrees
+of the sun and as bright as the threshold it was found at) set to nothing,
+box-filtered down its mips; then the residual, each mip GGX-sampled from the
+cut at the roughness UE's captures put there (128 samples, each read at the
+cut's level matching its solid angle). Measured on the same frame against
+athenea (`tx_regions.py`):
+
+| | UE's prefiltered cube | residual sampled from UE's mips | residual from the cut |
+|---|---|---|---|
+| ball | 1.117 (0.317) | 1.121 (0.394) | 1.081 (0.239) |
+| ball, upper half | 1.181 (0.569) | 1.169 (0.704) | 1.124 (0.437) |
+| ball, lower half | 0.994 (0.067) | 1.027 (0.086) | 0.996 (0.043) |
+| ground | 1.017 (0.026) | 1.023 (0.031) | 1.012 (0.022) |
+
+UE / athenea, with the mean absolute relative error. The middle column was
+the first version: it cut the sun from UE's own mips, which are prefiltered
+from the whole sky, so their sun is a halo under any threshold; it stayed in
+the map and the analytic sun came on top. The cut's own box mips hold no sun
+at all. What is left on the ball's upper half is the sharpness: athenea draws
+a smooth coat per pixel (its reflection slope) and shows the room in it,
+which one colour a splat cannot.
+
+**Timing** (`ue_time.sh /Game/TestTx`, RTX 3070, 1280 × 720, medians of 300
+frames): building the residual every frame cost 1.3 ms of GPU
+(`GPU/GaussiansSky` 1.69 ms against 0.40 ms for the projection alone); it is
+the world's, so it is built once for a sky light's cube and colour and kept,
+shared by every TX cloud. Kept, `GPU/GaussiansSky` is 0.397 ms against
+0.389 ms with the residual off, and `GPUTime` 11.90 ms against 11.69 ms.
+
+**The sharp lobes, per pixel.** What the residual left on the ball's upper
+half was the sharpness: athenea reads a smooth coat (under 0.2) and a sharp
+base polish (under 0.5) per pixel, along the mirror each pixel turns to by the
+surface's curvature, and a splat's single colour cannot show a window
+mirrored inside it. Ported (athenea's `SplatSlope` sharp lobe,
+`splat_project`, `splat_blend`): the cloud's shape operator is read
+(`primvars:athenea:splat:curvature`, `CURV`), the prepass turns the normal a
+pixel right and down, takes the centre's reading out of the colour and hands
+two words of payload to the raster, which reads the residual and the sun
+again at each pixel. Measured on the same frame:
+
+| | the residual | and the sharp lobes |
+|---|---|---|
+| ball | 1.081 (0.239) | 1.030 (0.124) |
+| ball, upper half | 1.124 (0.437) | 1.048 (0.213) |
+| ball, lower half | 0.996 (0.043) | 0.997 (0.035) |
+| ground | 1.012 (0.022) | 1.012 (0.022) |
+
+UE / athenea (mean absolute relative error). The window and the two lights
+the coat mirrors now stand where athenea draws them. The paint cloud as
+`.athc` v3 (the smallest encodings, and CPCA) gives the same (ball 1.033,
+upper half 1.051); its v2 keeps no curvature and stays at the residual's
+(1.085). `GPUTime` 11.84 ms against 12.07 ms with the residual off: inside
+the run-to-run noise.
+
+Two mistakes first: the curvature primvar has three values a gaussian and
+was read with the one-a-gaussian reader, which dropped it (debug view 6 shows
+which condition holds); and a version 3 block grew by the `CURV` section to
+29 words and was padded to 34, not the 32 the shader steps by, which read
+every later block's sections from the wrong place (the CPCA ball came out at
+3 % of athenea's).
+
+**Measurements that were wrong first, kept as what not to repeat.** UE's HDR
+screenshot saturates near 1, so it read the ground 26 % dark and every
+projected coefficient as about 1; and the test stage says centimetres (its
+root layer sets none) while its numbers are metres, so the cloud first came
+in 2 cm across.
+
+## 12. .splat, .spz, .sog and glTF
+
+The user asked for every format. These four are the most common after PLY,
+and athenea reads the first three (`io/SplatReaders.cpp`, `io/Sog.cpp`) and
+writes the fourth; the plugin reads them the way it reads a `.athc`: the
+file's bytes kept, a kernel a format to decode them (`GSDecodeSplatCS`,
+`GSDecodeSpzCS`, `GSDecodeSogCS`, `GSDecodeGltfCS`).
+
+- **Compression.** `.spz` versions 2 and 3 are gzip, which UE's zlib undoes;
+  version 4 is zstd and `.sog` is WebP, neither of which UE ships. With the
+  user's OK their decoders' sources were taken from the projects' own
+  repositories (zstd v1.5.7, libwebp v1.5.0, both BSD) into a module of their
+  own, `AtheneaCodecs`, editor only.
+- **Axes.** athenea turns an SPZ, right-up-back by the format, by negating
+  y and z into a 3DGS PLY's right-down-front, the frame its PLYs are read in.
+  The plugin composes that turn with its PLY mapping, `(z, x, −y)`, into
+  `(−z, x, y)`, so an SPZ stands as a PLY does. A first version took
+  athenea's PLY frame as y-up, `(x, −z, −y)`, which stood a painted cat
+  upright -- as athenea's default view does, since that view reads a PLY's
+  frame as y-up (COLMAP clouds want `--rotate-x 180` there) -- and drew a
+  version 4 SPZ written by splat-transform upside down, against the `.glb` the
+  same tool wrote of the same cloud. The cat holds y-down coordinates without
+  the coordinate-system extension saying so: it is the file that is off, and
+  it now stands upside down, as in athenea under a y-up view. A `.splat` keeps
+  COLMAP's axes, as a 3DGS PLY.
+- **Checked.** A version 2 SPZ (the cat, 206 232 gaussians, first-three
+  rotations), a version 3 (404 092, smallest three) and a `.splat` (the
+  dwarf, 524 288) import and draw. A version 4 (PlayCanvas's `biker.spz`,
+  152 746, degree 0) was refused at first: degree 0 has five streams, not six;
+  it now reads.
+- **`.sog`** follows athenea's `io/Sog.cpp` and `scene/sog_decode.slang`:
+  the zip and the WebP images undone on the CPU (libwebp from
+  `AtheneaCodecs`), the rest a kernel. Checked on athenea's own fixture,
+  `sh3.sog` (64 gaussians, version 2, a degree-3 palette) against the PLY it
+  was written from, both through the same axes and colour space: mean
+  difference 0.0017 (RMS 0.015) between the two frames, which is SOG's
+  quantisation -- athenea's two frames of the same pair differ by 0.0014. A
+  first run read the palette's width and its coefficients a colour from each
+  other's slots, and the harmonics drew a negative colour clamped to black.
+- **glTF** (`KHR_gaussian_splatting`) is read as glTF reads: accessors of any
+  component type, normalised or not, at any stride. Rather than a kernel for
+  each layout, the importer writes a table of accessor descriptors after the
+  buffers and one kernel reads any of them, so a quantised file
+  (`KHR_mesh_quantization`, PlayCanvas's normalised `COLOR_0`) costs nothing
+  more. The bounds are `POSITION`'s `min` and `max`, which glTF requires, so
+  no arithmetic on the data is left on the CPU.
+- **glTF's axes** are not an SPZ's: +Y up as well, but +Z the asset's front
+  where an SPZ's +Z is its back. The two files splat-transform wrote of one
+  cloud (`biker.glb`, `biker.spz`) first stood back to front; glTF is now
+  taken as `(z, −x, y)`, and the two frames differ by 0.00044 on average
+  (RMS 0.0020), the SPZ's 8-bit colours and fixed point.
+- **UE's own glTF importer** takes `.glb` too. The factory answers for a file
+  only when its JSON names the extension, so a mesh `.glb` stays with
+  Interchange; dropped into the Content Browser, which of the two UE asks
+  first has not been checked (the scripts name the factory).
+
+## 13. Not done
+
+- **Transfer (TX), past the opaque polish:** a slope across a splat for the
+  lobes that are not sharp (athenea's `slopeX`, `slopeY`), a fold's widening
+  (its `bakeSpread`), a v2 file's curvature, analytic lights, glass and thin walls, the zonal transfer of skinned
+  clouds, and a real-time sky capture.
 - **`.athc` levels and streaming.** The merged levels, the per-frame cut and
-  chunk streaming; the normals, emission and extras.
-- **Other formats.** `.athv` (HEVC video), `.athz` and `.athl` (the web's),
-  `.spz`, `.splat`, `.sog`, glTF `.glb` with `KHR_gaussian_splatting`.
+  chunk streaming; the normals, emission and extras. In version 3 the
+  curvature, the occlusion codebook, a zonal transfer, the skin and the
+  compact tier; a paged tree's merges are decoded and hidden, not left out.
+- **Other formats.** `.athv` (HEVC video), `.athz` and `.athl` (the web's);
+  an SPZ's coordinate-system extension; a glTF node's transform, more than one
+  gaussian primitive, sparse accessors and `EXT_meshopt_compression`.
 - **The ParticleField's transform** (a rotation would have to turn the
   harmonics).
 - **Remaining upstream defects** from `DESIGN.md`: the ViewRect offset,

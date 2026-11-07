@@ -26,6 +26,23 @@ void FGaussianSplatData::CopyFrom(const FGaussianSplatData* Other)
 	PackedSHWords = Other->PackedSHWords;
 	PackedRestPerColour = Other->PackedRestPerColour;
 	PackedUnitsToCm = Other->PackedUnitsToCm;
+	PackedFormat = Other->PackedFormat;
+	PackedBytes = Other->PackedBytes;
+	PackedStreams = Other->PackedStreams;
+	PackedSpz = Other->PackedSpz;
+
+	bHasTransfer = Other->bHasTransfer;
+	TransferDirectCount = Other->TransferDirectCount;
+	Transfer = Other->Transfer;
+	TransferMetallic = Other->TransferMetallic;
+	TransferSurface = Other->TransferSurface;
+	CellWords = Other->CellWords;
+	TransferCells = Other->TransferCells;
+	TransferField = Other->TransferField;
+	bPackedTransferField = Other->bPackedTransferField;
+	TransferCurvature = Other->TransferCurvature;
+	bPackedCurvature = Other->bPackedCurvature;
+	FileUnitsToCm = Other->FileUnitsToCm;
 	Bounds = Other->Bounds;
 }
 
@@ -46,6 +63,23 @@ void FGaussianSplatData::Empty()
 	PackedPositions.Empty();
 	PackedShape.Empty();
 	PackedSH.Empty();
+	PackedFormat = 0;
+	PackedBytes.Empty();
+	PackedStreams.Empty();
+	PackedSpz = FIntVector(0, 0, 0);
+
+	bHasTransfer = false;
+	TransferDirectCount = 0;
+	Transfer.Empty();
+	TransferMetallic.Empty();
+	TransferSurface.Empty();
+	CellWords = 0;
+	TransferCells.Empty();
+	TransferField.Empty();
+	bPackedTransferField = false;
+	TransferCurvature.Empty();
+	bPackedCurvature = false;
+	FileUnitsToCm = 100.0f;
 }
 
 void FGaussianSplatData::Resize(uint32 Num)

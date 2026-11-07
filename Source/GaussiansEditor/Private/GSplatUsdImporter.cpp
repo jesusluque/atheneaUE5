@@ -140,6 +140,111 @@ bool GSplatImporter::ImportUsd(const FString& Filename, UGSplatImportData& Impor
 		}
 	}
 
+	// A TX cloud's transfer: the direct half (9 or 16 values a gaussian), the
+	// indirect one (three times that) where it was kept, and the metallic the
+	// body is scaled by. The reflected field and the open directions are not
+	// read yet.
+	pxr::VtFloatArray TransferDirect, TransferIndirect, Metallic;
+	uint32 TransferCount = 0;
+	{
+		const pxr::UsdGeomPrimvarsAPI Primvars(Field.GetPrim());
+		const pxr::UsdGeomPrimvar Direct = Primvars.GetPrimvar(pxr::TfToken("athenea:splat:transferDirect"));
+		if (Direct && Direct.Get(&TransferDirect, At))
+		{
+			const int Element = Direct.GetElementSize();
+			if ((Element == 9 || Element == 16) && TransferDirect.size() == Count * size_t(Element))
+			{
+				TransferCount = uint32(Element);
+			}
+		}
+		const pxr::UsdGeomPrimvar Indirect = Primvars.GetPrimvar(pxr::TfToken("athenea:splat:transferIndirect"));
+		if (!(TransferCount > 0 && Indirect && Indirect.Get(&TransferIndirect, At)
+			&& TransferIndirect.size() == Count * 3 * size_t(TransferCount)))
+		{
+			TransferIndirect.clear();
+		}
+		const pxr::UsdGeomPrimvar Metal = Primvars.GetPrimvar(pxr::TfToken("athenea:splat:metallic"));
+		if (!(Metal && Metal.Get(&Metallic, At) && Metallic.size() == Count))
+		{
+			Metallic.clear();
+		}
+	}
+
+	// What a TX cloud's polish reflects with, where the cloud carries it: each
+	// primvar one value (or one triple) a gaussian; a missing one takes the
+	// value athenea gives it (plainLobes).
+	const pxr::UsdGeomPrimvarsAPI Primvars(Field.GetPrim());
+	auto Floats = [&](const char* Name) {
+		pxr::VtFloatArray Out;
+		const pxr::UsdGeomPrimvar P = Primvars.GetPrimvar(pxr::TfToken(Name));
+		if (!(P && P.Get(&Out, At) && Out.size() == Count))
+		{
+			Out.clear();
+		}
+		return Out;
+	};
+	auto Triples = [&](const char* Name) {
+		pxr::VtVec3fArray Out;
+		const pxr::UsdGeomPrimvar P = Primvars.GetPrimvar(pxr::TfToken(Name));
+		if (!(P && P.Get(&Out, At) && Out.size() == Count))
+		{
+			Out.clear();
+		}
+		return Out;
+	};
+	const pxr::VtFloatArray Roughness = Floats("athenea:splat:roughness");
+	const pxr::VtFloatArray SpecularWeight = Floats("athenea:splat:specularWeight");
+	const pxr::VtVec3fArray SpecularColor = Triples("athenea:splat:specularColor");
+	const pxr::VtFloatArray SpecularIor = Floats("athenea:splat:specularIor");
+	const pxr::VtFloatArray CoatWeight = Floats("athenea:splat:coatWeight");
+	const pxr::VtFloatArray CoatRoughness = Floats("athenea:splat:coatRoughness");
+	const pxr::VtFloatArray CoatIor = Floats("athenea:splat:coatIor");
+	const pxr::VtFloatArray CoatDarkening = Floats("athenea:splat:coatDarkening");
+	const pxr::VtVec3fArray SheenColor = Triples("athenea:splat:sheenColor");
+	const pxr::VtFloatArray SheenRoughness = Floats("athenea:splat:sheenRoughness");
+	const pxr::VtFloatArray MaterialRoughness = Floats("athenea:splat:materialRoughness");
+	// The shape operator is three values a gaussian (elementSize 3).
+	pxr::VtFloatArray Curvature;
+	{
+		const pxr::UsdGeomPrimvar P = Primvars.GetPrimvar(pxr::TfToken("athenea:splat:curvature"));
+		if (!(P && P.Get(&Curvature, At) && Curvature.size() == Count * 3))
+		{
+			Curvature.clear();
+		}
+	}
+	pxr::VtFloatArray Reflected;
+	{
+		// 48 values a gaussian, beside the indirect half only (transfer_layout.slang).
+		const pxr::UsdGeomPrimvar P = Primvars.GetPrimvar(pxr::TfToken("athenea:splat:transferReflected"));
+		if (!(P && P.Get(&Reflected, At) && Reflected.size() == Count * 48))
+		{
+			Reflected.clear();
+		}
+	}
+	pxr::VtIntArray SchlickMetal, ShadowBits;
+	{
+		const pxr::UsdGeomPrimvar P = Primvars.GetPrimvar(pxr::TfToken("athenea:splat:schlickMetal"));
+		if (!(P && P.Get(&SchlickMetal, At) && SchlickMetal.size() == Count))
+		{
+			SchlickMetal.clear();
+		}
+	}
+	uint32 CellWords = 0;
+	{
+		// 8 or 32 words a gaussian: a TX transfer's cells over the whole sphere.
+		// The first transfer's 2 words cover the half a gaussian faces and are
+		// not read.
+		const pxr::UsdGeomPrimvar P = Primvars.GetPrimvar(pxr::TfToken("athenea:splat:shadowBits"));
+		if (P && P.Get(&ShadowBits, At))
+		{
+			const int Element = P.GetElementSize();
+			if ((Element == 8 || Element == 32) && ShadowBits.size() == Count * size_t(Element))
+			{
+				CellWords = uint32(Element);
+			}
+		}
+	}
+
 	ImportData.NumSplats = int32(Count);
 	ImportData.bHasNormals = !Normals.empty();
 	ImportData.bHasHighOrderSH = Degree > 0;
@@ -204,6 +309,72 @@ bool GSplatImporter::ImportUsd(const FString& Filename, UGSplatImportData& Impor
 	Splats.FileAxisZ = SwizzleVector(0.0f, 0.0f, 1.0f, Swizzle);
 	Splats.bLinearizeColor = ImportData.bApplyGammaCorrection;
 
+	if (TransferCount > 0)
+	{
+		const size_t Stride = 4 * size_t(TransferCount);
+		Splats.bHasTransfer = true;
+		Splats.TransferDirectCount = TransferCount;
+		Splats.Transfer.SetNumZeroed(int32(Count * Stride));
+		Splats.TransferMetallic.SetNumZeroed(int32(Count));
+		for (size_t i = 0; i < Count; i++)
+		{
+			float* Out = &Splats.Transfer[i * Stride];
+			FMemory::Memcpy(Out, &TransferDirect[i * TransferCount], TransferCount * sizeof(float));
+			if (!TransferIndirect.empty())
+			{
+				FMemory::Memcpy(Out + TransferCount, &TransferIndirect[i * 3 * TransferCount], 3 * TransferCount * sizeof(float));
+			}
+			Splats.TransferMetallic[i] = Metallic.empty() ? 0.0f : Metallic[i];
+		}
+
+		// The surface, GS_SURFACE_* in GSColor.ush: normal (3), roughness,
+		// specular weight, colour (3) and index, coat weight, roughness, index
+		// and darkening, sheen colour (3) and roughness, Schlick's metal.
+		const uint32 SS = FGaussianSplatData::SurfaceStride;
+		Splats.TransferSurface.SetNumZeroed(int32(Count * SS));
+		for (size_t i = 0; i < Count; i++)
+		{
+			float* S = &Splats.TransferSurface[i * SS];
+			const pxr::GfVec3f N = Normals.empty() ? pxr::GfVec3f(0, 0, 1) : Normals[i];
+			S[0] = N[0]; S[1] = N[1]; S[2] = N[2];
+			S[3] = Roughness.empty() ? 0.5f : Roughness[i];
+			S[4] = SpecularWeight.empty() ? 1.0f : SpecularWeight[i];
+			const pxr::GfVec3f C = SpecularColor.empty() ? pxr::GfVec3f(1, 1, 1) : SpecularColor[i];
+			S[5] = C[0]; S[6] = C[1]; S[7] = C[2];
+			S[8] = SpecularIor.empty() ? 1.5f : SpecularIor[i];
+			S[9] = CoatWeight.empty() ? 0.0f : CoatWeight[i];
+			S[10] = CoatRoughness.empty() ? 0.0f : CoatRoughness[i];
+			S[11] = CoatIor.empty() ? 1.5f : CoatIor[i];
+			S[12] = CoatDarkening.empty() ? 0.0f : CoatDarkening[i];
+			const pxr::GfVec3f Sh = SheenColor.empty() ? pxr::GfVec3f(0, 0, 0) : SheenColor[i];
+			S[13] = Sh[0]; S[14] = Sh[1]; S[15] = Sh[2];
+			S[16] = SheenRoughness.empty() ? 0.3f : SheenRoughness[i];
+			S[17] = SchlickMetal.empty() ? 0.0f : float(SchlickMetal[i] != 0);
+			S[18] = MaterialRoughness.empty() ? S[3] : MaterialRoughness[i];
+		}
+
+		if (!Reflected.empty() && !TransferIndirect.empty())
+		{
+			Splats.TransferField.SetNumUninitialized(int32(Count * 48));
+			FMemory::Memcpy(Splats.TransferField.GetData(), Reflected.cdata(), Count * 48 * sizeof(float));
+		}
+
+		// The shape operator, three a splat, kept as the file has it.
+		if (Curvature.size() == Count * 3)
+		{
+			Splats.TransferCurvature.SetNumUninitialized(int32(Count * 3));
+			FMemory::Memcpy(Splats.TransferCurvature.GetData(), Curvature.cdata(), Count * 3 * sizeof(float));
+		}
+		Splats.FileUnitsToCm = ImportData.ScaleFactor;
+
+		Splats.CellWords = CellWords;
+		if (CellWords > 0)
+		{
+			Splats.TransferCells.SetNumUninitialized(int32(Count * CellWords));
+			FMemory::Memcpy(Splats.TransferCells.GetData(), ShadowBits.cdata(), Count * CellWords * sizeof(uint32));
+		}
+	}
+
 	// The prim's own transform is not applied: athenea writes its clouds at
 	// /World/Splats with none, and a rotation would have to turn the harmonics.
 	const pxr::GfMatrix4d LocalToWorld = pxr::UsdGeomXformable(Field.GetPrim()).ComputeLocalToWorldTransform(At);
@@ -214,8 +385,11 @@ bool GSplatImporter::ImportUsd(const FString& Filename, UGSplatImportData& Impor
 
 	Splats.SplatCount = uint32(Count);
 	Splats.RecalculateBounds();
-	UE_LOG(LogGSplatEditor, Display, TEXT("%s: %llu gaussians, degree %d, %s colour."),
-		*Filename, uint64(Count), Degree, bLinear ? TEXT("linear") : TEXT("sRGB"));
+	UE_LOG(LogGSplatEditor, Display, TEXT("%s: %llu gaussians, degree %d, %s colour, %s."),
+		*Filename, uint64(Count), Degree, bLinear ? TEXT("linear") : TEXT("sRGB"),
+		TransferCount == 0 ? TEXT("no transfer")
+			: TransferIndirect.empty() ? *FString::Printf(TEXT("a transfer of %u direct values"), TransferCount)
+			: *FString::Printf(TEXT("a transfer of %u direct and %u indirect values"), TransferCount, 3 * TransferCount));
 	return true;
 }
 

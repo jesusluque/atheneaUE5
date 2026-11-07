@@ -17,6 +17,11 @@
       "Name": "GaussiansEditor",
       "Type": "Editor",
       "LoadingPhase": "Default"
+    },
+    {
+      "Name": "AtheneaCodecs",
+      "Type": "Editor",
+      "LoadingPhase": "Default"
     }
   ],
   "FriendlyName": "StarLightGS",

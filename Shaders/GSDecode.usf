@@ -108,3 +108,744 @@ void GSDecodeAtheneaCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// A file's own packing, its bytes as the file has them (FGaussianSplatData::
+// PackedBytes), decoded into the same float buffers. Axes, units and the
+// rotation rule are the ones above.
+
+ByteAddressBuffer InBytes;
+uint4 Streams0;      // .spz: where positions, alphas, colours and scales start
+uint2 Streams1;      // .spz: where rotations and harmonics start
+uint FractionalBits; // .spz: the fixed point's
+uint SmallestThree;  // .spz: rotations as smallest three (version 3 on)
+uint SpzRest;        // .spz: harmonic coefficients a colour (0, 3, 8 or 15)
+
+uint ByteAt(uint Address)
+{
+	return (InBytes.Load(Address & ~3u) >> ((Address & 3u) * 8u)) & 0xFFu;
+}
+
+void WriteSplat(uint i, float3 FilePosition, float3 FileScale, float4 Q, float3 BaseColor, float Opacity)
+{
+	OutPositions[i] = ToLocal(FilePosition) * UnitsToCm;
+	OutScales[i] = abs(ToLocal(FileScale)) * (UnitsToCm / 100.0f);
+	const float Handed = dot(cross(FileToLocalX, FileToLocalY), FileToLocalZ);
+	const float4 nq = normalize(Q);
+	OutOrientations[i] = normalize(float4(ToLocal(nq.xyz), Handed > 0.0f ? -nq.w : nq.w));
+	OutSHAndOpacities[i] = float4(BaseColor, Opacity);
+}
+
+// antimatter15's .splat: position f32 x 3, linear scale f32 x 3, rgba u8 x 4
+// (the colour as displayed, the opacity), rotation u8 x 4 as w x y z,
+// (v - 128) / 128 -- as athenea reads it (io/SplatReaders.cpp).
+[numthreads(64, 1, 1)]
+void GSDecodeSplatCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint i = Offset + DispatchThreadId.x;
+	if (i >= Count)
+	{
+		return;
+	}
+	const uint b = i * 32u;
+	const float3 P = asfloat(InBytes.Load3(b));
+	const float3 S = asfloat(InBytes.Load3(b + 12u));
+	const uint Rgba = InBytes.Load(b + 24u);
+	const uint Rot = InBytes.Load(b + 28u);
+	const float4 C = float4(Rgba & 0xFFu, (Rgba >> 8) & 0xFFu, (Rgba >> 16) & 0xFFu, Rgba >> 24) / 255.0f;
+	const float4 Wxyz = (float4(Rot & 0xFFu, (Rot >> 8) & 0xFFu, (Rot >> 16) & 0xFFu, Rot >> 24) - 128.0f) / 128.0f;
+	WriteSplat(i, P, S, float4(Wxyz.yzw, Wxyz.x), C.rgb, C.a);
+	const uint Base = i * 45u;
+	for (uint k = 0; k < 45u; ++k)
+	{
+		OutHighOrderSH[Base + k] = 0.0f;
+	}
+}
+
+// Niantic's .spz (load-spz.cc, splat-utils.h): 24-bit fixed point positions,
+// alpha as a byte of the opacity, colour as (c / 255 - 0.5) / 0.15 of the
+// constant coefficient, log scale as s / 16 - 10, rotation as its first three
+// ((r / 127.5) - 1, w from the unit length) or smallest three (2 bits the
+// largest, then three 10-bit signed magnitudes over sqrt 2), and the
+// harmonics as (h - 128) / 128, rgb per coefficient.
+[numthreads(64, 1, 1)]
+void GSDecodeSpzCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint i = Offset + DispatchThreadId.x;
+	if (i >= Count)
+	{
+		return;
+	}
+	float3 P;
+	const float Fixed = 1.0f / float(1u << FractionalBits);
+	[unroll] for (uint a = 0; a < 3u; ++a)
+	{
+		const uint At = Streams0.x + i * 9u + a * 3u;
+		int v = int(ByteAt(At) | (ByteAt(At + 1u) << 8) | (ByteAt(At + 2u) << 16));
+		v = (v & 0x800000) != 0 ? (v | int(0xFF000000)) : v;
+		P[a] = float(v) * Fixed;
+	}
+	const float Opacity = float(ByteAt(Streams0.y + i)) / 255.0f;
+	float3 Dc;
+	[unroll] for (uint c = 0; c < 3u; ++c)
+	{
+		Dc[c] = (float(ByteAt(Streams0.z + i * 3u + c)) / 255.0f - 0.5f) / 0.15f;
+	}
+	float3 S;
+	[unroll] for (uint s = 0; s < 3u; ++s)
+	{
+		S[s] = exp(float(ByteAt(Streams0.w + i * 3u + s)) / 16.0f - 10.0f);
+	}
+	float4 Q;   // x y z w
+	if (SmallestThree != 0u)
+	{
+		const uint At = Streams1.x + i * 4u;
+		uint Comp = ByteAt(At) | (ByteAt(At + 1u) << 8) | (ByteAt(At + 2u) << 16) | (ByteAt(At + 3u) << 24);
+		const uint Largest = Comp >> 30;
+		const uint Mask = (1u << 9u) - 1u;
+		float SumSquares = 0.0f;
+		for (int k = 3; k >= 0; --k)
+		{
+			if (uint(k) != Largest)
+			{
+				const uint Mag = Comp & Mask;
+				const uint Neg = (Comp >> 9u) & 1u;
+				Comp >>= 10u;
+				float v = 0.70710678118654752f * float(Mag) / float(Mask);
+				v = Neg == 1u ? -v : v;
+				Q[k] = v;
+				SumSquares += v * v;
+			}
+		}
+		Q[Largest] = sqrt(max(0.0f, 1.0f - SumSquares));
+	}
+	else
+	{
+		const uint At = Streams1.x + i * 3u;
+		const float3 Xyz = float3(ByteAt(At), ByteAt(At + 1u), ByteAt(At + 2u)) / 127.5f - 1.0f;
+		Q = float4(Xyz, sqrt(max(0.0f, 1.0f - dot(Xyz, Xyz))));
+	}
+	WriteSplat(i, P, S, Q, 0.5f + 0.28209479177387814f * Dc, Opacity);
+	const uint Base = i * 45u;
+	for (uint k = 0; k < 15u; ++k)
+	{
+		for (uint ch = 0; ch < 3u; ++ch)
+		{
+			OutHighOrderSH[Base + ch * 15u + k] = k < SpzRest
+				? (float(ByteAt(Streams1.y + (i * SpzRest + k) * 3u + ch)) - 128.0f) / 128.0f
+				: 0.0f;
+		}
+	}
+}
+
+// PlayCanvas's SOG (athenea's scene/sog_decode.slang, after PlayCanvas's
+// gsplat-sog-data.js): images of RGBA8 texels, one a splat, and a float stream
+// of ranges and codebooks. Streams0 = means_l, means_u, quats, scales;
+// Streams1 = sh0, shN_labels; Streams2 = shN_centroids, the floats. The
+// .spz parameters' slots carry PackedSpz in the importer's order: version
+// (FractionalBits), coefficients a colour (SmallestThree), the palette's width
+// in texels (SpzRest).
+uint2 Streams2;
+
+uint Texel(uint Stream, uint i) { return InBytes.Load(Stream + i * 4u); }
+uint Channel(uint t, uint c) { return (t >> (8u * c)) & 0xFFu; }
+float SogFloat(uint k) { return asfloat(InBytes.Load(Streams2.y + k * 4u)); }
+float Unlerp(float Lo, float Hi, uint Byte) { return Lo + (Hi - Lo) * (float(Byte) / 255.0f); }
+
+[numthreads(64, 1, 1)]
+void GSDecodeSogCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint i = Offset + DispatchThreadId.x;
+	if (i >= Count)
+	{
+		return;
+	}
+	const uint Version = FractionalBits;
+	const uint Keep = SmallestThree;
+	const uint CentroidsWidth = SpzRest;
+
+	// Position: 16 bits an axis over two images, in a signed log domain.
+	float3 P;
+	[unroll] for (uint a = 0; a < 3u; ++a)
+	{
+		const uint q = (Channel(Texel(Streams0.y, i), a) << 8) | Channel(Texel(Streams0.x, i), a);
+		const float n = SogFloat(a) + (SogFloat(3u + a) - SogFloat(a)) * (float(q) / 65535.0f);
+		P[a] = sign(n) * (exp(abs(n)) - 1.0f);
+	}
+
+	// Colour and opacity.
+	const uint c = Texel(Streams1.x, i);
+	float3 Dc;
+	float Opacity;
+	if (Version == 2u)
+	{
+		[unroll] for (uint k = 0; k < 3u; ++k)
+		{
+			Dc[k] = SogFloat(22u + 256u + Channel(c, k));
+		}
+		Opacity = float(Channel(c, 3)) / 255.0f;
+	}
+	else
+	{
+		[unroll] for (uint k = 0; k < 3u; ++k)
+		{
+			Dc[k] = Unlerp(SogFloat(12u + k), SogFloat(16u + k), Channel(c, k));
+		}
+		Opacity = 1.0f / (1.0f + exp(-Unlerp(SogFloat(15u), SogFloat(19u), Channel(c, 3))));
+	}
+
+	// Log scales, by codebook or by range.
+	float3 S;
+	const uint st = Texel(Streams0.w, i);
+	[unroll] for (uint a = 0; a < 3u; ++a)
+	{
+		const uint Byte = Channel(st, a);
+		S[a] = exp(Version == 2u ? SogFloat(22u + Byte) : Unlerp(SogFloat(6u + a), SogFloat(9u + a), Byte));
+	}
+
+	// Quaternion, smallest three: the alpha byte (252..255) names the one left out.
+	const float Norm = 1.41421356237f;
+	const uint qt = Texel(Streams0.z, i);
+	const float qa = (float(Channel(qt, 0)) / 255.0f - 0.5f) * Norm;
+	const float qb = (float(Channel(qt, 1)) / 255.0f - 0.5f) * Norm;
+	const float qc = (float(Channel(qt, 2)) / 255.0f - 0.5f) * Norm;
+	const float Rest = sqrt(max(0.0f, 1.0f - (qa * qa + qb * qb + qc * qc)));
+	float4 Q = float4(0, 0, 0, 1);   // x y z w
+	const int Mode = int(Channel(qt, 3)) - 252;
+	if (Mode == 0)      Q = float4(qa, qb, qc, Rest);
+	else if (Mode == 1) Q = float4(Rest, qb, qc, qa);
+	else if (Mode == 2) Q = float4(qb, Rest, qc, qa);
+	else if (Mode == 3) Q = float4(qb, qc, Rest, qa);
+
+	WriteSplat(i, P, S, Q, 0.5f + 0.28209479177387814f * Dc, Opacity);
+
+	// Higher harmonics through the palette: the label names an entry, a row
+	// holds 64 entries of Keep texels.
+	const uint Base = i * 45u;
+	for (uint k = 0; k < 45u; ++k)
+	{
+		OutHighOrderSH[Base + k] = 0.0f;
+	}
+	if (Keep == 0u)
+	{
+		return;
+	}
+	const uint Label = Texel(Streams1.y, i);
+	const uint Entry = Channel(Label, 0) | (Channel(Label, 1) << 8);
+	const uint u = (Entry % 64u) * Keep;
+	const uint v = Entry / 64u;
+	for (uint basis = 0; basis < Keep; ++basis)
+	{
+		const uint t = Texel(Streams2.x, (u + basis) + v * CentroidsWidth);
+		for (uint colour = 0; colour < 3u; ++colour)
+		{
+			const uint Byte = Channel(t, colour);
+			OutHighOrderSH[Base + colour * 15u + basis] =
+				Version == 2u ? SogFloat(22u + 512u + Byte) : Unlerp(SogFloat(20u), SogFloat(21u), Byte);
+		}
+	}
+}
+
+// glTF with KHR_gaussian_splatting (GSplatGltfImporter.cpp): the file's
+// buffers, and at Streams0.x a table of 21 accessors of four words -- the byte
+// address of the first element, the stride, the component type | normalized
+// << 16 | components << 20, present -- for position, rotation (x y z w),
+// linear scale, linear opacity, COLOR_0, and the 16 coefficients (rgb), in
+// glTF's own accessor rules: floats as they are, normalised integers over
+// their largest value (signed ones clamped at -1), others as their value.
+// SpzRest: the coefficients a colour beyond the constant one that are drawn.
+uint ShortAt(uint Address)
+{
+	return (InBytes.Load(Address & ~3u) >> ((Address & 2u) * 8u)) & 0xFFFFu;
+}
+
+float GltfComponent(uint4 A, uint i, uint c)
+{
+	const uint Type = A.z & 0xFFFFu;
+	const bool Normalized = ((A.z >> 16) & 1u) != 0u;
+	const uint At = A.x + i * A.y;
+	if (Type == 5126u)
+	{
+		return asfloat(InBytes.Load(At + c * 4u));
+	}
+	if (Type == 5121u)
+	{
+		const float v = float(ByteAt(At + c));
+		return Normalized ? v / 255.0f : v;
+	}
+	if (Type == 5120u)
+	{
+		const float v = float(int(ByteAt(At + c) << 24) >> 24);
+		return Normalized ? max(v / 127.0f, -1.0f) : v;
+	}
+	if (Type == 5123u)
+	{
+		const float v = float(ShortAt(At + c * 2u));
+		return Normalized ? v / 65535.0f : v;
+	}
+	if (Type == 5122u)
+	{
+		const float v = float(int(ShortAt(At + c * 2u) << 16) >> 16);
+		return Normalized ? max(v / 32767.0f, -1.0f) : v;
+	}
+	if (Type == 5125u)
+	{
+		return float(InBytes.Load(At + c * 4u));
+	}
+	return 0.0f;
+}
+
+uint4 GltfAccessor(uint Slot)
+{
+	return InBytes.Load4(Streams0.x + Slot * 16u);
+}
+
+// An accessor's element, the default's components where it has fewer; an
+// accessor with no data (present but no view) reads as zeros.
+float4 GltfRead(uint4 A, uint i, float4 Default)
+{
+	float4 r = Default;
+	if (A.w != 0u)
+	{
+		const uint Components = (A.z >> 20) & 7u;
+		[unroll] for (uint c = 0; c < 4u; ++c)
+		{
+			if (c < Components)
+			{
+				r[c] = GltfComponent(A, i, c);
+			}
+		}
+	}
+	return r;
+}
+
+[numthreads(64, 1, 1)]
+void GSDecodeGltfCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint i = Offset + DispatchThreadId.x;
+	if (i >= Count)
+	{
+		return;
+	}
+	const float3 P = GltfRead(GltfAccessor(0u), i, 0.0f).xyz;
+	const float4 Q = GltfRead(GltfAccessor(1u), i, float4(0.0f, 0.0f, 0.0f, 1.0f));
+	const float3 S = GltfRead(GltfAccessor(2u), i, 0.0f).xyz;
+	const uint4 OpacityA = GltfAccessor(3u);
+	const uint4 ColorA = GltfAccessor(4u);
+	const uint4 DcA = GltfAccessor(5u);
+	const float4 Color = GltfRead(ColorA, i, float4(0.5f, 0.5f, 0.5f, 1.0f));
+	const float Opacity = OpacityA.w != 0u ? GltfRead(OpacityA, i, 0.0f).x : Color.a;
+	const float3 Base = DcA.w != 0u ? 0.5f + 0.28209479177387814f * GltfRead(DcA, i, 0.0f).rgb : Color.rgb;
+	WriteSplat(i, P, S, Q, Base, Opacity);
+	const uint Out = i * 45u;
+	for (uint k = 0; k < 15u; ++k)
+	{
+		const uint4 A = GltfAccessor(6u + k);
+		const float3 v = k < SpzRest ? GltfRead(A, i, 0.0f).rgb : 0.0f;
+		[unroll] for (uint ch = 0; ch < 3u; ++ch)
+		{
+			OutHighOrderSH[Out + ch * 15u + k] = v[ch];
+		}
+	}
+}
+
+// athenea's .athc version 3, as sparkwebGPU writes it for the web (docs/docs/
+// athc-v3.md there), after the gunzip (GSplatAthcImporter.cpp). At Streams0.x:
+//   9 section descriptors of 8 words, in the order CORE, SHRS, TREE, MATL,
+//     SHAD, TXDI, TXIN, TXFD, CURV: present, words a element, arrays, 0, then the
+//     arrays' words (up to 4) -- a section is its arrays one after the other
+//     (CORE: positions 4, shape 4, tail 1; MATL: normals, emission, pbr,
+//     lobes as the file holds them; the rest one array);
+//   then Streams0.y blocks of 32 words: first element, elements, and for each
+//     section its address, its encoding and where its words go in Scratch,
+//     then three unused.
+// Streams0.z: the harmonics' words a splat; Streams0.w: the rest coefficients
+// a colour drawn; Streams1.x: the scratch's bytes; Streams1.y: the transfer's
+// values a splat (0: none); Streams2.x: the file's flags.
+// Encodings: 0 v2's words; 1 byte planes (byte b of every element, then byte
+// b + 1); 2 byte planes of each 16-bit lane's difference from the element
+// before (wrapping), summed into Scratch by GSAthc3UndeltaCS; 3 CPCA (a
+// transfer section's clusters), rebuilt into Scratch by GSAthc3CpcaCS.
+RWByteAddressBuffer Scratch;
+
+#define ATHC3_SECTIONS 9u
+#define ATHC3_BLOCK_WORDS 32u
+
+uint4 Athc3Desc(uint k) { return InBytes.Load4(Streams0.x + k * 32u); }
+uint4 Athc3Arrays(uint k) { return InBytes.Load4(Streams0.x + k * 32u + 16u); }
+uint Athc3BlockAt(uint b) { return Streams0.x + ATHC3_SECTIONS * 32u + b * ATHC3_BLOCK_WORDS * 4u; }
+uint2 Athc3Block(uint b) { return InBytes.Load2(Athc3BlockAt(b)); }
+uint3 Athc3Section(uint b, uint k) { return InBytes.Load3(Athc3BlockAt(b) + 8u + k * 12u); }
+
+// Where word w of a section's element lies: the array's first byte in the
+// section (n elements) and the array's row in bytes; w becomes the word in it.
+void Athc3Array(uint k, uint n, inout uint w, out uint Base, out uint Row)
+{
+	const uint4 A = Athc3Arrays(k);
+	Base = 0u;
+	Row = 4u;
+	[unroll] for (uint a = 0; a < 4u; ++a)
+	{
+		if (A[a] == 0u)
+		{
+			break;
+		}
+		if (w < A[a])
+		{
+			Row = A[a] * 4u;
+			return;
+		}
+		w -= A[a];
+		Base += n * A[a] * 4u;
+	}
+}
+
+uint Athc3Word(uint b, uint k, uint n, uint e, uint w)
+{
+	const uint3 S = Athc3Section(b, k);
+	uint Base, Row;
+	Athc3Array(k, n, w, Base, Row);
+	if (S.y == 0u)
+	{
+		return InBytes.Load(S.x + Base + e * Row + w * 4u);
+	}
+	if (S.y >= 2u)
+	{
+		return Scratch.Load(S.z + Base + e * Row + w * 4u);
+	}
+	const uint P = S.x + Base + (w * 4u) * n + e;
+	return ByteAt(P) | (ByteAt(P + n) << 8) | (ByteAt(P + 2u * n) << 16) | (ByteAt(P + 3u * n) << 24);
+}
+
+uint Athc3BlockOf(uint i)
+{
+	uint Lo = 0u, Hi = Streams0.y;
+	while (Hi - Lo > 1u)
+	{
+		const uint Mid = (Lo + Hi) / 2u;
+		if (Athc3Block(Mid).x <= i)
+		{
+			Lo = Mid;
+		}
+		else
+		{
+			Hi = Mid;
+		}
+	}
+	return Lo;
+}
+
+// One group a block, one thread a word of a row across the sections: a
+// delta-coded word's two lanes summed over the block's elements in order.
+[numthreads(128, 1, 1)]
+void GSAthc3UndeltaCS(uint3 GroupId : SV_GroupID, uint3 ThreadId : SV_GroupThreadID)
+{
+	const uint b = GroupId.x;
+	if (b >= Streams0.y)
+	{
+		return;
+	}
+	uint w = ThreadId.x;
+	uint k = 0u;
+	for (; k < ATHC3_SECTIONS; ++k)
+	{
+		const uint4 D = Athc3Desc(k);
+		if (D.x != 0u && w < D.y)
+		{
+			break;
+		}
+		w -= D.x != 0u ? D.y : 0u;
+	}
+	if (k >= ATHC3_SECTIONS)
+	{
+		return;
+	}
+	const uint3 S = Athc3Section(b, k);
+	if (S.y != 2u)
+	{
+		return;
+	}
+	const uint n = Athc3Block(b).y;
+	uint Base, Row;
+	Athc3Array(k, n, w, Base, Row);
+	uint Lo = 0u, Hi = 0u;
+	for (uint e = 0; e < n; ++e)
+	{
+		const uint P = S.x + Base + (w * 4u) * n + e;
+		Lo = (Lo + (ByteAt(P) | (ByteAt(P + n) << 8))) & 0xFFFFu;
+		Hi = (Hi + (ByteAt(P + 2u * n) | (ByteAt(P + 3u * n) << 8))) & 0xFFFFu;
+		Scratch.Store(S.z + Base + e * Row + w * 4u, Lo | (Hi << 16));
+	}
+}
+
+// One thread an element: each CPCA-coded section of its block rebuilt into
+// Scratch as halves (athc_cpca.rs decode_cpca). Mode 0: the halves as byte
+// planes after the mode word. Mode 1: K, M, D, B; K f32 steps; K x (1 + M) x D
+// f16 (a cluster's mean, then its M directions), to a word; n cluster bytes;
+// M x B planes of n bytes, byte b of each coefficient's zig-zag integer. A
+// value is the mean plus each coefficient times its step times its
+// direction, in that order, in f32, then the nearest half.
+[numthreads(64, 1, 1)]
+void GSAthc3CpcaCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint i = Offset + DispatchThreadId.x;
+	if (i >= Count)
+	{
+		return;
+	}
+	const uint b = Athc3BlockOf(i);
+	const uint2 Block = Athc3Block(b);
+	const uint n = Block.y;
+	const uint e = i - Block.x;
+	for (uint k = 5u; k < 8u; ++k)
+	{
+		const uint3 S = Athc3Section(b, k);
+		const uint Words = Athc3Desc(k).y;
+		if (Athc3Desc(k).x == 0u || S.y != 3u)
+		{
+			continue;
+		}
+		const uint Out = S.z + e * Words * 4u;
+		if (InBytes.Load(S.x) == 0u)
+		{
+			for (uint w = 0; w < Words; ++w)
+			{
+				const uint P = S.x + 4u + (w * 4u) * n + e;
+				Scratch.Store(Out + w * 4u, ByteAt(P) | (ByteAt(P + n) << 8) | (ByteAt(P + 2u * n) << 16) | (ByteAt(P + 3u * n) << 24));
+			}
+			continue;
+		}
+		const uint K = InBytes.Load(S.x + 4u);
+		const uint M = min(InBytes.Load(S.x + 8u), 48u);
+		const uint D = InBytes.Load(S.x + 12u);
+		const uint B = InBytes.Load(S.x + 16u);
+		const uint StepsAt = S.x + 20u;
+		const uint BasisAt = StepsAt + 4u * K;
+		const uint IdsAt = ((BasisAt + 2u * K * (1u + M) * D) + 3u) & ~3u;
+		const uint PlanesAt = IdsAt + n;
+		const uint c = min(ByteAt(IdsAt + e), K - 1u);
+		const float Step = asfloat(InBytes.Load(StepsAt + 4u * c));
+		float Coef[48];
+		for (uint j = 0; j < M; ++j)
+		{
+			uint z = 0u;
+			for (uint bb = 0; bb < B; ++bb)
+			{
+				z |= ByteAt(PlanesAt + (j * B + bb) * n + e) << (8u * bb);
+			}
+			const int q = int(z >> 1) ^ -int(z & 1u);
+			Coef[j] = float(q) * Step;
+		}
+		const uint Cluster = BasisAt + 2u * c * (1u + M) * D;
+		for (uint v = 0; v < D; v += 2u)
+		{
+			float2 Acc;
+			[unroll] for (uint h = 0; h < 2u; ++h)
+			{
+				const uint At = Cluster + 2u * (v + h);
+				float a = f16tof32(ShortAt(At));
+				for (uint j2 = 0; j2 < M; ++j2)
+				{
+					const float Prod = Coef[j2] * f16tof32(ShortAt(Cluster + 2u * ((1u + j2) * D + v + h)));
+					a = a + Prod;
+				}
+				Acc[h] = a;
+			}
+			Scratch.Store(Out + v * 2u, (f32tof16(Acc.x) & 0xFFFFu) | (f32tof16(Acc.y) << 16));
+		}
+	}
+}
+
+[numthreads(64, 1, 1)]
+void GSDecodeAthc3CS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint i = Offset + DispatchThreadId.x;
+	if (i >= Count)
+	{
+		return;
+	}
+	const uint b = Athc3BlockOf(i);
+	const uint2 Block = Athc3Block(b);
+	const uint n = Block.y;
+	const uint e = i - Block.x;
+
+	float4 P;
+	[unroll] for (uint k = 0; k < 4u; ++k)
+	{
+		P[k] = asfloat(Athc3Word(b, 0u, n, e, k));
+	}
+	uint4 Shape;
+	[unroll] for (uint s = 0; s < 4u; ++s)
+	{
+		Shape[s] = Athc3Word(b, 0u, n, e, 4u + s);
+	}
+
+	// As GSDecodeAtheneaCS.
+	OutPositions[i] = ToLocal(P.xyz) * UnitsToCm;
+	const float3 Scale = exp(float3(LowHalf(Shape.y), HighHalf(Shape.y), LowHalf(Shape.z)));
+	OutScales[i] = abs(ToLocal(Scale)) * (UnitsToCm / 100.0f);
+	const float4 Q = DecodeQuaternion(Shape.x);
+	const float Handed = dot(cross(FileToLocalX, FileToLocalY), FileToLocalZ);
+	OutOrientations[i] = normalize(float4(ToLocal(Q.xyz), Handed > 0.0f ? -Q.w : Q.w));
+
+	// A paged tree's merged node (children past zero) is drawn at no opacity:
+	// its leaves are drawn instead.
+	const bool Merged = Athc3Desc(2u).x != 0u && Athc3Section(b, 2u).x != 0xFFFFFFFFu && (Athc3Word(b, 2u, n, e, 1u) >> 16) != 0u;
+	OutSHAndOpacities[i] = float4(HighHalf(Shape.z), LowHalf(Shape.w), HighHalf(Shape.w), Merged ? 0.0f : P.w);
+
+	const uint Kept = Streams0.w;
+	const uint Base = i * 45u;
+	for (uint k2 = 0; k2 < 15u; ++k2)
+	{
+		for (uint c = 0; c < 3u; ++c)
+		{
+			float v = 0.0f;
+			if (k2 < Kept)
+			{
+				const uint Index = k2 * 3u + c;
+				const uint Word = Athc3Word(b, 1u, n, e, Index / 2u);
+				v = (Index & 1u) == 0u ? LowHalf(Word) : HighHalf(Word);
+			}
+			OutHighOrderSH[Base + c * 15u + k2] = v;
+		}
+	}
+}
+
+// A TX cloud's streams into the buffers a USD TX cloud's arrays fill
+// (FGaussianSplatData's Transfer, TransferMetallic, TransferSurface,
+// TransferCells and TransferField; GSColor.ush reads them): the transfer's
+// halves, which run across TXDI, TXIN and TXFD as one array, its direct
+// values then the indirect ones, then the reflected field; the open cells
+// (SHAD); and from MATL the normal, metallic, roughness, the Schlick and
+// material-roughness bits of the pbr word, and the lobes (athenea's
+// packing.slang and splat_encoding.slang).
+RWStructuredBuffer<float> OutTransfer;
+RWStructuredBuffer<float> OutMetallic;
+RWStructuredBuffer<float> OutSurface;
+RWStructuredBuffer<uint> OutCells;
+RWStructuredBuffer<float> OutField;
+RWStructuredBuffer<float> OutCurvature;
+uint TxDirect;     // direct values a splat (9 or 16)
+uint TxField;      // 1: the field's 48 values follow the indirect ones
+uint TxCellWords;  // SHAD's words a splat, 0 for none
+
+float Athc3Half(uint b, uint n, uint e, uint h)
+{
+	uint g = h / 2u;
+	uint k = 5u;
+	for (; k < 8u; ++k)
+	{
+		const uint4 D = Athc3Desc(k);
+		if (D.x != 0u && g < D.y)
+		{
+			break;
+		}
+		g -= D.x != 0u ? D.y : 0u;
+	}
+	if (k >= 8u)
+	{
+		return 0.0f;
+	}
+	const uint Word = Athc3Word(b, k, n, e, g);
+	return (h & 1u) == 0u ? LowHalf(Word) : HighHalf(Word);
+}
+
+float3 UnpackOctahedral(uint Word)
+{
+	const float2 f = float2(float(Word & 0xFFFFu), float(Word >> 16)) / 65535.0f * 2.0f - 1.0f;
+	float3 v = float3(f.x, f.y, 1.0f - abs(f.x) - abs(f.y));
+	const float t = saturate(-v.z);
+	v.x += v.x >= 0.0f ? -t : t;
+	v.y += v.y >= 0.0f ? -t : t;
+	return normalize(v);
+}
+
+float LobeByte(uint Word, uint At) { return float((Word >> (At * 8u)) & 0xFFu) / 255.0f; }
+
+[numthreads(64, 1, 1)]
+void GSDecodeAthc3TxCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint i = Offset + DispatchThreadId.x;
+	if (i >= Count)
+	{
+		return;
+	}
+	const uint b = Athc3BlockOf(i);
+	const uint2 Block = Athc3Block(b);
+	const uint n = Block.y;
+	const uint e = i - Block.x;
+
+	const uint T = Streams1.y;
+	const uint Stride = 4u * TxDirect;
+	for (uint v = 0; v < Stride; ++v)
+	{
+		OutTransfer[i * Stride + v] = v < T ? Athc3Half(b, n, e, v) : 0.0f;
+	}
+	if (TxField != 0u)
+	{
+		for (uint f = 0; f < 48u; ++f)
+		{
+			OutField[i * 48u + f] = Athc3Half(b, n, e, Stride + f);
+		}
+	}
+	for (uint c = 0; c < TxCellWords; ++c)
+	{
+		OutCells[i * TxCellWords + c] = Athc3Word(b, 4u, n, e, c);
+	}
+	// CURV: the shape operator, three halves in two words.
+	if (Athc3Desc(8u).x != 0u)
+	{
+		const uint W0 = Athc3Word(b, 8u, n, e, 0u);
+		const uint W1 = Athc3Word(b, 8u, n, e, 1u);
+		OutCurvature[i * 3u + 0u] = LowHalf(W0);
+		OutCurvature[i * 3u + 1u] = HighHalf(W0);
+		OutCurvature[i * 3u + 2u] = LowHalf(W1);
+	}
+
+	// MATL: its arrays in the file's order, normals and emission as the flags
+	// say, then pbr and lobes.
+	const uint Flags = Streams2.x;
+	const bool Material = Athc3Desc(3u).x != 0u;
+	uint w = 0u;
+	float3 Normal = float3(0.0f, 0.0f, 1.0f);
+	if (Material && (Flags & 1u) != 0u)
+	{
+		Normal = UnpackOctahedral(Athc3Word(b, 3u, n, e, w));
+		w += 1u;
+	}
+	if ((Flags & 4u) != 0u)
+	{
+		w += 1u;
+	}
+	const uint MaterialWords = Material ? Athc3Desc(3u).y : 0u;
+	const bool HasPbr = w < MaterialWords;
+	const uint Pbr = HasPbr ? Athc3Word(b, 3u, n, e, w) : 0u;
+	const bool HasLobes = w + 4u <= MaterialWords;
+	const uint3 Lobes = HasLobes
+		? uint3(Athc3Word(b, 3u, n, e, w + 1u), Athc3Word(b, 3u, n, e, w + 2u), Athc3Word(b, 3u, n, e, w + 3u))
+		: uint3(0xFFFFFFFFu, 0x40000000u | (32u << 16), 0u);   // plainLobes: white, weight 1; index 1.5 both
+
+	const float Roughness = HasPbr ? float((Pbr >> 8) & 0xFFu) / 255.0f : 0.5f;
+	OutMetallic[i] = HasPbr ? float(Pbr & 0xFFu) / 255.0f : 0.0f;
+	const uint o = i * 20u;
+	OutSurface[o + 0u] = Normal.x;
+	OutSurface[o + 1u] = Normal.y;
+	OutSurface[o + 2u] = Normal.z;
+	OutSurface[o + 3u] = Roughness;
+	OutSurface[o + 4u] = LobeByte(Lobes.x, 3u);
+	OutSurface[o + 5u] = LobeByte(Lobes.x, 0u);
+	OutSurface[o + 6u] = LobeByte(Lobes.x, 1u);
+	OutSurface[o + 7u] = LobeByte(Lobes.x, 2u);
+	OutSurface[o + 8u] = 1.0f + float(Lobes.y >> 24) / 128.0f;
+	OutSurface[o + 9u] = LobeByte(Lobes.y, 0u);
+	OutSurface[o + 10u] = LobeByte(Lobes.y, 1u);
+	OutSurface[o + 11u] = 1.0f + float((Lobes.y >> 16) & 0x7Fu) / 64.0f;
+	OutSurface[o + 12u] = ((Lobes.y >> 23) & 1u) != 0u ? 1.0f : 0.0f;
+	OutSurface[o + 13u] = LobeByte(Lobes.z, 0u);
+	OutSurface[o + 14u] = LobeByte(Lobes.z, 1u);
+	OutSurface[o + 15u] = LobeByte(Lobes.z, 2u);
+	OutSurface[o + 16u] = LobeByte(Lobes.z, 3u);
+	OutSurface[o + 17u] = ((Pbr >> 25) & 1u) != 0u ? 1.0f : 0.0f;
+	OutSurface[o + 18u] = ((Pbr >> 26) & 1u) != 0u ? float(Pbr >> 27) / 31.0f : Roughness;
+	OutSurface[o + 19u] = 0.0f;
+}

@@ -95,6 +95,11 @@ UGSplatFactory::UGSplatFactory()
 	Formats.Add(TEXT("usda;Gaussian splats (USD ParticleField)"));
 	Formats.Add(TEXT("usdc;Gaussian splats (USD ParticleField)"));
 	Formats.Add(TEXT("athc;athenea chunked cloud"));
+	Formats.Add(TEXT("splat;Gaussian splats (antimatter15)"));
+	Formats.Add(TEXT("spz;Gaussian splats (Niantic SPZ)"));
+	Formats.Add(TEXT("sog;Gaussian splats (PlayCanvas SOG)"));
+	Formats.Add(TEXT("glb;Gaussian splats (glTF KHR_gaussian_splatting)"));
+	Formats.Add(TEXT("gltf;Gaussian splats (glTF KHR_gaussian_splatting)"));
 	ImportPriority = DefaultImportPriority + 10;
 }
 
@@ -126,7 +131,11 @@ bool UGSplatFactory::FactoryCanImport(const FString& Filename)
 	{
 		return GSplatImporter::StageHasSplats(Filename);
 	}
-	if (GSplatImporter::IsAthcFile(Filename))
+	if (GSplatImporter::IsGltfFile(Filename))
+	{
+		return GSplatImporter::GltfHasSplats(Filename);
+	}
+	if (GSplatImporter::IsAthcFile(Filename) || GSplatImporter::IsSplatFile(Filename) || GSplatImporter::IsSogFile(Filename))
 	{
 		return true;
 	}
@@ -220,12 +229,19 @@ UObject* UGSplatFactory::ImportInternal(UClass* InClass, UObject* InParent, FNam
 
 	// athenea: a USD stage or a .athc carries its own axes, units and colour
 	// space, so it is read with no dialogue.
-	if (GSplatImporter::IsUsdFile(Filename) || GSplatImporter::IsAthcFile(Filename))
+	if (GSplatImporter::IsUsdFile(Filename) || GSplatImporter::IsAthcFile(Filename) || GSplatImporter::IsSplatFile(Filename)
+		|| GSplatImporter::IsSogFile(Filename) || GSplatImporter::IsGltfFile(Filename))
 	{
 		Object->Splats.Empty();
 		const bool bRead = GSplatImporter::IsUsdFile(Filename)
 			? GSplatImporter::ImportUsd(Filename, *Object->AssetImportData, Object->Splats)
-			: GSplatImporter::ImportAthc(Filename, *Object->AssetImportData, Object->Splats);
+			: GSplatImporter::IsAthcFile(Filename)
+			? GSplatImporter::ImportAthc(Filename, *Object->AssetImportData, Object->Splats)
+			: GSplatImporter::IsGltfFile(Filename)
+			? GSplatImporter::ImportGltf(Filename, *Object->AssetImportData, Object->Splats)
+			: GSplatImporter::IsSogFile(Filename)
+			? GSplatImporter::ImportSog(Filename, *Object->AssetImportData, Object->Splats)
+			: GSplatImporter::ImportSplatFile(Filename, *Object->AssetImportData, Object->Splats);
 		if (!bRead)
 		{
 			Object->Splats.Empty();

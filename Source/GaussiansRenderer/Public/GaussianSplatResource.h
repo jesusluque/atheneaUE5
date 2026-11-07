@@ -26,6 +26,19 @@ BEGIN_UNIFORM_BUFFER_STRUCT(FGaussianSplatShaderResources, GAUSSIANSRENDERER_API
 	SHADER_PARAMETER(FVector3f, FileAxisX)
 	SHADER_PARAMETER(FVector3f, FileAxisY)
 	SHADER_PARAMETER(FVector3f, FileAxisZ)
+
+	// athenea: a TX cloud's transfer and metallic (GS_COLOR_TRANSFER).
+	SHADER_PARAMETER(uint32, TransferDirectCount)
+	SHADER_PARAMETER_SRV(StructuredBuffer<float>, Transfer)
+	SHADER_PARAMETER_SRV(StructuredBuffer<float>, TransferMetallic)
+	SHADER_PARAMETER_SRV(StructuredBuffer<float>, TransferSurface)
+	SHADER_PARAMETER(uint32, CellWords)
+	SHADER_PARAMETER_SRV(StructuredBuffer<uint>, TransferCells)
+	SHADER_PARAMETER(uint32, HasField)
+	SHADER_PARAMETER_SRV(StructuredBuffer<float>, TransferField)
+	SHADER_PARAMETER(uint32, HasCurvature)
+	SHADER_PARAMETER_SRV(StructuredBuffer<float>, TransferCurvature)
+	SHADER_PARAMETER(float, FileUnitsToCm)
 END_UNIFORM_BUFFER_STRUCT()
 
 BEGIN_UNIFORM_BUFFER_STRUCT(FGaussianSplatPrimitiveShaderResources, GAUSSIANSRENDERER_API)
@@ -79,6 +92,9 @@ public:
 	uint32 GetSplatCount() const { return SplatData.SplatCount; }
 	// Checks from CPU copy of splat data if this resource supports relighting
 	bool SupportsRelighting() const { return SplatData.SupportsRelighting(); }
+	// athenea: whether the colour is an albedo a transfer lights
+	bool HasTransfer() const { return SplatData.bHasTransfer; }
+	bool HasCurvature() const { return SplatData.bHasTransfer && (!SplatData.TransferCurvature.IsEmpty() || (SplatData.bPacked && SplatData.bPackedCurvature)); }
 
 private:
 	// CPU copy of data that this resource will copy to GPU
@@ -108,4 +124,19 @@ private:
 	FBufferResources NormalsBuffer;
 	FBufferResources HighOrderSHBuffer;
 	FBufferResources MetallicRoughnessBuffer;
+
+	// athenea: a TX cloud's transfer
+	FBufferResources TransferBuffer;
+	FBufferResources TransferMetallicBuffer;
+	FBufferResources TransferSurfaceBuffer;
+	FBufferResources TransferCellsBuffer;
+	FBufferResources TransferFieldBuffer;
+	// athenea: a .athc v3 TX cloud's transfer buffers, written by the device.
+	FBufferResources PackedTransfer;
+	FBufferResources PackedMetallic;
+	FBufferResources PackedSurface;
+	FBufferResources PackedCells;
+	FBufferResources PackedField;
+	FBufferResources PackedCurvature;
+	FBufferResources CurvatureBuffer;
 };

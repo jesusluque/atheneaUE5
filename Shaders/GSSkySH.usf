@@ -1,0 +1,229 @@
+// Copyright (c) 2026 jesus luque.
+//
+// The sky light as a TX transfer reads it, in the file's frame of the
+// primitive being drawn: its sun found and taken out, as athenea's env_sun
+// takes it (technique/env_sun.slang), and the rest projected onto the 16 real
+// harmonics the transfer was measured on (envBasisValue,
+// light/environment.slang).
+//
+// Directions are 16384 points of a Fibonacci sphere in the file's frame, each
+// worth 4 pi / 16384 of solid angle (equal area); each is taken to the world,
+// the sky light's cubemap read along it at a mip of about 64 texels a face
+// (SkyMip), times the sky light's colour and intensity (View.SkyLightColor).
+//
+//   1. the sky's median luminance (a histogram of log2 luminance in half
+//      stops, robust to the sun itself) and its brightest direction;
+//   2. the sun: the directions at least max(16 median, 0.02 peak) bright and
+//      within ten degrees of the brightest, where the peak is 32 times the
+//      median; summed into an irradiance, a light-weighted centre and a solid
+//      angle, and kept as a sun only where it is as compact as a disc of
+//      that solid angle (else it stays in the sky);
+//   3. the harmonics of everything that is not the sun.
+//
+// OutSkySH[0..15] the harmonics; [16] the sun's direction (file frame) and the
+// half angle of its cone, 0 for no sun; [17] its irradiance and the threshold.
+// One group of 256 threads.
+
+#include "/Engine/Private/Common.ush"
+
+TextureCube SkyCubemap;
+SamplerState SkyCubemapSampler;
+float SkyMip;
+RWStructuredBuffer<float4> OutSkySH;
+
+#define GS_SKY_THREADS 256
+#define GS_SKY_DIRECTIONS 16384
+#define GS_SKY_BINS 80
+
+static const float3 kGrey = float3(0.2126f, 0.7152f, 0.0722f);
+static const float kSunOverMedian = 16.0f;
+static const float kSunOfPeak = 0.02f;
+static const float kSunPeakOverMedian = 32.0f;
+static const float kSunWidest = 0.175f;
+
+groupshared float3 Partial[GS_SKY_THREADS];
+groupshared float PartialW[GS_SKY_THREADS];
+groupshared uint Histogram[GS_SKY_BINS];
+
+float GSEnvBasis(uint k, float3 d)
+{
+	const float x = d.x, y = d.y, z = d.z;
+	switch (k)
+	{
+	case 0:  return 0.28209479177387814f;
+	case 1:  return -0.4886025119029199f * y;
+	case 2:  return 0.4886025119029199f * z;
+	case 3:  return -0.4886025119029199f * x;
+	case 4:  return 1.0925484305920792f * x * y;
+	case 5:  return -1.0925484305920792f * y * z;
+	case 6:  return 0.31539156525252005f * (2.0f * z * z - x * x - y * y);
+	case 7:  return -1.0925484305920792f * x * z;
+	case 8:  return 0.5462742152960396f * (x * x - y * y);
+	case 9:  return -0.5900435899266435f * y * (3.0f * x * x - y * y);
+	case 10: return 2.890611442640554f * x * y * z;
+	case 11: return -0.4570457994644658f * y * (4.0f * z * z - x * x - y * y);
+	case 12: return 0.3731763325901154f * z * (2.0f * z * z - 3.0f * x * x - 3.0f * y * y);
+	case 13: return -0.4570457994644658f * x * (4.0f * z * z - x * x - y * y);
+	case 14: return 1.445305721320277f * z * (x * x - y * y);
+	case 15: return -0.5900435899266435f * x * (x * x - 3.0f * y * y);
+	default: return 0.0f;
+	}
+}
+
+float3 FileDirection(uint i)
+{
+	const float z = 1.0f - (2.0f * float(i) + 1.0f) / float(GS_SKY_DIRECTIONS);
+	const float r = sqrt(max(0.0f, 1.0f - z * z));
+	const float phi = float(i) * 2.399963229728653f;
+	return float3(r * cos(phi), r * sin(phi), z);
+}
+
+float3 SkyAlong(float3 d)
+{
+	const float3 Local = GSResources.FileAxisX * d.x + GSResources.FileAxisY * d.y + GSResources.FileAxisZ * d.z;
+	const float3 World = normalize(mul(Local, (float3x3) Primitive.LocalToRelativeWorld));
+	return TextureCubeSampleLevel(SkyCubemap, SkyCubemapSampler, World, SkyMip).rgb * View.SkyLightColor.rgb;
+}
+
+// The sum of a value over the group, left in Partial[0] and PartialW[0].
+void Reduce(uint Thread, float3 Value, float W)
+{
+	Partial[Thread] = Value;
+	PartialW[Thread] = W;
+	GroupMemoryBarrierWithGroupSync();
+	for (uint Stride = GS_SKY_THREADS / 2; Stride > 0; Stride >>= 1)
+	{
+		if (Thread < Stride)
+		{
+			Partial[Thread] += Partial[Thread + Stride];
+			PartialW[Thread] += PartialW[Thread + Stride];
+		}
+		GroupMemoryBarrierWithGroupSync();
+	}
+}
+
+[numthreads(GS_SKY_THREADS, 1, 1)]
+void GSSkySHCS(uint Thread : SV_GroupIndex)
+{
+	const float Omega = 4.0f * PI / float(GS_SKY_DIRECTIONS);
+
+	// 1. The median and the peak.
+	if (Thread < GS_SKY_BINS)
+	{
+		Histogram[Thread] = 0u;
+	}
+	GroupMemoryBarrierWithGroupSync();
+	float Peak = -1.0f;
+	uint PeakAt = 0u;
+	for (uint i = Thread; i < GS_SKY_DIRECTIONS; i += GS_SKY_THREADS)
+	{
+		const float Lum = dot(SkyAlong(FileDirection(i)), kGrey);
+		const uint Bin = uint(clamp((log2(max(Lum, 1.0e-9f)) + 20.0f) * 2.0f, 0.0f, 79.0f));
+		InterlockedAdd(Histogram[Bin], 1u);
+		if (Lum > Peak)
+		{
+			Peak = Lum;
+			PeakAt = i;
+		}
+	}
+	Partial[Thread] = float3(Peak, asfloat(PeakAt), 0.0f);
+	GroupMemoryBarrierWithGroupSync();
+	for (uint Stride = GS_SKY_THREADS / 2; Stride > 0; Stride >>= 1)
+	{
+		if (Thread < Stride && Partial[Thread + Stride].x > Partial[Thread].x)
+		{
+			Partial[Thread] = Partial[Thread + Stride];
+		}
+		GroupMemoryBarrierWithGroupSync();
+	}
+	const float SkyPeak = Partial[0].x;
+	const float3 Axis = FileDirection(asuint(Partial[0].y));
+	GroupMemoryBarrierWithGroupSync();
+	float Median = 0.0f;
+	{
+		uint Below = 0u;
+		for (uint b = 0; b < GS_SKY_BINS; ++b)
+		{
+			Below += Histogram[b];
+			if (Below * 2u >= uint(GS_SKY_DIRECTIONS))
+			{
+				Median = exp2(float(b) * 0.5f - 20.0f + 0.25f);
+				break;
+			}
+		}
+	}
+	const float Threshold = max(kSunOverMedian * Median, kSunOfPeak * SkyPeak);
+	const bool Found = SkyPeak > kSunPeakOverMedian * max(Median, 1.0e-9f);
+	const float CosWidest = cos(kSunWidest);
+
+	// 2. The sun's directions, and the harmonics of the rest and of the sun.
+	float3 Sum[16];
+	float3 SunSum[16];
+	for (uint k = 0; k < 16; ++k)
+	{
+		Sum[k] = 0;
+		SunSum[k] = 0;
+	}
+	float3 Delivered = 0;
+	float3 Centre = 0;
+	float Weight = 0;
+	float Solid = 0;
+	for (uint i = Thread; i < GS_SKY_DIRECTIONS; i += GS_SKY_THREADS)
+	{
+		const float3 d = FileDirection(i);
+		const float3 L = SkyAlong(d);
+		const float Lum = dot(L, kGrey);
+		const bool InSun = Found && Lum >= Threshold && dot(d, Axis) >= CosWidest;
+		if (InSun)
+		{
+			Delivered += L * Omega;
+			Centre += d * (Lum * Omega);
+			Weight += Lum * Omega;
+			Solid += Omega;
+		}
+		for (uint k = 0; k < 16; ++k)
+		{
+			const float3 v = L * (GSEnvBasis(k, d) * Omega);
+			if (InSun)
+			{
+				SunSum[k] += v;
+			}
+			else
+			{
+				Sum[k] += v;
+			}
+		}
+	}
+
+	Reduce(Thread, Delivered, Solid);
+	const float3 SunDelivered = Partial[0];
+	const float SunSolid = PartialW[0];
+	GroupMemoryBarrierWithGroupSync();
+	Reduce(Thread, Centre, Weight);
+	const float3 SunCentre = Partial[0];
+	const float SunWeight = PartialW[0];
+	GroupMemoryBarrierWithGroupSync();
+
+	// A sun is a disc: its light-weighted spread about the centre, 2 (1 -
+	// |mean direction|), no more than twice a disc's of its solid angle.
+	const float DiscCone = SunSolid > 0.0f ? acos(saturate(1.0f - SunSolid / (2.0f * PI))) : 0.0f;
+	const float Spread = SunWeight > 0.0f ? 2.0f * max(1.0f - length(SunCentre) / SunWeight, 0.0f) : 0.0f;
+	const bool Compact = Spread <= DiscCone * DiscCone + 1.0e-6f;
+	const bool IsSun = Found && SunSolid > 0.0f && dot(SunCentre, SunCentre) > 0.0f && Compact;
+
+	// 3. The harmonics; a region that is no sun stays in them.
+	for (uint k = 0; k < 16; ++k)
+	{
+		Reduce(Thread, IsSun ? Sum[k] : Sum[k] + SunSum[k], 0.0f);
+		if (Thread == 0)
+		{
+			OutSkySH[k] = float4(Partial[0], 0.0f);
+		}
+		GroupMemoryBarrierWithGroupSync();
+	}
+	if (Thread == 0)
+	{
+		OutSkySH[16] = float4(IsSun ? normalize(SunCentre) : Axis, IsSun ? max(DiscCone, 1.0e-4f) : 0.0f);
+		OutSkySH[17] = float4(IsSun ? SunDelivered : 0.0f, Threshold);
+	}
+}

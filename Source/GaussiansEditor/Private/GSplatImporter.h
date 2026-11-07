@@ -24,6 +24,19 @@ namespace GSplatImporter
 	// athenea: a .athc's finest level, packed (GSplatAthcImporter.cpp).
 	bool IsAthcFile(const FString& Filename);
 	bool ImportAthc(const FString& Filename, UGSplatImportData& ImportData, FGaussianSplatData& Splats);
+
+	// athenea: .splat and .spz kept as their bytes (GSplatFileImporter.cpp).
+	bool IsSplatFile(const FString& Filename);
+	bool ImportSplatFile(const FString& Filename, UGSplatImportData& ImportData, FGaussianSplatData& Splats);
+
+	// athenea: PlayCanvas's .sog, or an unbundled SOG's meta.json (GSplatSogImporter.cpp).
+	bool IsSogFile(const FString& Filename);
+	bool ImportSog(const FString& Filename, UGSplatImportData& ImportData, FGaussianSplatData& Splats);
+
+	// athenea: glTF with KHR_gaussian_splatting, .glb or .gltf (GSplatGltfImporter.cpp).
+	bool IsGltfFile(const FString& Filename);
+	bool GltfHasSplats(const FString& Filename);
+	bool ImportGltf(const FString& Filename, UGSplatImportData& ImportData, FGaussianSplatData& Splats);
 };
 
 enum class EGSplatSwizzleAxis : uint8;

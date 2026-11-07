@@ -1,0 +1,357 @@
+// Copyright (c) 2026 jesus luque.
+//
+// What a TX cloud reflects: athenea's polish (splat/splat_relight.slang), the
+// lobes of a gaussian's surface against the sky, ported to HLSL function by
+// function, with athenea's names and comments' substance kept short here. All
+// directions are in the file's frame, which is the frame the cloud's normals,
+// transfer and open-direction cells were written in; the sky is read in the
+// world through SkyWorld.
+//
+//   GSGgxDirectionalAlbedo, GSGgxEnergyCompensation  material/microfacet.slang
+//   GSFresnelDielectric, GSArtisticIor, GSFresnelConductor
+//   GSSheenDirectionalAlbedo                         imageworksSheenDirectionalAlbedo
+//   GSEnvDielectricAt / Exact, GSEnvConductorEdged, GSEnvSchlickMetal
+//   GSEnvironmentBrdf                                environmentBrdfOf
+//   GSLayers                                         splatLayers
+//   GSCellsOpen, GSConeOpen, GSLobeOpen              splatCellsOpen, splatConeOpen, splatLobeOpen
+
+#pragma once
+
+// The surface a splat keeps (FGaussianSplatData::TransferSurface).
+#define GS_SURFACE_STRIDE 20u
+
+struct FGSSurface
+{
+	float3 Normal;
+	float Roughness;
+	float SpecularWeight;
+	float3 SpecularColor;
+	float SpecularIor;
+	float CoatWeight;
+	float CoatRoughness;
+	float CoatIor;
+	float CoatDarkening;
+	float3 SheenColor;
+	float SheenRoughness;
+	bool SchlickMetal;
+	float MaterialRoughness;
+	float Metallic;
+	float3 Albedo;
+};
+
+FGSSurface GSReadSurface(uint SplatIndex, float3 Albedo)
+{
+	const uint b = SplatIndex * GS_SURFACE_STRIDE;
+	FGSSurface s;
+	s.Normal = float3(GSResources.TransferSurface[b], GSResources.TransferSurface[b + 1], GSResources.TransferSurface[b + 2]);
+	s.Roughness = GSResources.TransferSurface[b + 3];
+	s.SpecularWeight = GSResources.TransferSurface[b + 4];
+	s.SpecularColor = float3(GSResources.TransferSurface[b + 5], GSResources.TransferSurface[b + 6], GSResources.TransferSurface[b + 7]);
+	s.SpecularIor = GSResources.TransferSurface[b + 8];
+	s.CoatWeight = GSResources.TransferSurface[b + 9];
+	s.CoatRoughness = GSResources.TransferSurface[b + 10];
+	s.CoatIor = GSResources.TransferSurface[b + 11];
+	s.CoatDarkening = GSResources.TransferSurface[b + 12];
+	s.SheenColor = float3(GSResources.TransferSurface[b + 13], GSResources.TransferSurface[b + 14], GSResources.TransferSurface[b + 15]);
+	s.SheenRoughness = GSResources.TransferSurface[b + 16];
+	s.SchlickMetal = GSResources.TransferSurface[b + 17] > 0.5f;
+	s.MaterialRoughness = GSResources.TransferSurface[b + 18];
+	s.Metallic = saturate(GSResources.TransferMetallic[SplatIndex]);
+	s.Albedo = Albedo;
+	return s;
+}
+
+float GSSquare(float x) { return x * x; }
+
+float3 GSGgxDirectionalAlbedo(float NdotV, float Alpha, float3 F0, float3 F90)
+{
+	const float x = NdotV;
+	const float y = Alpha;
+	const float x2 = x * x;
+	const float y2 = y * y;
+	const float4 r = float4(0.1003f, 0.9345f, 1.0f, 1.0f) +
+	                 float4(-0.6303f, -2.323f, -1.765f, 0.2281f) * x +
+	                 float4(9.748f, 2.229f, 8.263f, 15.94f) * y +
+	                 float4(-2.038f, -3.748f, 11.53f, -55.83f) * x * y +
+	                 float4(29.34f, 1.424f, 28.96f, 13.08f) * x2 +
+	                 float4(-8.245f, -0.7684f, -7.507f, 41.26f) * y2 +
+	                 float4(-26.44f, 1.436f, -36.11f, 54.9f) * x2 * y +
+	                 float4(19.99f, 0.2913f, 15.86f, 300.2f) * x * y2 +
+	                 float4(-5.448f, 0.6286f, 33.37f, -285.1f) * x2 * y2;
+	const float2 ab = saturate(r.xy / r.zw);
+	return F0 * ab.x + F90 * ab.y;
+}
+
+float3 GSGgxEnergyCompensation(float NdotV, float Alpha, float3 Fss)
+{
+	const float Ess = GSGgxDirectionalAlbedo(NdotV, Alpha, 1.0f, 1.0f).x;
+	return 1.0f + Fss * (1.0f - Ess) / Ess;
+}
+
+float GSIorToF0(float Ior) { return GSSquare((Ior - 1.0f) / (Ior + 1.0f)); }
+
+float GSDielectricF0(float Ior)
+{
+	return abs(Ior - 1.5f) < 1.0e-6f ? 0.04f : GSIorToF0(max(Ior, 1.0f));
+}
+
+float GSFresnelDielectric(float CosTheta, float Ior)
+{
+	const float c = CosTheta;
+	const float g2 = Ior * Ior + c * c - 1.0f;
+	if (g2 < 0.0f)
+	{
+		return 1.0f;
+	}
+	const float g = sqrt(g2);
+	return 0.5f * GSSquare((g - c) / (g + c)) * (1.0f + GSSquare(((g + c) * c - 1.0f) / ((g - c) * c + 1.0f)));
+}
+
+void GSArtisticIor(float3 Reflectivity, float3 Edge, out float3 Ior, out float3 Extinction)
+{
+	const float3 r = clamp(Reflectivity, 0.0f, 0.99f);
+	const float3 Root = sqrt(r);
+	const float3 Low = (1.0f - r) / (1.0f + r);
+	const float3 High = (1.0f + Root) / (1.0f - Root);
+	Ior = lerp(High, Low, saturate(Edge));
+	const float3 Up = Ior + 1.0f;
+	const float3 Down = Ior - 1.0f;
+	Extinction = sqrt(max((Up * Up * r - Down * Down) / max(1.0f - r, 1.0e-6f), 0.0f));
+}
+
+float3 GSFresnelConductor(float CosTheta, float3 n, float3 k)
+{
+	const float CosTheta2 = GSSquare(saturate(CosTheta));
+	const float SinTheta2 = 1.0f - CosTheta2;
+	const float3 n2 = n * n;
+	const float3 k2 = k * k;
+	const float3 t0 = n2 - k2 - SinTheta2;
+	const float3 a2plusb2 = sqrt(t0 * t0 + 4.0f * n2 * k2);
+	const float3 t1 = a2plusb2 + CosTheta2;
+	const float3 a = sqrt(max(0.5f * (a2plusb2 + t0), 0.0f));
+	const float3 t2 = 2.0f * a * CosTheta;
+	const float3 rs = (t1 - t2) / (t1 + t2);
+	const float3 t3 = CosTheta2 * a2plusb2 + SinTheta2 * SinTheta2;
+	const float3 t4 = t2 * SinTheta2;
+	const float3 rp = rs * (t3 - t4) / (t3 + t4);
+	return 0.5f * (rp + rs);
+}
+
+float GSSheenDirectionalAlbedo(float NdotV, float Roughness)
+{
+	const float2 r = float2(13.67300f, 1.0f) + float2(-68.78018f, 61.57746f) * NdotV +
+	                 float2(799.08825f, 442.78211f) * Roughness + float2(-905.00061f, 2597.49308f) * NdotV * Roughness +
+	                 float2(60.28956f, 121.81241f) * NdotV * NdotV + float2(1086.96473f, 3045.55075f) * Roughness * Roughness;
+	return saturate(r.x / r.y);
+}
+
+float3 GSEnvDielectricAt(float Roughness, float NdotV, float Ior)
+{
+	const float Alpha = max(Roughness * Roughness, 1.0e-4f);
+	const float3 F = GSFresnelDielectric(NdotV, max(Ior, 1.0f));
+	return GSGgxDirectionalAlbedo(NdotV, Alpha, GSDielectricF0(Ior), 1.0f) * GSGgxEnergyCompensation(NdotV, Alpha, F);
+}
+
+float3 GSEnvDielectricExactAt(float Roughness, float NdotV, float Ior)
+{
+	const float Alpha = max(Roughness * Roughness, 1.0e-4f);
+	const float Index = max(Ior, 1.0f);
+	const float F0 = GSDielectricF0(Index);
+	const float Schlick = F0 + (1.0f - F0) * pow(1.0f - saturate(NdotV), 5.0f);
+	const float Exact = GSFresnelDielectric(saturate(NdotV), Index);
+	if (Alpha < 1.0e-3f)
+	{
+		return Exact;
+	}
+	const float Ratio = Exact / max(Schlick, 1.0e-6f);
+	return GSEnvDielectricAt(Roughness, NdotV, Ior) * lerp(Ratio, 1.0f, saturate(Alpha));
+}
+
+float3 GSEnvConductorEdged(float3 Albedo, float3 Edge, float Roughness, float NdotV)
+{
+	const float Alpha = max(Roughness * Roughness, 1.0e-4f);
+	float3 Index;
+	float3 Extinction;
+	GSArtisticIor(saturate(Albedo), saturate(Edge), Index, Extinction);
+	const float3 F = GSFresnelConductor(NdotV, Index, Extinction);
+	return GSGgxDirectionalAlbedo(NdotV, Alpha, F, F) * GSGgxEnergyCompensation(NdotV, Alpha, F);
+}
+
+float3 GSEnvSchlickMetal(float3 Albedo, float3 Edge, float Roughness, float NdotV)
+{
+	const float Alpha = max(Roughness * Roughness, 1.0e-4f);
+	const float3 F0 = saturate(Albedo);
+	const float3 F90 = saturate(Edge);
+	const float3 F = F0 + (F90 - F0) * pow(1.0f - saturate(NdotV), 5.0f);
+	return GSGgxDirectionalAlbedo(NdotV, Alpha, F0, F90) * GSGgxEnergyCompensation(NdotV, Alpha, F);
+}
+
+// environmentBrdfOf: the specular lobe against a whole sky.
+float3 GSEnvironmentBrdf(FGSSurface s, float NdotV)
+{
+	const float3 Dielectric = GSEnvDielectricAt(s.Roughness, NdotV, s.SpecularIor) * s.SpecularWeight * s.SpecularColor;
+	const float3 Metal = s.SchlickMetal ? GSEnvSchlickMetal(s.Albedo, s.SpecularColor, s.Roughness, NdotV)
+	                                    : GSEnvConductorEdged(s.Albedo, s.SpecularColor, s.Roughness, NdotV);
+	return lerp(Dielectric, Metal, s.Metallic);
+}
+
+struct FGSLayers
+{
+	float3 Coat;
+	float3 Sheen;
+	float3 Under;
+	float3 BelowCoat;
+};
+
+// splatLayers: the coat and the sheen over the base, and OpenPBR's coat
+// darkening of what reaches it.
+FGSLayers GSLayers(FGSSurface s, float NdotV)
+{
+	FGSLayers l;
+	const float3 Fitted = s.CoatWeight > 0.0f ? s.CoatWeight * GSEnvDielectricAt(s.CoatRoughness, NdotV, s.CoatIor) : 0.0f;
+	l.Coat = s.CoatWeight > 0.0f ? s.CoatWeight * GSEnvDielectricExactAt(s.CoatRoughness, NdotV, s.CoatIor) : 0.0f;
+	const float SheenAlbedo = any(s.SheenColor > 0.0f) ? GSSheenDirectionalAlbedo(NdotV, max(s.SheenRoughness, 0.01f)) : 0.0f;
+	l.Sheen = s.SheenColor * SheenAlbedo;
+	const float SheenWeight = max(max(s.SheenColor.x, s.SheenColor.y), s.SheenColor.z);
+	l.BelowCoat = saturate(1.0f - Fitted);
+	l.Under = l.BelowCoat * saturate(1.0f - SheenWeight * SheenAlbedo);
+	if (s.CoatWeight > 0.0f && s.CoatDarkening >= 0.5f)
+	{
+		const float n = max(s.CoatIor, 1.0f);
+		const float K = 1.0f - (1.0f - GSDielectricF0(n)) / (n * n);
+		const float3 E = saturate(lerp(s.Albedo, s.Albedo * s.SpecularWeight, s.Metallic));
+		l.Under *= lerp(1.0f, (1.0f - K) / max(1.0f - E * K, 1.0e-4f), s.CoatWeight);
+	}
+	return l;
+}
+
+// common/octahedral.slang
+float2 GSOctWrap(float2 v)
+{
+	return (1.0f - abs(v.yx)) * select(v >= 0.0f, 1.0f, -1.0f);
+}
+
+float2 GSOctEncode(float3 n)
+{
+	n /= max(abs(n.x) + abs(n.y) + abs(n.z), 1.0e-20f);
+	const float2 p = n.z >= 0.0f ? n.xy : GSOctWrap(n.xy);
+	return p * 0.5f + 0.5f;
+}
+
+float3 GSOctDecode(float2 f)
+{
+	f = f * 2.0f - 1.0f;
+	float3 n = float3(f.x, f.y, 1.0f - abs(f.x) - abs(f.y));
+	const float t = saturate(-n.z);
+	n.x += n.x >= 0.0f ? -t : t;
+	n.y += n.y >= 0.0f ? -t : t;
+	return normalize(n);
+}
+
+uint GSCellSide() { return GSResources.CellWords >= 32u ? 32u : 16u; }
+
+bool GSCellBit(uint SplatIndex, uint Index)
+{
+	return ((GSResources.TransferCells[SplatIndex * GSResources.CellWords + (Index >> 5u)] >> (Index & 31u)) & 1u) != 0u;
+}
+
+// splatCellsOpen: the cells bilinearly read along d, those behind Axis (when
+// one is given) left out; -1 where none counts.
+float GSCellsOpen(uint SplatIndex, float3 d, float3 Axis)
+{
+	const uint Side = GSCellSide();
+	const float SideF = float(Side);
+	const bool Judged = dot(Axis, Axis) > 0.0f;
+	const float2 At = GSOctEncode(d) * SideF - 0.5f;
+	const float2 Lo = floor(At);
+	const float2 f = At - Lo;
+	float Open = 0.0f;
+	float Weight = 0.0f;
+	[unroll] for (uint k = 0; k < 4; ++k)
+	{
+		const int2 Cell = clamp(int2(Lo) + int2(k & 1, k >> 1), 0, int(Side) - 1);
+		const float w = ((k & 1) != 0 ? f.x : 1.0f - f.x) * ((k >> 1) != 0 ? f.y : 1.0f - f.y);
+		if (w <= 0.0f)
+		{
+			continue;
+		}
+		if (Judged && dot(GSOctDecode((float2(Cell) + 0.5f) / SideF), Axis) <= 0.0f)
+		{
+			continue;
+		}
+		Open += w * (GSCellBit(SplatIndex, uint(Cell.y) * Side + uint(Cell.x)) ? 1.0f : 0.0f);
+		Weight += w;
+	}
+	return Weight > 0.0f ? Open / Weight : -1.0f;
+}
+
+// splatConeOpen: the centre and a ring of six at Spread, never narrower than
+// a cell.
+float GSConeOpen(uint SplatIndex, float3 m, float SpreadIn, float3 Axis)
+{
+	const float Centre = GSCellsOpen(SplatIndex, m, Axis);
+	const float HalfCell = PI / float(GSCellSide() * 2u);
+	const float Spread = max(SpreadIn, 2.0f * HalfCell);
+	const float3 Helper = abs(m.z) < 0.999f ? float3(0, 0, 1) : float3(1, 0, 0);
+	const float3 t = normalize(cross(Helper, m));
+	const float3 b = cross(m, t);
+	const float c = cos(Spread);
+	const float sn = sin(Spread);
+	float Open = Centre >= 0.0f ? Centre / 3.0f : 0.0f;
+	float Weight = Centre >= 0.0f ? 1.0f / 3.0f : 0.0f;
+	[unroll] for (uint k = 0; k < 6; ++k)
+	{
+		const float Phi = float(k) * (PI / 3.0f);
+		const float3 d = normalize(m * c + (t * cos(Phi) + b * sin(Phi)) * sn);
+		const float o = GSCellsOpen(SplatIndex, d, Axis);
+		if (o >= 0.0f)
+		{
+			Open += o / 9.0f;
+			Weight += 1.0f / 9.0f;
+		}
+	}
+	return Weight > 0.0f ? Open / Weight : 1.0f;
+}
+
+// splatLobeOpen: the share of a GGX lobe about m the cells leave open.
+float GSLobeOpen(uint SplatIndex, float3 m, float Roughness, float3 Axis)
+{
+	if (GSResources.CellWords < 8u)
+	{
+		return 1.0f;
+	}
+	const float Alpha = max(Roughness * Roughness, 1.0e-3f);
+	return GSConeOpen(SplatIndex, m, min(1.4f * atan(Alpha), 1.2f), Axis);
+}
+
+// splatOpenness: how much of the hemisphere a gaussian faces is open, from the
+// transfer's constant term (an open plane's is C0).
+float GSOpenness(uint SplatIndex)
+{
+	return saturate(GSResources.Transfer[SplatIndex * 4u * GSResources.TransferDirectCount] / 0.28209479177387814f);
+}
+
+// specularOpenness: Lagarde and de Rousiers' fit of a reflection's occlusion
+// from the openness, for a lobe the cells do not answer.
+float GSSpecularOpenness(float NdotV, float Openness, float Roughness)
+{
+	return saturate(pow(NdotV + Openness, exp2(-16.0f * Roughness - 1.0f)) - 1.0f + Openness);
+}
+
+// splatFieldAlong: the reflected field along d (the file's frame), its bands
+// damped by the lobe's width, exp(-l (l + 1) alpha^2).
+float3 GSFieldAlong(uint SplatIndex, float3 d, float Roughness)
+{
+	const float Alpha = Roughness * Roughness;
+	const float A2 = Alpha * Alpha;
+	const uint Base = SplatIndex * 48u;
+	float3 Sum = 0;
+	[unroll] for (uint j = 0; j < 16u; ++j)
+	{
+		const float Band = j < 1u ? 0.0f : (j < 4u ? 2.0f : (j < 9u ? 6.0f : 12.0f));
+		const float3 Value = float3(GSResources.TransferField[Base + j * 3u], GSResources.TransferField[Base + j * 3u + 1u],
+		                            GSResources.TransferField[Base + j * 3u + 2u]);
+		Sum += Value * (exp(-Band * A2) * GSEnvBasis(j, d));
+	}
+	return max(Sum, 0.0f);
+}

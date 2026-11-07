@@ -9,6 +9,318 @@
 
 #define GS_COLOR_HIGH_ORDER_SH 1u
 #define GS_COLOR_LINEARIZE     2u
+#define GS_COLOR_TRANSFER      4u
+
+// The sky on the transfer's 16 harmonics, in the file's frame (GSSkySH.usf),
+// for the primitive being drawn, its sun taken out: [16] the sun's direction
+// and cone (0: none), [17] its irradiance. Read only by a TX cloud.
+StructuredBuffer<float4> SkySH;
+// r.Gaussians.Athenea.Debug: 1 draws the projected sky's mean radiance.
+uint AtheneaDebug;
+
+// The sky light's cubemap, its mips prefiltered by roughness as UE prefilters
+// them, which a TX cloud's polish reads along its reflection.
+TextureCube SkyCubemap;
+SamplerState SkyCubemapSampler;
+float SkyMips;
+
+
+// The sky's radiance along d (the file's frame) at a lobe's roughness: d taken
+// to the world as the sky pass takes it, the mip UE's own reflections read at
+// that roughness (ComputeReflectionCaptureMipFromRoughness).
+// The sky without its sun, prefiltered by roughness, its mips at the roughness
+// UE's captures put there (GSSkyResidual.usf); no mips where the frame made
+// none, and the sky light's own cube is read, sun included.
+TextureCube SkyResidual;
+float SkyResidualMips;
+
+float3 GSSkyRadiance(float3 d, float Roughness)
+{
+	const float3 Local = GSResources.FileAxisX * d.x + GSResources.FileAxisY * d.y + GSResources.FileAxisZ * d.z;
+	const float3 World = normalize(mul(Local, (float3x3) Primitive.LocalToRelativeWorld));
+	if (SkyResidualMips > 0.0f)
+	{
+		const float ResidualMip = clamp(SkyResidualMips - 1.0f - (1.0f - 1.2f * log2(max(Roughness, 0.001f))), 0.0f, SkyResidualMips - 1.0f);
+		return TextureCubeSampleLevel(SkyResidual, SkyCubemapSampler, World, ResidualMip).rgb * View.SkyLightColor.rgb;
+	}
+	const float LevelFrom1x1 = 1.0f - 1.2f * log2(max(Roughness, 0.001f));
+	const float Mip = clamp(SkyMips - 1.0f - LevelFrom1x1, 0.0f, max(SkyMips - 1.0f, 0.0f));
+	return TextureCubeSampleLevel(SkyCubemap, SkyCubemapSampler, World, Mip).rgb * View.SkyLightColor.rgb;
+}
+
+// athenea's environment basis (light/environment.slang): the sky's harmonics,
+// the reflected field's, and the debug views'.
+float GSEnvBasis(uint k, float3 d)
+{
+	const float x = d.x, y = d.y, z = d.z;
+	switch (k)
+	{
+	case 0:  return 0.28209479177387814f;
+	case 1:  return -0.4886025119029199f * y;
+	case 2:  return 0.4886025119029199f * z;
+	case 3:  return -0.4886025119029199f * x;
+	case 4:  return 1.0925484305920792f * x * y;
+	case 5:  return -1.0925484305920792f * y * z;
+	case 6:  return 0.31539156525252005f * (2.0f * z * z - x * x - y * y);
+	case 7:  return -1.0925484305920792f * x * z;
+	case 8:  return 0.5462742152960396f * (x * x - y * y);
+	case 9:  return -0.5900435899266435f * y * (3.0f * x * x - y * y);
+	case 10: return 2.890611442640554f * x * y * z;
+	case 11: return -0.4570457994644658f * y * (4.0f * z * z - x * x - y * y);
+	case 12: return 0.3731763325901154f * z * (2.0f * z * z - 3.0f * x * x - 3.0f * y * y);
+	case 13: return -0.4570457994644658f * x * (4.0f * z * z - x * x - y * y);
+	case 14: return 1.445305721320277f * z * (x * x - y * y);
+	case 15: return -0.5900435899266435f * x * (x * x - 3.0f * y * y);
+	default: return 0.0f;
+	}
+}
+
+#include "GSPolish.ush"
+
+// What of the sky reaches a TX gaussian, direct and bounced: <T_direct +
+// T_indirect, L> -- athenea's transferredBody (splat_relight.slang), the
+// albedo left out.
+float3 GSTransferredFront(uint SplatIndex)
+{
+	const uint D = GSResources.TransferDirectCount;
+	const uint Base = SplatIndex * 4u * D;
+	float3 Sum = 0;
+	for (uint k = 0; k < D; ++k)
+	{
+		const float3 L = SkySH[k].rgb;
+		const float3 Indirect = float3(GSResources.Transfer[Base + D + k * 3u],
+		                               GSResources.Transfer[Base + D + k * 3u + 1u],
+		                               GSResources.Transfer[Base + D + k * 3u + 2u]);
+		Sum += L * (GSResources.Transfer[Base + k] + Indirect);
+	}
+	return max(Sum, 0.0f);
+}
+
+// splatIndirectAlong: how much a delta of unit irradiance from d brings this
+// gaussian after bouncing off what stands around it.
+float3 GSIndirectAlong(uint SplatIndex, float3 d)
+{
+	const uint D = GSResources.TransferDirectCount;
+	const uint Base = SplatIndex * 4u * D + D;
+	float3 Sum = 0;
+	for (uint k = 0; k < D; ++k)
+	{
+		Sum += float3(GSResources.Transfer[Base + k * 3u], GSResources.Transfer[Base + k * 3u + 1u],
+		              GSResources.Transfer[Base + k * 3u + 2u]) * GSEnvBasis(k, d);
+	}
+	return Sum;
+}
+
+// splatFieldCoupling: how much more or less light the scene bounces under this
+// sky than under a white one, per channel -- the gaussian's own indirect
+// transfer dotted with the sky, and read along the sun, over its constant
+// term times sqrt(4 pi).
+float3 GSFieldCoupling(uint SplatIndex)
+{
+	const uint D = GSResources.TransferDirectCount;
+	const uint Base = SplatIndex * 4u * D + D;
+	float3 Gathered = 0;
+	for (uint k = 0; k < D; ++k)
+	{
+		Gathered += float3(GSResources.Transfer[Base + k * 3u], GSResources.Transfer[Base + k * 3u + 1u],
+		                   GSResources.Transfer[Base + k * 3u + 2u]) * SkySH[k].rgb;
+	}
+	float3 Mean = SkySH[0].rgb * 0.28209479177387814f;
+	if (SkySH[16].w > 0.0f)
+	{
+		Gathered += SkySH[17].rgb * GSIndirectAlong(SplatIndex, SkySH[16].xyz);
+		Mean += SkySH[17].rgb * (1.0f / (4.0f * PI));
+	}
+	const float3 White = float3(GSResources.Transfer[Base], GSResources.Transfer[Base + 1u], GSResources.Transfer[Base + 2u])
+		* 3.5449077018110318f;
+	return select(White > 1.0e-4f, max(Gathered / max(White, 1.0e-4f), 0.0f), Mean);
+}
+
+
+
+// THE SHARP LOBES, DRAWN PER PIXEL (athenea's SplatSlope sharp lobe,
+// splat_relight and splat_blend). A coat smoother than kSharpRoughness, or a
+// base polish smoother than kSharpPolishRoughness, mirrors what changes faster
+// than a gaussian is wide; its centre's reading is taken out of the colour and
+// the raster reads the sky again along the mirror each pixel turns to. The
+// prepass says how the surface's normal turns a pixel right and down (from the
+// cloud's curvature, in the file's frame) before it asks for the colour, and
+// takes the payload back after:
+//   A: the mirror at the centre (octahedral, the world), its step a pixel
+//      right and a pixel down, the coat's weight (a luminance) and roughness;
+//   B: the polish's weight (rgb) and roughness, the sun's through the polish
+//      (rgb, times the share the cells let through) and through the coat.
+// The sun's direction and irradiance are the frame's (GSSunWorld).
+#define GS_SHARP_ROUGHNESS 0.2f
+#define GS_SHARP_POLISH_ROUGHNESS 0.5f
+static bool GSSharpOn = false;
+static float3 GSSharpTurnX = 0;
+static float3 GSSharpTurnY = 0;
+static float GSSharpTurn2 = 0;
+static uint4 GSSharpA = 0;
+static uint4 GSSharpB = 0;
+
+uint GSPackHalves(float a, float b) { return (f32tof16(a) & 0xFFFFu) | (f32tof16(b) << 16); }
+
+// GSOctEncode, GSOctDecode: GSPolish.ush (athenea's common/octahedral.slang).
+
+float3 GSFileToWorld(float3 d)
+{
+	const float3 Local = GSResources.FileAxisX * d.x + GSResources.FileAxisY * d.y + GSResources.FileAxisZ * d.z;
+	return normalize(mul(Local, (float3x3) Primitive.LocalToRelativeWorld));
+}
+
+// THE SUN IN A REFLECTION, analytic (athenea's splat_relight sunReflectPdf):
+// with the eye along the normal, as the prefiltered map assumes, the lobe's
+// distribution of reflected directions, D(h) / 4 for the half vector between
+// the mirror and the sun, integrating to one; the disc folded into the lobe's
+// width (its half angle added in quadrature to alpha). A lobe's weight times
+// the sun's irradiance times this is the sun's whole reflection.
+float GSSunReflectPdf(float3 Mirror, float3 ToSun, float Roughness, float DiscHalfAngle)
+{
+	const float Alpha = max(Roughness * Roughness, 1.0e-3f);
+	const float a2 = Alpha * Alpha + DiscHalfAngle * DiscHalfAngle;
+	const float CosTheta = clamp(dot(Mirror, ToSun), -1.0f, 1.0f);
+	const float CosHalf2 = saturate(0.5f * (1.0f + CosTheta));
+	const float d = CosHalf2 * (a2 - 1.0f) + 1.0f;
+	return a2 / (PI * d * d) * 0.25f;
+}
+
+// A TX gaussian seen along d (the file's frame, from the eye): relitByDome's
+// opaque sum: the body under its layers, the polish of the base lobe and the
+// coat, each narrowed by the open directions and filled where they are closed
+// by the reflected field, and the sheen. Not here yet: the sun athenea
+// separates from a sky, glass and thin walls.
+float3 GSTransferredRadiance(uint SplatIndex, float3 Albedo, float3 d)
+{
+	FGSSurface s = GSReadSurface(SplatIndex, Albedo);
+	const float3 wo = -d;
+	float3 n = normalize(s.Normal);
+	n = dot(n, wo) < 0.0f ? -n : n;
+	const float NdotV = max(dot(n, wo), 1.0e-4f);
+	const float3 Mirror = reflect(d, n);
+
+	// transferViewless: the sky's harmonics, then the sun athenea separates
+	// from the sky -- its cosine shadowed by the cells along it, and its
+	// bounce read from the indirect transfer along it.
+	float3 Front = GSTransferredFront(SplatIndex);
+	const bool HasSun = SkySH[16].w > 0.0f;
+	const float3 SunDirection = SkySH[16].xyz;
+	const float3 Irradiance = SkySH[17].rgb;
+	float SunShare = 1.0f;
+	if (HasSun && GSResources.CellWords >= 8u)
+	{
+		const float Open = GSCellsOpen(SplatIndex, SunDirection, n);
+		SunShare = Open >= 0.0f ? Open : 1.0f;
+	}
+	if (HasSun)
+	{
+		Front += Irradiance * (max(dot(n, SunDirection), 0.0f) * SunShare / PI);
+		if (GSResources.CellWords >= 8u)
+		{
+			Front += Irradiance * GSIndirectAlong(SplatIndex, SunDirection);
+		}
+	}
+	const FGSLayers Layers = GSLayers(s, NdotV);
+
+	const bool Cells = GSResources.CellWords >= 8u;
+	const bool Field = Cells && GSResources.HasField != 0u;
+	const float3 Coupling = Field ? GSFieldCoupling(SplatIndex) : 0.0f;
+	const float Openness = GSOpenness(SplatIndex);
+
+	const float3 Body = Layers.Under * s.Albedo * (1.0f - s.Metallic) * Front;
+
+	// The base lobe: the cells and the field only for a material rough enough
+	// (kPolishFieldRoughness); a smoother one is narrowed by the openness fit.
+	const bool PolishField = Field && s.MaterialRoughness >= 0.3f;
+	const float Narrowed = PolishField ? GSLobeOpen(SplatIndex, Mirror, s.Roughness, n)
+	                                   : GSSpecularOpenness(NdotV, Openness, s.Roughness);
+	const float3 Closed = PolishField ? Coupling * GSFieldAlong(SplatIndex, Mirror, s.Roughness) : 0.0f;
+	// The sun the residual map no longer holds, through the lobe, by the share
+	// the cells let through.
+	const bool SunApart = HasSun && SkyResidualMips > 0.0f;
+	const float3 PolishSun = SunApart
+		? Irradiance * (SunShare * GSSunReflectPdf(Mirror, SunDirection, s.Roughness, SkySH[16].w)) : 0.0f;
+	const float3 Polish = Layers.Under * max(GSEnvironmentBrdf(s, NdotV)
+		* (Narrowed * GSSkyRadiance(Mirror, s.Roughness) + (1.0f - Narrowed) * Closed + PolishSun), 0.0f);
+
+	// The coat: the cells wherever the cloud keeps them, and what its closed
+	// directions show from the field.
+	float3 Coat = 0;
+	if (s.CoatWeight > 0.0f)
+	{
+		const float CoatNarrowed = Cells ? GSLobeOpen(SplatIndex, Mirror, s.CoatRoughness, n)
+		                                 : GSSpecularOpenness(NdotV, Openness, s.CoatRoughness);
+		const float3 CoatSeen = GSSkyRadiance(Mirror, s.CoatRoughness);
+		const float3 CoatSun = SunApart
+			? Irradiance * (SunShare * GSSunReflectPdf(Mirror, SunDirection, s.CoatRoughness, SkySH[16].w)) : 0.0f;
+		Coat = Field ? max(Layers.Coat * (CoatNarrowed * CoatSeen
+		                       + (1.0f - CoatNarrowed) * Coupling * GSFieldAlong(SplatIndex, Mirror, s.CoatRoughness) + CoatSun), 0.0f)
+		             : Layers.Coat * (CoatNarrowed * CoatSeen + CoatSun);
+	}
+	const float3 Sheen = Layers.BelowCoat * Layers.Sheen * Front;
+	float3 Radiance = max(Body + Polish + Coat + Sheen, 0.0f);
+
+	// The sharp lobes go to the raster: their centre's readings out of the
+	// colour (which may go below zero; the raster clamps after adding).
+	GSSharpA = 0;
+	GSSharpB = 0;
+	if (GSSharpOn && SkyResidualMips > 0.0f)
+	{
+		const bool SharpCoat = s.CoatWeight > 0.0f && s.CoatRoughness < GS_SHARP_ROUGHNESS;
+		const bool SharpPolish = s.Roughness < GS_SHARP_POLISH_ROUGHNESS && !PolishField;
+		if (SharpCoat || SharpPolish)
+		{
+			// The turn was measured for the stored normal; n may face the other way.
+			const float Side = dot(n, s.Normal) >= 0.0f ? 1.0f : -1.0f;
+			const float3 MirrorX = reflect(d, normalize(n + Side * GSSharpTurnX));
+			const float3 MirrorY = reflect(d, normalize(n + Side * GSSharpTurnY));
+			const float3 Grey = float3(0.2126f, 0.7152f, 0.0722f);
+			float CoatW = 0.0f, CoatR = 1.0f, CoatSunW = 0.0f;
+			float3 PolishW = 0.0f, PolishSunW = 0.0f;
+			float PolishR = 1.0f;
+			if (SharpCoat)
+			{
+				const float CoatNarrowed = Cells ? GSLobeOpen(SplatIndex, Mirror, s.CoatRoughness, n)
+				                                 : GSSpecularOpenness(NdotV, Openness, s.CoatRoughness);
+				CoatW = dot(Layers.Coat, Grey) * CoatNarrowed;
+				Radiance -= CoatW * GSSkyRadiance(Mirror, s.CoatRoughness);
+				if (SunApart)
+				{
+					CoatSunW = dot(Layers.Coat, Grey) * SunShare;
+					Radiance -= CoatSunW * Irradiance * GSSunReflectPdf(Mirror, SunDirection, s.CoatRoughness, SkySH[16].w);
+				}
+				// The pixel's own spread: the normal turns across it.
+				const float a = s.CoatRoughness * s.CoatRoughness;
+				CoatR = sqrt(sqrt(min(a * a + GSSharpTurn2 / 6.0f, 1.0f)));
+			}
+			if (SharpPolish)
+			{
+				const float3 Brdf = Layers.Under * GSEnvironmentBrdf(s, NdotV);
+				PolishW = Brdf * Narrowed;
+				Radiance -= PolishW * GSSkyRadiance(Mirror, s.Roughness);
+				if (SunApart)
+				{
+					PolishSunW = Brdf * SunShare;
+					Radiance -= PolishSunW * Irradiance * GSSunReflectPdf(Mirror, SunDirection, s.Roughness, SkySH[16].w);
+				}
+				const float a = s.Roughness * s.Roughness;
+				PolishR = sqrt(sqrt(min(a * a + GSSharpTurn2 / 6.0f, 1.0f)));
+			}
+			const float2 At = GSOctEncode(GSFileToWorld(Mirror));
+			float2 StepX = GSOctEncode(GSFileToWorld(MirrorX)) - At;
+			float2 StepY = GSOctEncode(GSFileToWorld(MirrorY)) - At;
+			// A turn across the octahedron's fold is not a step: left flat.
+			StepX = all(abs(StepX) < 0.25f) ? StepX : 0.0f;
+			StepY = all(abs(StepY) < 0.25f) ? StepY : 0.0f;
+			GSSharpA = uint4(GSPackHalves(At.x, At.y), GSPackHalves(StepX.x, StepX.y), GSPackHalves(StepY.x, StepY.y),
+				GSPackHalves(CoatW, CoatR));
+			GSSharpB = uint4(GSPackHalves(PolishW.x, PolishW.y), GSPackHalves(PolishW.z, PolishR),
+				GSPackHalves(PolishSunW.x, PolishSunW.y), GSPackHalves(PolishSunW.z, CoatSunW));
+		}
+	}
+	return Radiance;
+}
 
 // Degree 1 to 3 of the real harmonics in 3DGS's sign convention, at a unit
 // direction d, times the coefficients of one channel starting at Base.
@@ -45,6 +357,45 @@ float GSHighOrderSH(StructuredBuffer<float> SH, uint Base, float3 d)
 float4 GSSplatColor(uint SplatIndex, float3 LocalView, bool bViewDependent)
 {
 	float4 ColorOpacity = GSResources.SHAndOpacities[SplatIndex];
+
+	if ((GSResources.ColorFlags & GS_COLOR_TRANSFER) != 0)
+	{
+		float3 Albedo = max(ColorOpacity.rgb, 0.0f);
+		if ((GSResources.ColorFlags & GS_COLOR_LINEARIZE) != 0)
+		{
+			Albedo = select(Albedo <= 0.04045f, Albedo / 12.92f, pow((Albedo + 0.055f) / 1.055f, 2.4f));
+		}
+		if (AtheneaDebug == 6u)
+		{
+			// Whether the sharp lobes are made: (turn computed, curvature kept, residual sky).
+			return float4(GSSharpOn ? 1.0f : 0.0f, GSResources.HasCurvature != 0u ? 1.0f : 0.0f, SkyResidualMips > 0.0f ? 1.0f : 0.0f, ColorOpacity.a);
+		}
+		if (AtheneaDebug == 1u)
+		{
+			return float4(SkySH[0].rgb * 0.28209479177387814f, ColorOpacity.a);
+		}
+		if (AtheneaDebug >= 100u && AtheneaDebug < 116u)
+		{
+			// Coefficient k of the projected sky as it is, plus 4 so that a
+			// negative one survives the frame.
+			return float4(SkySH[AtheneaDebug - 100u].rgb + 4.0f, ColorOpacity.a);
+		}
+		if (AtheneaDebug >= 2u && AtheneaDebug <= 5u)
+		{
+			// The projected sky rebuilt along the file's +y, -y, +z or -z.
+			const float3 Dirs[4] = { float3(0, 1, 0), float3(0, -1, 0), float3(0, 0, 1), float3(0, 0, -1) };
+			const float3 d = Dirs[AtheneaDebug - 2u];
+			float3 L = 0;
+			for (uint k = 0; k < 16u; ++k)
+			{
+				L += SkySH[k].rgb * GSEnvBasis(k, d);
+			}
+			return float4(L, ColorOpacity.a);
+		}
+		const float3 v = normalize(LocalView);
+		const float3 d = float3(dot(v, GSResources.FileAxisX), dot(v, GSResources.FileAxisY), dot(v, GSResources.FileAxisZ));
+		return float4(GSTransferredRadiance(SplatIndex, Albedo, d), ColorOpacity.a);
+	}
 
 	if (bViewDependent && (GSResources.ColorFlags & GS_COLOR_HIGH_ORDER_SH) != 0)
 	{

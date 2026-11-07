@@ -6,6 +6,14 @@
 // (GSDecode.usf). Merged levels, normals, emission and the extras are not read
 // yet.
 //
+// Version 3 (sparkwebGPU's, for the web; docs/docs/athc-v3.md there) is the
+// same values in sections, each gzipped or not and stored as v2's words, as
+// byte planes or as byte planes of 16-bit differences. Its chunks' CORE and
+// SHRS sections are kept as stored (after the gunzip) with a table of blocks,
+// and the GPU reads them in any of the three (PackedFormat 5,
+// GSDecodeAthc3CS). The levels, the material, the transfer and the rest are
+// not read yet.
+//
 //   page 0        header (104 bytes: FileHeader below)
 //   page 1..      level table, chunk table (offset, count, pad a chunk)
 //   each chunk    positions (16 B a splat), shape (16 B), SH (4 * shWords B),
@@ -16,6 +24,7 @@
 
 #if WITH_EDITOR
 
+#include "AtheneaCodecs.h"
 #include "GaussianData.h"
 #include "GaussiansEditorModule.h"
 #include "HAL/PlatformFileManager.h"
@@ -61,6 +70,390 @@ namespace
 	}
 }
 
+namespace GSplatAthc3
+{
+	uint32 W32(const uint8* b) { return uint32(b[0]) | (uint32(b[1]) << 8) | (uint32(b[2]) << 16) | (uint32(b[3]) << 24); }
+	uint64 W64(const uint8* b) { return uint64(W32(b)) | (uint64(W32(b + 4)) << 32); }
+	float F32(const uint8* b) { const uint32 v = W32(b); float f; FMemory::Memcpy(&f, &v, 4); return f; }
+	constexpr uint32 Tag(const char* s) { return uint32(uint8(s[0])) | (uint32(uint8(s[1])) << 8) | (uint32(uint8(s[2])) << 16) | (uint32(uint8(s[3])) << 24); }
+	constexpr uint32 kKindChunk = 1;
+	constexpr uint32 kKindPage = 2;
+	constexpr uint32 kSections = 9;
+	constexpr uint32 kAthcNormals = 1;
+	constexpr uint32 kAthcEmission = 4;
+	constexpr uint32 kAthcTransfer = 32;
+
+	bool Import(IFileHandle& File, const FString& Filename, UGSplatImportData& ImportData, FGaussianSplatData& Splats)
+	{
+		auto Fail = [&](const FString& Why)
+		{
+			UE_LOG(LogGSplatEditor, Error, TEXT("%s: %s"), *Filename, *Why);
+			return false;
+		};
+		uint8 H[176];
+		FMemory::Memzero(H);
+		if (!ReadAt(File, 0, H, 160))
+		{
+			return Fail(TEXT("a version 3 header cut short."));
+		}
+		if (W32(H + 4) != 3)
+		{
+			return Fail(FString::Printf(TEXT("ATH3 version %u, this reads 3."), W32(H + 4)));
+		}
+		const uint32 Flags = W32(H + 8), Count = W32(H + 12), RestPerColour = W32(H + 32), SHWords = W32(H + 36);
+		const uint32 TransferCount = W32(H + 40), ShadowWords = W32(H + 44), PbrWords = W32(H + 48), LobesWords = W32(H + 52);
+		const uint32 SectionCount = W32(H + 60), BlockCount = W32(H + 104);
+		const uint64 SectionTable = W64(H + 112), BlockIndex = W64(H + 120);
+		if (Count == 0 || RestPerColour > 15 || SHWords != FMath::Max((RestPerColour * 3 + 1) / 2, 1u) || SectionCount == 0 || SectionCount > 64 || BlockCount == 0)
+		{
+			return Fail(FString::Printf(TEXT("a version 3 header that does not add up (%u splats, %u rest, %u words, %u sections, %u blocks)."),
+				Count, RestPerColour, SHWords, SectionCount, BlockCount));
+		}
+
+		// The sections read, in the order GSDecode.usf names them; a TX cloud's
+		// material and transfer only where the transfer is one the plugin draws
+		// (9 or 16 direct values, with or without the indirect half and the
+		// field; not a zonal one).
+		static const char* kRead[kSections] = { "CORE", "SHRS", "TREE", "MATL", "SHAD", "TXDI", "TXIN", "TXFD", "CURV" };
+		const uint32 Direct = (TransferCount == 9 || TransferCount == 36 || TransferCount == 84) ? 9u
+			: (TransferCount == 16 || TransferCount == 64 || TransferCount == 112) ? 16u : 0u;
+		const bool bTransfer = Direct > 0 && (Flags & kAthcTransfer) != 0;
+		TArray<uint8> Table;
+		Table.SetNumUninitialized(int32(SectionCount) * 32);
+		if (!ReadAt(File, SectionTable, Table.GetData(), Table.Num()))
+		{
+			return Fail(TEXT("the section table is cut short."));
+		}
+		int32 Index[kSections];
+		uint32 Words[kSections], Encoding[kSections], Compression[kSections];
+		for (uint32 k = 0; k < kSections; k++)
+		{
+			Index[k] = INDEX_NONE;
+			Words[k] = Encoding[k] = Compression[k] = 0;
+		}
+		for (uint32 s = 0; s < SectionCount; s++)
+		{
+			const uint8* E = &Table[s * 32];
+			for (uint32 k = 0; k < kSections; k++)
+			{
+				if (W32(E) == Tag(kRead[k]))
+				{
+					Index[k] = int32(s);
+					Encoding[k] = W32(E + 8);
+					Compression[k] = W32(E + 12);
+					Words[k] = W32(E + 16);
+				}
+			}
+		}
+		if (!bTransfer)
+		{
+			for (uint32 k = 3; k < kSections; k++)
+			{
+				Index[k] = INDEX_NONE;
+			}
+		}
+		if (Index[0] == INDEX_NONE || Words[0] != 9)
+		{
+			return Fail(Index[0] == INDEX_NONE ? FString(TEXT("no CORE section."))
+				: FString::Printf(TEXT("CORE of %u words a splat, where 9 were due."), Words[0]));
+		}
+		for (uint32 k = 0; k < kSections; k++)
+		{
+			const bool bCpcaAllowed = k >= 5;
+			if (Index[k] != INDEX_NONE && ((Encoding[k] > 2 && !(bCpcaAllowed && Encoding[k] == 3)) || Compression[k] > 1))
+			{
+				return Fail(FString::Printf(TEXT("section %hs in encoding %u, compression %u, which this does not read."), kRead[k], Encoding[k], Compression[k]));
+			}
+		}
+
+		// Each section's arrays (athc_v3.rs section_arrays).
+		uint32 Arrays[kSections][4];
+		FMemory::Memzero(Arrays);
+		Arrays[0][0] = 4; Arrays[0][1] = 4; Arrays[0][2] = 1;
+		Arrays[2][0] = 1; Arrays[2][1] = 1;
+		{
+			uint32 a = 0;
+			for (const uint32 w : { (Flags & kAthcNormals) ? 1u : 0u, (Flags & kAthcEmission) ? 1u : 0u, PbrWords, LobesWords })
+			{
+				if (w > 0 && a < 4)
+				{
+					Arrays[3][a++] = w;
+				}
+			}
+			if (Arrays[3][0] + Arrays[3][1] + Arrays[3][2] + Arrays[3][3] != Words[3])
+			{
+				FMemory::Memzero(Arrays[3]);
+				Arrays[3][0] = Words[3];
+			}
+		}
+		for (const uint32 k : { 1u, 4u, 5u, 6u, 7u, 8u })
+		{
+			Arrays[k][0] = Words[k];
+		}
+		if (Words[2] != 2)
+		{
+			FMemory::Memzero(Arrays[2]);
+			Arrays[2][0] = Words[2];
+		}
+
+		// The blocks: each chunk's or page's sections, gunzipped, in a row.
+		const uint64 Entry = 32 + 16 * uint64(SectionCount);
+		TArray<uint8> BlockIndexBytes;
+		BlockIndexBytes.SetNumUninitialized(int64(BlockCount) * int64(Entry));
+		if (!ReadAt(File, BlockIndex, BlockIndexBytes.GetData(), BlockIndexBytes.Num()))
+		{
+			return Fail(TEXT("the block index is cut short."));
+		}
+		TArray<uint32> Blocks;
+		TArray<uint8> Data;
+		uint32 Done = 0, Used = 0, Pages = 0, ScratchBytes = 0;
+		bool bCpca = false, bDelta = false;
+		TArray<uint8> Stored, Raw;
+		for (uint32 b = 0; b < BlockCount; b++)
+		{
+			const uint8* E = &BlockIndexBytes[b * Entry];
+			// Chunks (kind 1) hold the finest splats; a paged file's pages (kind
+			// 2) hold its whole tree, merges and leaves, TREE telling them apart.
+			// A merged level (kind 0) is not read yet.
+			const uint32 Kind = W32(E);
+			const uint32 n = W32(E + 12);
+			if ((Kind != kKindChunk && Kind != kKindPage) || n == 0)
+			{
+				continue;
+			}
+			Blocks.Add(Done);
+			Blocks.Add(n);
+			for (uint32 k = 0; k < kSections; k++)
+			{
+				const int32 s = Index[k];
+				if (s == INDEX_NONE || (k == 2 && Kind != kKindPage))
+				{
+					Blocks.Append({ ~0u, 0u, 0u });
+					continue;
+				}
+				const uint8* Span = E + 32 + 16 * s;
+				const uint64 At = W64(Span);
+				const uint32 StoredBytes = W32(Span + 8), RawBytes = W32(Span + 12);
+				if (Encoding[k] != 3 && RawBytes != n * Words[k] * 4)
+				{
+					return Fail(FString::Printf(TEXT("a block's section %hs holds %u bytes where %u were due."), kRead[k], RawBytes, n * Words[k] * 4));
+				}
+				Stored.SetNumUninitialized(StoredBytes);
+				if (!ReadAt(File, At, Stored.GetData(), StoredBytes))
+				{
+					return Fail(TEXT("a block runs past the file."));
+				}
+				const TArray<uint8>* Bytes = &Stored;
+				if (Compression[k] == 1)
+				{
+					Raw.Reset();
+					// A CPCA section's raw bytes are its decoded halves; its payload,
+					// what the gunzip gives, is smaller.
+					if (!AtheneaCodecs::Gunzip(Stored.GetData(), Stored.Num(), Raw) || (Encoding[k] != 3 && Raw.Num() != int32(RawBytes)))
+					{
+						return Fail(FString::Printf(TEXT("a block's section %hs does not gunzip to its %u bytes."), kRead[k], RawBytes));
+					}
+					Bytes = &Raw;
+				}
+				const uint32 SectionAt = uint32(Data.Num());
+				Data.Append(*Bytes);
+				Data.SetNumZeroed(Align(Data.Num(), 4));
+				uint32 ScratchAt = 0;
+				if (Encoding[k] >= 2)
+				{
+					ScratchAt = ScratchBytes;
+					ScratchBytes += n * Words[k] * 4;
+					bDelta |= Encoding[k] == 2;
+					bCpca |= Encoding[k] == 3;
+				}
+				Blocks.Append({ SectionAt, Encoding[k], ScratchAt });
+			}
+			Blocks.Append({ 0u, 0u, 0u });   // to 32 words (ATHC3_BLOCK_WORDS)
+			Done += n;
+			Used++;
+			Pages += Kind == kKindPage ? 1 : 0;
+		}
+		if (Done != Count)
+		{
+			return Fail(FString::Printf(TEXT("its chunks or pages hold %u splats where the header says %u."), Done, Count));
+		}
+		if (Used > 65535 || uint64(Data.Num()) + uint64(ScratchBytes) > 0xFFFFFFFFull)
+		{
+			return Fail(FString::Printf(TEXT("%u blocks, more than one dispatch takes, or past 4 GB."), Used));
+		}
+
+		// The descriptors, then the blocks.
+		const uint32 TableAt = uint32(Data.Num());
+		TArray<uint32> Desc;
+		for (uint32 k = 0; k < kSections; k++)
+		{
+			const bool bPresent = Index[k] != INDEX_NONE && !(k == 2 && Pages == 0);
+			Desc.Append({ bPresent ? 1u : 0u, Words[k], 0u, 0u, Arrays[k][0], Arrays[k][1], Arrays[k][2], Arrays[k][3] });
+		}
+		Data.Append(reinterpret_cast<const uint8*>(Desc.GetData()), Desc.Num() * sizeof(uint32));
+		Data.Append(reinterpret_cast<const uint8*>(Blocks.GetData()), Blocks.Num() * sizeof(uint32));
+
+		ImportData.Swizzle = { EGSplatSwizzleAxis::X, EGSplatSwizzleAxis::Z, EGSplatSwizzleAxis::Y };
+		ImportData.ScaleFactor = 100.0f;
+		ImportData.bApplyGammaCorrection = (Flags & kAthcLinear) == 0;
+		ImportData.NumSplats = int32(Count);
+		ImportData.bHasHighOrderSH = RestPerColour > 0 && Index[1] != INDEX_NONE;
+		ImportData.bHasNormals = false;
+		ImportData.bHasMetallicRoughness = false;
+
+		Splats.Empty();
+		Splats.bPacked = true;
+		Splats.PackedFormat = 5;
+		Splats.SplatCount = Count;
+		Splats.bHasHighOrderSH = ImportData.bHasHighOrderSH && ImportData.bImportHighOrderSH;
+		Splats.PackedUnitsToCm = ImportData.ScaleFactor;
+		Splats.PackedBytes = MoveTemp(Data);
+		Splats.PackedStreams = { TableAt, Used, SHWords, Splats.bHasHighOrderSH ? RestPerColour : 0u,
+			ScratchBytes, bTransfer ? TransferCount : 0u, Flags, (bDelta ? 1u : 0u) | (bCpca ? 2u : 0u) };
+		if (bTransfer)
+		{
+			// The transfer's buffers are written on the device (GSDecodeAthc3TxCS).
+			Splats.bHasTransfer = true;
+			Splats.TransferDirectCount = Direct;
+			Splats.CellWords = (Index[4] != INDEX_NONE && (ShadowWords == 8 || ShadowWords == 32)) ? ShadowWords : 0u;
+			Splats.bPackedTransferField = Direct == 16 && TransferCount == 112;
+			Splats.bPackedCurvature = Index[8] != INDEX_NONE && Words[8] == 2;
+			Splats.FileUnitsToCm = 100.0f;
+		}
+		const TArray<EGSplatSwizzleAxis>& Swizzle = ImportData.Swizzle;
+		Splats.FileAxisX = SwizzleVector(1.0f, 0.0f, 0.0f, Swizzle);
+		Splats.FileAxisY = SwizzleVector(0.0f, 1.0f, 0.0f, Swizzle);
+		Splats.FileAxisZ = SwizzleVector(0.0f, 0.0f, 1.0f, Swizzle);
+		Splats.bLinearizeColor = ImportData.bApplyGammaCorrection;
+
+		FBox Box(ForceInit);
+		Box += FVector(SwizzleVector(F32(H + 80), F32(H + 84), F32(H + 88), Swizzle) * ImportData.ScaleFactor);
+		Box += FVector(SwizzleVector(F32(H + 92), F32(H + 96), F32(H + 100), Swizzle) * ImportData.ScaleFactor);
+		Splats.SetBounds(FBoxSphereBounds(Box));
+
+		const FString TransferText = bTransfer
+			? FString::Printf(TEXT("of %u values%s%s"), TransferCount, bCpca ? TEXT(", CPCA") : TEXT(""), Splats.CellWords ? TEXT(", cells") : TEXT(""))
+			: TransferCount > 0 ? FString::Printf(TEXT("of %u values not drawn (zonal or another layout)"), TransferCount) : FString(TEXT("none"));
+		UE_LOG(LogGSplatEditor, Display, TEXT("%s: %u gaussians in %u blocks%s, .athc version 3 (CORE encoding %u), %u rest coefficients a colour, %s colour, transfer %s; the levels not read."),
+			*Filename, Count, Used, Pages > 0 ? TEXT(" (error-band pages: the merges drawn at no opacity, the leaves alone seen)") : TEXT(""),
+			Encoding[0], RestPerColour, (Flags & kAthcLinear) ? TEXT("linear") : TEXT("sRGB"), *TransferText);
+		return true;
+	}
+
+	// A version 2 TX cloud as format 5: each chunk's bytes as the file has them,
+	// its arrays described where v2 lays them -- positions, shape, harmonics,
+	// tail, then normals, emission, pbr, lobes (MATL), the transfer's halves
+	// (one TXDI of all its words) and the open cells (SHAD).
+	bool FromV2(IFileHandle& File, const FString& Filename, const FAthcHeader& H, const uint32* Extra, const TArray<FAthcChunk>& Chunks,
+		UGSplatImportData& ImportData, FGaussianSplatData& Splats)
+	{
+		auto Fail = [&](const FString& Why)
+		{
+			UE_LOG(LogGSplatEditor, Error, TEXT("%s: %s"), *Filename, *Why);
+			return false;
+		};
+		const uint32 PbrWords = Extra[0], LobesWords = Extra[1], TransferCount = Extra[2], TransferWords = Extra[3], ShadowWords = Extra[4];
+		const uint32 Direct = (TransferCount == 9 || TransferCount == 36 || TransferCount == 84) ? 9u
+			: (TransferCount == 16 || TransferCount == 64 || TransferCount == 112) ? 16u : 0u;
+		if (Direct == 0 || TransferWords != (TransferCount + 1) / 2)
+		{
+			return Fail(FString::Printf(TEXT("a transfer of %u values in %u words, which is not drawn."), TransferCount, TransferWords));
+		}
+		const uint32 Normals = (H.Flags & kAthcNormals) ? 1u : 0u, Emission = (H.Flags & kAthcEmission) ? 1u : 0u;
+		const uint32 MaterialWords = Normals + Emission + ((H.Flags & 16u) ? PbrWords + LobesWords : 0u);
+		const uint32 Row = 4 + 4 + H.SHWords + 1 + MaterialWords + TransferWords + ShadowWords;
+
+		TArray<uint8> Data;
+		TArray<uint32> Blocks;
+		uint32 Done = 0;
+		for (int32 c = 0; c < Chunks.Num(); c++)
+		{
+			const uint32 n = Chunks[c].Count;
+			const uint32 At = uint32(Data.Num());
+			Data.AddUninitialized(int64(n) * Row * 4);
+			if (!ReadAt(File, Chunks[c].Offset, Data.GetData() + At, uint64(n) * Row * 4))
+			{
+				return Fail(FString::Printf(TEXT("chunk %d is cut short."), c));
+			}
+			const uint32 Sh = At + n * 32, Matl = Sh + n * 4 * (H.SHWords + 1), Tx = Matl + n * 4 * MaterialWords, Shad = Tx + n * 4 * TransferWords;
+			Blocks.Append({ Done, n,
+				At, 0u, 0u,                                       // CORE: positions, shape
+				Sh, 0u, 0u,                                       // SHRS
+				~0u, 0u, 0u,                                      // TREE: none
+				MaterialWords ? Matl : ~0u, 0u, 0u,               // MATL
+				ShadowWords ? Shad : ~0u, 0u, 0u,                 // SHAD
+				Tx, 0u, 0u,                                       // TXDI: the whole transfer
+				~0u, 0u, 0u, ~0u, 0u, 0u,                         // TXIN, TXFD: in TXDI
+				~0u, 0u, 0u,                                      // CURV: not read from a v2
+				0u, 0u, 0u });
+			Done += n;
+		}
+		if (Done != H.Count || uint64(Data.Num()) > 0xFFFFFFF0ull)
+		{
+			return Fail(FString::Printf(TEXT("its chunks hold %u splats where the header says %u, or past 4 GB."), Done, H.Count));
+		}
+
+		uint32 Desc[kSections][8];
+		FMemory::Memzero(Desc);
+		auto Set = [&](uint32 k, uint32 Words, std::initializer_list<uint32> Arrays)
+		{
+			Desc[k][0] = Words > 0 ? 1u : 0u;
+			Desc[k][1] = Words;
+			uint32 a = 4;
+			for (const uint32 w : Arrays)
+			{
+				if (w > 0 && a < 8)
+				{
+					Desc[k][a++] = w;
+				}
+			}
+		};
+		Set(0, 8, { 4, 4 });
+		Set(1, H.SHWords, { H.SHWords });
+		Set(3, MaterialWords, { Normals, Emission, (H.Flags & 16u) ? PbrWords : 0u, (H.Flags & 16u) ? LobesWords : 0u });
+		Set(4, ShadowWords, { ShadowWords });
+		Set(5, TransferWords, { TransferWords });
+		const uint32 TableAt = uint32(Data.Num());
+		Data.Append(reinterpret_cast<const uint8*>(Desc), sizeof(Desc));
+		Data.Append(reinterpret_cast<const uint8*>(Blocks.GetData()), Blocks.Num() * sizeof(uint32));
+
+		ImportData.Swizzle = { EGSplatSwizzleAxis::X, EGSplatSwizzleAxis::Z, EGSplatSwizzleAxis::Y };
+		ImportData.ScaleFactor = 100.0f;
+		ImportData.bApplyGammaCorrection = (H.Flags & kAthcLinear) == 0;
+		ImportData.NumSplats = int32(H.Count);
+		ImportData.bHasHighOrderSH = H.RestPerColour > 0;
+		ImportData.bHasNormals = false;
+		ImportData.bHasMetallicRoughness = false;
+
+		Splats.Empty();
+		Splats.bPacked = true;
+		Splats.PackedFormat = 5;
+		Splats.SplatCount = H.Count;
+		Splats.bHasHighOrderSH = ImportData.bHasHighOrderSH && ImportData.bImportHighOrderSH;
+		Splats.PackedUnitsToCm = ImportData.ScaleFactor;
+		Splats.PackedBytes = MoveTemp(Data);
+		Splats.PackedStreams = { TableAt, uint32(Chunks.Num()), H.SHWords, Splats.bHasHighOrderSH ? H.RestPerColour : 0u,
+			0u, TransferCount, H.Flags, 0u };
+		Splats.bHasTransfer = true;
+		Splats.TransferDirectCount = Direct;
+		Splats.CellWords = (ShadowWords == 8 || ShadowWords == 32) ? ShadowWords : 0u;
+		Splats.bPackedTransferField = Direct == 16 && TransferCount == 112;
+		const TArray<EGSplatSwizzleAxis>& Swizzle = ImportData.Swizzle;
+		Splats.FileAxisX = SwizzleVector(1.0f, 0.0f, 0.0f, Swizzle);
+		Splats.FileAxisY = SwizzleVector(0.0f, 1.0f, 0.0f, Swizzle);
+		Splats.FileAxisZ = SwizzleVector(0.0f, 0.0f, 1.0f, Swizzle);
+		Splats.bLinearizeColor = ImportData.bApplyGammaCorrection;
+		FBox Box(ForceInit);
+		Box += FVector(SwizzleVector(H.BoundsMin[0], H.BoundsMin[1], H.BoundsMin[2], Swizzle) * ImportData.ScaleFactor);
+		Box += FVector(SwizzleVector(H.BoundsMax[0], H.BoundsMax[1], H.BoundsMax[2], Swizzle) * ImportData.ScaleFactor);
+		Splats.SetBounds(FBoxSphereBounds(Box));
+		UE_LOG(LogGSplatEditor, Display, TEXT("%s: %u gaussians in %d chunks, .athc version 2 with a transfer of %u values%s, %u rest coefficients a colour, %s colour; %u levels not read."),
+			*Filename, H.Count, Chunks.Num(), TransferCount, Splats.CellWords ? TEXT(" and cells") : TEXT(""), H.RestPerColour,
+			(H.Flags & kAthcLinear) ? TEXT("linear") : TEXT("sRGB"), H.Levels);
+		return true;
+	}
+}
+
 bool GSplatImporter::IsAthcFile(const FString& Filename)
 {
 	return FPaths::GetExtension(Filename).ToLower() == TEXT("athc");
@@ -76,6 +469,10 @@ bool GSplatImporter::ImportAthc(const FString& Filename, UGSplatImportData& Impo
 	}
 
 	FAthcHeader H;
+	if (ReadAt(*File, 0, &H, 4) && FMemory::Memcmp(H.Magic, "ATH3", 4) == 0)
+	{
+		return GSplatAthc3::Import(*File, Filename, ImportData, Splats);
+	}
 	if (!ReadAt(*File, 0, &H, sizeof(H)) || FMemory::Memcmp(H.Magic, "ATHC", 4) != 0)
 	{
 		UE_LOG(LogGSplatEditor, Error, TEXT("%s: no ATHC magic."), *Filename);
@@ -87,7 +484,7 @@ bool GSplatImporter::ImportAthc(const FString& Filename, UGSplatImportData& Impo
 		return false;
 	}
 	if (H.Count == 0 || H.ChunkSplats == 0 || H.Chunks != (uint64(H.Count) + H.ChunkSplats - 1) / H.ChunkSplats
-		|| H.RestPerColour > 15 || H.SHWords != (H.RestPerColour * 3 + 1) / 2)
+		|| H.RestPerColour > 15 || (H.SHWords != (H.RestPerColour * 3 + 1) / 2 && !(H.RestPerColour == 0 && H.SHWords == 1)))
 	{
 		UE_LOG(LogGSplatEditor, Error, TEXT("%s: a header that does not add up (%u splats, %u chunks of %u, %u rest, %u words)."),
 			*Filename, H.Count, H.Chunks, H.ChunkSplats, H.RestPerColour, H.SHWords);
@@ -100,6 +497,19 @@ bool GSplatImporter::ImportAthc(const FString& Filename, UGSplatImportData& Impo
 	{
 		UE_LOG(LogGSplatEditor, Error, TEXT("%s: the chunk table is cut short."), *Filename);
 		return false;
+	}
+	// A TX cloud's chunks carry the material, the transfer and the cells after
+	// the harmonics: read through version 3's machinery, every section in v2's
+	// words.
+	if (H.Version == 2 && (H.Flags & GSplatAthc3::kAthcTransfer) != 0)
+	{
+		uint32 Extra[8];
+		if (!ReadAt(*File, 104, Extra, sizeof(Extra)))
+		{
+			UE_LOG(LogGSplatEditor, Error, TEXT("%s: the extra header is cut short."), *Filename);
+			return false;
+		}
+		return GSplatAthc3::FromV2(*File, Filename, H, Extra, Chunks, ImportData, Splats);
 	}
 
 	// athenea's clouds are y up, right-handed and in metres; UE takes them as
