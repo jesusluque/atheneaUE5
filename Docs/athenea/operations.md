@@ -233,8 +233,9 @@ needs it.
 
 ## 9. Licences
 
-- The plugin is a fork of StarLightGS (MIT); `LICENSE` is upstream's and is
-  kept. Files added here carry this project's copyright line.
+- The plugin is a fork of StarLightGS (MIT), and this fork's own work is
+  under the same MIT licence: `LICENSE` keeps upstream's copyright line and
+  adds this project's. Files added here carry that line in their header.
 - No engine source is copied into the repository; the plugin includes UE's
   headers when it is built.
 - OpenUSD is reached through UE's USDCore plugin, under OpenUSD's own licence

@@ -237,9 +237,10 @@ Nada de este plugin lo necesita.
 
 ## 9. Licencias
 
-- El plugin es un fork de StarLightGS (MIT); `LICENSE` es el de upstream y se
-  conserva. Los ficheros añadidos aquí llevan la línea de copyright de este
-  proyecto.
+- El plugin es un fork de StarLightGS (MIT), y el trabajo propio de este fork
+  está bajo la misma licencia MIT: `LICENSE` conserva la línea de copyright de
+  upstream y añade la de este proyecto. Los ficheros añadidos aquí llevan esa
+  línea en su cabecera.
 - No se copia código fuente del motor en el repositorio; el plugin incluye
   las cabeceras de UE cuando se compila.
 - A OpenUSD se llega a través del plugin USDCore de UE, bajo la propia

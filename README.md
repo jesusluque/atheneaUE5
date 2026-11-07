@@ -26,8 +26,8 @@ Documentation, in English and Spanish, is in [`Docs/athenea`](Docs/athenea):
 and what was measured). Test scripts are in [`Tools/athenea`](Tools/athenea).
 
 Requirements: UE 5.8.4, Win64, DirectX 12 with shader model 6 only (see
-operations §3). Upstream's `LICENSE` (MIT) applies to its code; files added
-here carry their own copyright line.
+operations §3). Licence: MIT, upstream's and this fork's alike (`LICENSE`
+carries both copyright lines).
 
 ---
 
