@@ -4,6 +4,9 @@
 #include "GaussianSplatSceneProxy.h"
 #include "GSWorldSubsystem.h"
 #include "Components/BillboardComponent.h"
+#include "Engine/World.h"
+#include "UObject/ConstructorHelpers.h"
+#include "Materials/Material.h"
 
 UGaussianSplatComponent::UGaussianSplatComponent()
 {

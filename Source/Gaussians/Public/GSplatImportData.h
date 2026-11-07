@@ -45,7 +45,7 @@ public:
 	UPROPERTY()
 	bool bImportNormals = false;
 	UPROPERTY()
-	bool bImportHighOrderSH = false;
+	bool bImportHighOrderSH = true;
 	UPROPERTY()
 	bool bImportMetallicRoughness = false;
 

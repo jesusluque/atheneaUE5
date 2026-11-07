@@ -1,3 +1,36 @@
+# atheneaUE5
+
+athenea's gaussian clouds in Unreal Engine 5.8: a fork of
+[StarLightGS](https://github.com/CoSTAR-National-Lab/starlightgs) (MIT) by
+CoSTAR National Lab, whose README follows below.
+
+What this fork adds:
+
+- **View-dependent colour**: spherical harmonics of degree 1 to 3, imported
+  and evaluated along the view in the file's own frame (upstream reserves
+  them but draws the base colour only).
+- **athenea's formats**: USD `ParticleField3DGaussianSplat` stages (through
+  the OpenUSD UE bundles), athenea's chunked `.athc` (kept packed and decoded
+  on the GPU), and PLY files athenea flattened (their axes, units and colour
+  space read from the header comment).
+- **Fixes** to build and render with UE 5.8.4, and to upstream defects (an
+  out-of-bounds append, no pre-exposure, a shadow bound, plugin content not
+  packaged, and others).
+- **GPU stats** for each stage of a splat frame.
+
+Documentation, in English and Spanish, is in [`Docs/athenea`](Docs/athenea):
+[design](Docs/athenea/DESIGN.md), [operations](Docs/athenea/operations.md)
+(requirements, building, importing, rendering and timing without a window),
+[development](Docs/athenea/development.md) and
+[decisions](Docs/athenea/decisions.md) (every change against upstream, why,
+and what was measured). Test scripts are in [`Tools/athenea`](Tools/athenea).
+
+Requirements: UE 5.8.4, Win64, DirectX 12 with shader model 6 only (see
+operations §3). Upstream's `LICENSE` (MIT) applies to its code; files added
+here carry their own copyright line.
+
+---
+
 # StarLightGS
 
 ![](Resources/Demo.gif)

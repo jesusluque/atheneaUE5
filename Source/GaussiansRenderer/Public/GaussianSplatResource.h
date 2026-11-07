@@ -1,6 +1,8 @@
 #pragma once
 
 #include "RenderResource.h"
+#include "ShaderParameterMacros.h"
+#include "UniformBuffer.h"
 #include "GaussianData.h"
 
 
@@ -17,6 +19,13 @@ BEGIN_UNIFORM_BUFFER_STRUCT(FGaussianSplatShaderResources, GAUSSIANSRENDERER_API
 	SHADER_PARAMETER_SRV(StructuredBuffer<float3>, Normals)
 	SHADER_PARAMETER_SRV(StructuredBuffer<float>, HighOrderSH)
 	SHADER_PARAMETER_SRV(StructuredBuffer<float2>, MetallicRoughness)
+
+	// athenea: how the colour is read (GS_COLOR_* in GSCompute.usf), and the
+	// file's axes in local space, which the harmonics are expanded in.
+	SHADER_PARAMETER(uint32, ColorFlags)
+	SHADER_PARAMETER(FVector3f, FileAxisX)
+	SHADER_PARAMETER(FVector3f, FileAxisY)
+	SHADER_PARAMETER(FVector3f, FileAxisZ)
 END_UNIFORM_BUFFER_STRUCT()
 
 BEGIN_UNIFORM_BUFFER_STRUCT(FGaussianSplatPrimitiveShaderResources, GAUSSIANSRENDERER_API)

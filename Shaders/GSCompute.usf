@@ -10,6 +10,7 @@
 #include "/Engine/Private/Nanite/NaniteHZBCull.ush"
 
 #include "Shared/GaussiansDefinitions.h"
+#include "GSColor.ush"
 
 #ifndef ENABLE_RELIGHTING
 #define ENABLE_RELIGHTING true
@@ -199,7 +200,7 @@ void GSPrepass(uint3 DispatchThreadId : SV_DispatchThreadID, uint3 GroupId : SV_
 			true,
 			false
 		);
-		bVisible &= FrustumCullData.bIsVisible;
+		bVisible = bVisible && (FrustumCullData.bIsVisible);
 
 		if (bVisible)
 		{
@@ -269,7 +270,7 @@ void GSPrepass(uint3 DispatchThreadId : SV_DispatchThreadID, uint3 GroupId : SV_
 					// Multiply by 100 again to convert to Unreal units
 					float Depth = ConvertToDeviceZ(100.0f * ViewPosition.z);
 					FScreenRect ScreenRect = GetScreenRect(int4(0, 0, HZBViewSize), float3(Min, Depth), float3(Max, Depth), 4);
-					bVisible &= IsVisibleHZB(ScreenRect, true);
+					bVisible = bVisible && (IsVisibleHZB(ScreenRect, true));
 				}
 
 		    	if (bVisible)
@@ -282,7 +283,12 @@ void GSPrepass(uint3 DispatchThreadId : SV_DispatchThreadID, uint3 GroupId : SV_
 					GS_SSScale[Index] = float4(MajorAxisMultiplier, MinorAxisMultiplier);
 					GS_Conic[Index] = Conic;
 	        
-					GS_ColorOpacity[Index] = GSResources.SHAndOpacities[SplatIndex];
+					// athenea: the eye sits at the translated world's origin, so the
+					// splat's translated position is the view direction; the colour
+					// takes its harmonics along it unless the splat is relit, where
+					// the colour is an albedo.
+					const float3 LocalView = mul(TranslatedWorldPosition.xyz, (float3x3) Primitive.RelativeWorldToLocal);
+					GS_ColorOpacity[Index] = GSSplatColor(SplatIndex, LocalView, !ENABLE_RELIGHTING);
 
 					GS_Depth[Index] = order_preserving_float_map(ViewPosition.z);
 
@@ -323,6 +329,15 @@ void GSPrepass(uint3 DispatchThreadId : SV_DispatchThreadID, uint3 GroupId : SV_
 			InterlockedExchange(Counter[1], BufferCapacity, Dummy);
 
 			GS_NumSplats = 0;
+		}
+		else if (GS_OutBufferStartIndex + GS_NumSplats > BufferCapacity)
+		{
+			// athenea: the group that straddles the end keeps what fits, so no
+			// write lands past the buffer (DX12 drops those, Metal and Vulkan do not).
+			uint Dummy;
+			InterlockedExchange(Counter[1], BufferCapacity, Dummy);
+
+			GS_NumSplats = BufferCapacity - GS_OutBufferStartIndex;
 		}
 	}
 
@@ -455,6 +470,11 @@ FRTOut GSSplatting_PS(FOutVertex Input)
     float Alpha = exp(Power) * Input.Opacity;
 
 	Output.Color = float4(Input.Color, 1) * Alpha;
+#if !ENABLE_RELIGHTING
+	// athenea: an unlit splat's colour is scene light, so it takes the view's
+	// pre-exposure as everything else in SceneColor does.
+	Output.Color.rgb *= PrimaryView.PreExposure;
+#endif
 
 #if ENABLE_RELIGHTING
     Output.Normal = float4(Input.Normal, 1) * Alpha;

@@ -171,16 +171,16 @@ void GSplatCullingCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex
 			switch (ClippingVolume.GetMode())
 			{
 				case GAUSSIANS_CLIPPING_MODE_CLIP_INSIDE_ALL:
-					bVisible &= Intersection < 2; // Visible if splat is not entirely inside volume
+					bVisible = bVisible && (Intersection < 2); // Visible if splat is not entirely inside volume
 					break;
 				case GAUSSIANS_CLIPPING_MODE_CLIP_INSIDE_ANY:
-					bVisible &= Intersection == 0; // Visible if splat does not intersect volume at all
+					bVisible = bVisible && (Intersection == 0); // Visible if splat does not intersect volume at all
 					break;
 				case GAUSSIANS_CLIPPING_MODE_CLIP_OUTSIDE_ALL:
-					bVisible &= Intersection > 0; // Visible if splat intersects in any way
+					bVisible = bVisible && (Intersection > 0); // Visible if splat intersects in any way
 					break;
 				case GAUSSIANS_CLIPPING_MODE_CLIP_OUTSIDE_ANY:
-					bVisible &= Intersection == 2; // Visible only if splat is completely contained
+					bVisible = bVisible && (Intersection == 2); // Visible only if splat is completely contained
 					break;
 				default:
 					break;

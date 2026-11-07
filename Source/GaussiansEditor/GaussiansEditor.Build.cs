@@ -30,6 +30,9 @@ public class GaussiansEditor: ModuleRules
 
             "GaussiansRenderer", 
             "Gaussians", 
+
+            // athenea: OpenUSD as UE bundles it, for USD ParticleFields.
+            "UnrealUSDWrapper",
         });
 
         bUseRTTI = true;

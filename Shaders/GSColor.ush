@@ -1,0 +1,70 @@
+// Copyright (c) 2026 jesus luque.
+//
+// A splat's colour seen from a direction: the degree-0 term the importer
+// stored (already times C0, plus a half) and, when the asset carries them, the
+// 45 higher coefficients of degree 1 to 3 in the file's own frame, laid out as
+// 3DGS writes them (red's fifteen, then green's, then blue's).
+
+#pragma once
+
+#define GS_COLOR_HIGH_ORDER_SH 1u
+#define GS_COLOR_LINEARIZE     2u
+
+// Degree 1 to 3 of the real harmonics in 3DGS's sign convention, at a unit
+// direction d, times the coefficients of one channel starting at Base.
+float GSHighOrderSH(StructuredBuffer<float> SH, uint Base, float3 d)
+{
+	const float C1 = 0.4886025119029199f;
+	const float C2[5] = { 1.0925484305920792f, -1.0925484305920792f, 0.31539156525252005f, -1.0925484305920792f, 0.5462742152960396f };
+	const float C3[7] = { -0.5900435899266435f, 2.890611442640554f, -0.4570457994644658f, 0.3731763325901154f, -0.4570457994644658f, 1.445305721320277f, -0.5900435899266435f };
+
+	const float x = d.x, y = d.y, z = d.z;
+	const float xx = x * x, yy = y * y, zz = z * z;
+
+	float r = -C1 * y * SH[Base + 0] + C1 * z * SH[Base + 1] - C1 * x * SH[Base + 2];
+
+	r += C2[0] * x * y * SH[Base + 3]
+	   + C2[1] * y * z * SH[Base + 4]
+	   + C2[2] * (2.0f * zz - xx - yy) * SH[Base + 5]
+	   + C2[3] * x * z * SH[Base + 6]
+	   + C2[4] * (xx - yy) * SH[Base + 7];
+
+	r += C3[0] * y * (3.0f * xx - yy) * SH[Base + 8]
+	   + C3[1] * x * y * z * SH[Base + 9]
+	   + C3[2] * y * (4.0f * zz - xx - yy) * SH[Base + 10]
+	   + C3[3] * z * (2.0f * zz - 3.0f * xx - 3.0f * yy) * SH[Base + 11]
+	   + C3[4] * x * (4.0f * zz - xx - yy) * SH[Base + 12]
+	   + C3[5] * z * (xx - yy) * SH[Base + 13]
+	   + C3[6] * x * (xx - 3.0f * yy) * SH[Base + 14];
+
+	return r;
+}
+
+// LocalView is the direction from the eye to the splat in the asset's local
+// space. It is taken into the file's frame before the harmonics are read.
+float4 GSSplatColor(uint SplatIndex, float3 LocalView, bool bViewDependent)
+{
+	float4 ColorOpacity = GSResources.SHAndOpacities[SplatIndex];
+
+	if (bViewDependent && (GSResources.ColorFlags & GS_COLOR_HIGH_ORDER_SH) != 0)
+	{
+		const float3 v = normalize(LocalView);
+		const float3 d = float3(dot(v, GSResources.FileAxisX), dot(v, GSResources.FileAxisY), dot(v, GSResources.FileAxisZ));
+		const uint Base = SplatIndex * 45u;
+		ColorOpacity.r += GSHighOrderSH(GSResources.HighOrderSH, Base + 0u, d);
+		ColorOpacity.g += GSHighOrderSH(GSResources.HighOrderSH, Base + 15u, d);
+		ColorOpacity.b += GSHighOrderSH(GSResources.HighOrderSH, Base + 30u, d);
+	}
+
+	ColorOpacity.rgb = max(ColorOpacity.rgb, 0.0f);
+
+	if ((GSResources.ColorFlags & GS_COLOR_LINEARIZE) != 0)
+	{
+		// The sRGB curve itself, as athenea's cloudLight takes it
+		// (common/color.slang), not a 2.2 power: they part in the shadows.
+		const float3 c = ColorOpacity.rgb;
+		ColorOpacity.rgb = select(c <= 0.04045f, c / 12.92f, pow((c + 0.055f) / 1.055f, 2.4f));
+	}
+
+	return ColorOpacity;
+}

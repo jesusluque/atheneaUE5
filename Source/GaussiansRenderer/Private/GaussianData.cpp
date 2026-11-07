@@ -13,6 +13,20 @@ void FGaussianSplatData::CopyFrom(const FGaussianSplatData* Other)
 	Normals = Other->Normals;
 	HighOrderHarmonicsCoefficients = Other->HighOrderHarmonicsCoefficients;
 	MetallicRoughness = Other->MetallicRoughness;
+
+	FileAxisX = Other->FileAxisX;
+	FileAxisY = Other->FileAxisY;
+	FileAxisZ = Other->FileAxisZ;
+	bLinearizeColor = Other->bLinearizeColor;
+
+	bPacked = Other->bPacked;
+	PackedPositions = Other->PackedPositions;
+	PackedShape = Other->PackedShape;
+	PackedSH = Other->PackedSH;
+	PackedSHWords = Other->PackedSHWords;
+	PackedRestPerColour = Other->PackedRestPerColour;
+	PackedUnitsToCm = Other->PackedUnitsToCm;
+	Bounds = Other->Bounds;
 }
 
 void FGaussianSplatData::Empty()
@@ -27,6 +41,11 @@ void FGaussianSplatData::Empty()
 	Normals.Empty();
 	HighOrderHarmonicsCoefficients.Empty();
 	MetallicRoughness.Empty();
+
+	bPacked = false;
+	PackedPositions.Empty();
+	PackedShape.Empty();
+	PackedSH.Empty();
 }
 
 void FGaussianSplatData::Resize(uint32 Num)

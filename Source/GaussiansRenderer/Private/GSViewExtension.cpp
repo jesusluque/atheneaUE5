@@ -19,6 +19,8 @@ DEFINE_STAT(STAT_SplatsRenderedLit)
 DEFINE_STAT(STAT_SplatsRenderedUnlit)
 
 DECLARE_GPU_STAT_NAMED(GaussiansLit, TEXT("Gaussians: Lit"));
+// athenea: the unlit splats timed as the lit ones are, so a profile shows them.
+DECLARE_GPU_STAT_NAMED(GaussiansUnlit, TEXT("Gaussians: Unlit"));
 
 
 static TAutoConsoleVariable<bool> CVarGaussiansDisableViewExtension(
@@ -140,7 +142,7 @@ void FGSViewExtension::PrePostProcessPass_RenderThread(FRDGBuilder& GraphBuilder
 		check(InView.bIsViewInfo);
 		const FViewInfo& ViewInfo = static_cast<const FViewInfo&>(InView);
 
-		RDG_EVENT_SCOPE(GraphBuilder, "Gaussians: Unlit");
+		RDG_EVENT_SCOPE_STAT(GraphBuilder, GaussiansUnlit, "Gaussians: Unlit");
 		const FSceneTextureUniformParameters* SceneTextures = Inputs.SceneTextures->GetContents();
 		FRDGTextureRef SceneColorTexture = SceneTextures->SceneColorTexture;
 		FRDGTextureRef SceneVelocityTexture = ViewInfo.GetSceneTextures().Velocity;

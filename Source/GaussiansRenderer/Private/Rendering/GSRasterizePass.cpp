@@ -18,6 +18,12 @@
 #include "GaussiansDefinitions.h"
 #include "GSDispatchHelper.h"
 
+// athenea: each stage of a splat frame timed apart, so a profile says where the
+// time goes.
+DECLARE_GPU_STAT_NAMED(GaussiansPrePass, TEXT("Gaussians: PrePass"));
+DECLARE_GPU_STAT_NAMED(GaussiansSort, TEXT("Gaussians: Radix Sort"));
+DECLARE_GPU_STAT_NAMED(GaussiansRaster, TEXT("Gaussians: Rasterization"));
+
 
 static TAutoConsoleVariable<int32> CVarGaussiansMaxSplats(
 	TEXT("r.Gaussians.MaxSplats"),
@@ -224,7 +230,7 @@ void FGSViewExtension::GaussianSplattingPass(
 		}
 		bAnySplatsRendered = true;
 
-		RDG_EVENT_SCOPE(GraphBuilder, "Gaussians: PrePass");
+		RDG_EVENT_SCOPE_STAT(GraphBuilder, GaussiansPrePass, "Gaussians: PrePass");
 
 		// Set up indirect args for this splat
 		Gaussians::AddSetupDispatchIndirectArgsPass(
@@ -301,7 +307,7 @@ void FGSViewExtension::GaussianSplattingPass(
 
 	// Sort all projected screens-space splats along view axis
 	{
-		RDG_EVENT_SCOPE(GraphBuilder, "Gaussians: Radix Sort");
+		RDG_EVENT_SCOPE_STAT(GraphBuilder, GaussiansSort, "Gaussians: Radix Sort");
 
 		TArray<FRDGBufferRef> InKeys   = { GaussianDepthBuffer, GraphBuilder.CreateBuffer(GaussianDepthBuffer->Desc, TEXT("Gaussians.PingPongDepth")) };
 		TArray<FRDGBufferRef> InValues = { GaussianIndexBuffer, GraphBuilder.CreateBuffer(GaussianIndexBuffer->Desc, TEXT("Gaussians.PingPongIDX")) };
@@ -324,7 +330,7 @@ void FGSViewExtension::GaussianSplattingPass(
 
 	// Rasterize splats into the render target
 	{
-		RDG_EVENT_SCOPE(GraphBuilder, "Gaussians: Rasterization");
+		RDG_EVENT_SCOPE_STAT(GraphBuilder, GaussiansRaster, "Gaussians: Rasterization");
 
 		auto PassParameters = GraphBuilder.AllocParameters<FSplattingPassPipelineParameters>();
 

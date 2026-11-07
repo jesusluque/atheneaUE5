@@ -333,7 +333,7 @@ FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput In
 	};
 
 	uint Index = Input.VertexId / 6;
-	if (Index > GSPrimitiveResources.SplatIndexCountBuffer[0])
+	if (Index >= GSPrimitiveResources.SplatIndexCountBuffer[0])
 	{
 		FVertexFactoryIntermediates DummyIntermediates = (FVertexFactoryIntermediates)0;
 		return DummyIntermediates;
@@ -536,7 +536,7 @@ float3 VertexFactoryGetWorldNormal(FPositionAndNormalOnlyVertexFactoryInput Inpu
     float3 InvScale = SceneData.Primitive.InvNonUniformScale;
 
 	uint Index = Input.VertexId / 6;
-	if (Index > GSPrimitiveResources.SplatIndexCountBuffer[0])
+	if (Index >= GSPrimitiveResources.SplatIndexCountBuffer[0])
 	{
 		return float3(0, 0, 0);
 	}

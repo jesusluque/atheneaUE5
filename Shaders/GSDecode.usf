@@ -1,0 +1,110 @@
+// Copyright (c) 2026 jesus luque.
+//
+// athenea's device packing (common/packing.slang) into this plugin's float
+// buffers, once, when a packed asset's resource is made. One thread a splat.
+//
+// The file's axes go to local space by FileToLocal (its columns are where the
+// file's x, y and z land), as the PLY importer's swizzle takes them, and its
+// units to centimetres by UnitsToCm. Rotations follow the importer's
+// SwizzleQuaternion, which the rasteriser's own convention expects.
+
+#include "/Engine/Public/Platform.ush"
+
+uint Offset;
+uint Count;
+uint SHWords;
+uint RestPerColour;
+float UnitsToCm;
+float3 FileToLocalX;
+float3 FileToLocalY;
+float3 FileToLocalZ;
+
+StructuredBuffer<float4> InPositions;
+StructuredBuffer<uint> InShape;
+StructuredBuffer<uint> InSH;
+
+RWStructuredBuffer<float3> OutPositions;
+RWStructuredBuffer<float3> OutScales;
+RWStructuredBuffer<float4> OutOrientations;
+RWStructuredBuffer<float4> OutSHAndOpacities;
+RWStructuredBuffer<float> OutHighOrderSH;
+
+static const float kSqrtHalf = 0.70710678f;
+
+// packing.slang's decodeQuaternion: (x, y, z, w).
+float4 DecodeQuaternion(uint Word)
+{
+	const uint Largest = Word & 3u;
+	float3 Small = float3(float((Word >> 22) & 1023u), float((Word >> 12) & 1023u), float((Word >> 2) & 1023u));
+	Small = (Small / 1023.0f * 2.0f - 1.0f) * kSqrtHalf;
+	const float Rest = sqrt(max(0.0f, 1.0f - dot(Small, Small)));
+	float4 Q = 0;
+	uint Next = 0;
+	for (uint k = 0; k < 4; ++k)
+	{
+		if (k == Largest)
+		{
+			Q[k] = Rest;
+		}
+		else
+		{
+			Q[k] = Small[Next];
+			Next += 1;
+		}
+	}
+	return Q;
+}
+
+float LowHalf(uint Word) { return f16tof32(Word & 0xFFFFu); }
+float HighHalf(uint Word) { return f16tof32(Word >> 16); }
+
+float HalfAt(uint Row, uint Index)
+{
+	const uint Word = InSH[Row + Index / 2];
+	return (Index & 1u) == 0u ? LowHalf(Word) : HighHalf(Word);
+}
+
+float3 ToLocal(float3 V)
+{
+	return FileToLocalX * V.x + FileToLocalY * V.y + FileToLocalZ * V.z;
+}
+
+[numthreads(64, 1, 1)]
+void GSDecodeAtheneaCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint i = Offset + DispatchThreadId.x;
+	if (i >= Count)
+	{
+		return;
+	}
+
+	const float4 P = InPositions[i];
+	OutPositions[i] = ToLocal(P.xyz) * UnitsToCm;
+
+	const uint Row = i * 4;
+	const uint4 Shape = uint4(InShape[Row], InShape[Row + 1], InShape[Row + 2], InShape[Row + 3]);
+
+	// Scales stay in metres-like units (centimetres over 100), as the PLY
+	// importer leaves them; an axis permutation only moves them about.
+	const float3 Scale = exp(float3(LowHalf(Shape.y), HighHalf(Shape.y), LowHalf(Shape.z)));
+	OutScales[i] = abs(ToLocal(Scale)) * (UnitsToCm / 100.0f);
+
+	const float4 Q = DecodeQuaternion(Shape.x);
+	const float Handed = dot(cross(FileToLocalX, FileToLocalY), FileToLocalZ);
+	const float4 R = float4(ToLocal(Q.xyz), Handed > 0.0f ? -Q.w : Q.w);
+	OutOrientations[i] = normalize(R);
+
+	OutSHAndOpacities[i] = float4(HighHalf(Shape.z), LowHalf(Shape.w), HighHalf(Shape.w), P.w);
+
+	// Rest coefficient k of channel c where f_rest puts it: c * 15 + k. The
+	// bands the file does not hold are zero.
+	const uint ShRow = i * SHWords;
+	const uint Base = i * 45u;
+	for (uint k = 0; k < 15u; ++k)
+	{
+		for (uint c = 0; c < 3u; ++c)
+		{
+			OutHighOrderSH[Base + c * 15u + k] = k < RestPerColour ? HalfAt(ShRow, k * 3u + c) : 0.0f;
+		}
+	}
+}

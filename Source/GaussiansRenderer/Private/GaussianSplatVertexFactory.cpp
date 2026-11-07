@@ -4,12 +4,14 @@
 #include "GaussianSplatResource.h"
 #include "MeshMaterialShader.h"
 #include "MeshDrawShaderBindings.h"
+#include "PrimitiveUniformShaderParameters.h"
 
 
 IMPLEMENT_VERTEX_FACTORY_TYPE(FGaussianSplatVertexFactory, "/Plugin/StarLightGS/GSVertexFactory.ush",
 	  EVertexFactoryFlags::UsedWithMaterials
 	| EVertexFactoryFlags::SupportsDynamicLighting
-	| EVertexFactoryFlags::SupportsStaticLighting
+	// athenea: no lightmap coordinates are fetched, so no static lighting
+	// permutations; the factory only draws shadow depth.
 	//| EVertexFactoryFlags::SupportsManualVertexFetch
 	| EVertexFactoryFlags::SupportsPositionOnly
 	//| EVertexFactoryFlags::SupportsPrecisePrevWorldPos

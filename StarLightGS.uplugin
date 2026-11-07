@@ -27,7 +27,7 @@
   "DocsURL": "",
   "MarketplaceURL": "",
   "SupportURL": "",
-  "CanContainContent": "true",
+  "CanContainContent": true,
   "Installed": false,
   "IsBetaVersion": true,
   "Plugins": [
@@ -40,6 +40,10 @@
       "Name": "ProceduralMeshComponent",
       "Enabled": true,
       "SupportedTargetPlatforms": null
+    },
+    {
+      "Name": "USDCore",
+      "Enabled": true
     }
   ],
   "SupportedTargetPlatforms": null

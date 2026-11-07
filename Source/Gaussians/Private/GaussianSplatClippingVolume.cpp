@@ -5,6 +5,7 @@
 //#include "Builders/CubeBuilder.h"
 //#include "Builders/TetrahedronBuilder.h"
 #include "Components/BrushComponent.h"
+#include "Engine/World.h"
 
 
 AGaussianSplatClippingVolume::AGaussianSplatClippingVolume()

@@ -89,6 +89,13 @@ UGSplatFactory::UGSplatFactory()
 	bEditorImport = true;
 
 	Formats.Add(TEXT("ply;GSplatImport"));
+	// athenea: a USD stage is ours only when it holds a gaussian ParticleField
+	// (FactoryCanImport); UE's USD importer keeps every other stage.
+	Formats.Add(TEXT("usd;Gaussian splats (USD ParticleField)"));
+	Formats.Add(TEXT("usda;Gaussian splats (USD ParticleField)"));
+	Formats.Add(TEXT("usdc;Gaussian splats (USD ParticleField)"));
+	Formats.Add(TEXT("athc;athenea chunked cloud"));
+	ImportPriority = DefaultImportPriority + 10;
 }
 
 bool UGSplatFactory::ShouldShowInNewMenu() const
@@ -115,6 +122,14 @@ UObject* UGSplatFactory::FactoryCreateNew(UClass* InClass, UObject* InParent, FN
 
 bool UGSplatFactory::FactoryCanImport(const FString& Filename)
 {
+	if (GSplatImporter::IsUsdFile(Filename))
+	{
+		return GSplatImporter::StageHasSplats(Filename);
+	}
+	if (GSplatImporter::IsAthcFile(Filename))
+	{
+		return true;
+	}
 	return FPaths::GetExtension(Filename) == TEXT("ply");
 }
 
@@ -201,6 +216,24 @@ UObject* UGSplatFactory::ImportInternal(UClass* InClass, UObject* InParent, FNam
 	if (Filename.IsEmpty())
 	{
 		return nullptr;
+	}
+
+	// athenea: a USD stage or a .athc carries its own axes, units and colour
+	// space, so it is read with no dialogue.
+	if (GSplatImporter::IsUsdFile(Filename) || GSplatImporter::IsAthcFile(Filename))
+	{
+		Object->Splats.Empty();
+		const bool bRead = GSplatImporter::IsUsdFile(Filename)
+			? GSplatImporter::ImportUsd(Filename, *Object->AssetImportData, Object->Splats)
+			: GSplatImporter::ImportAthc(Filename, *Object->AssetImportData, Object->Splats);
+		if (!bRead)
+		{
+			Object->Splats.Empty();
+			return nullptr;
+		}
+		Object->AssetImportData->Update(Filename);
+		GEditor->GetEditorSubsystem<UImportSubsystem>()->BroadcastAssetPostImport(this, Object);
+		return Object;
 	}
 
 	// Parse file into preview data required for import dialogue

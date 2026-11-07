@@ -1,6 +1,8 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "RenderResource.h"
+#include "VertexFactory.h"
 
 /**
  * Gaussian splat factory that fetches splat data form asset uniform and passes it to the mesh pipeline manually

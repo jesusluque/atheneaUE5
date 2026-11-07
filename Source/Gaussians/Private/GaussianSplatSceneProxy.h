@@ -5,6 +5,10 @@
 #include "GaussianSplatVertexFactory.h"
 
 #include "PrimitiveSceneProxy.h"
+#include "SceneManagement.h"
+#include "SceneView.h"
+#include "MeshBatch.h"
+#include "Materials/MaterialInterface.h"
 
 
 class UGaussianSplatComponent;

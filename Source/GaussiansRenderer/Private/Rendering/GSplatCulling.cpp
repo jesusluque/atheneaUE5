@@ -12,6 +12,9 @@
 
 #include "GaussiansDefinitions.h"
 
+// athenea: timed apart, as the other stages are.
+DECLARE_GPU_STAT_NAMED(GaussiansCulling, TEXT("Gaussians: Culling"));
+
 
 class FGSplatCullingCS : public FGlobalShader
 {
@@ -81,7 +84,7 @@ void FGSViewExtension::GSCullingPass(
 	check(InView.bIsViewInfo);
 	const FViewInfo& ViewInfo = static_cast<const FViewInfo&>(InView);
 
-	RDG_EVENT_SCOPE(GraphBuilder, "Gaussians: Culling");
+	RDG_EVENT_SCOPE_STAT(GraphBuilder, GaussiansCulling, "Gaussians: Culling");
 
 	TArray<const FGSClippingVolumeProxy*> RelevantCullingVolumes;
 	RelevantCullingVolumes.Reserve(CullingVolumes.Num());

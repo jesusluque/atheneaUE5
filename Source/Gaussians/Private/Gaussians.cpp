@@ -3,6 +3,7 @@
 #include "Gaussians.h"
 
 #include "Interfaces/IPluginManager.h"
+#include "Misc/Paths.h"
 #include "GameplayTagsManager.h"
 
 #define LOCTEXT_NAMESPACE "FGaussiansModule"

@@ -41,6 +41,30 @@ bool GSplatImporter::ParsePly(const FString& Filename, UGSplatImportData& Import
 
 	ImportData.NumSplats = vertices.count;
 
+	// athenea: a file athenea flattened says what it is in a comment, e.g.
+	// "athenea flatten: degree 3, sRGB display-referred, y up, metres". A y-up,
+	// right-handed file comes into UE's left-handed, z-up space as (x, z, y);
+	// display-referred colour is linearised after its harmonics are summed.
+	for (const std::string& Comment : ply.comments)
+	{
+		if (Comment.find("athenea") == std::string::npos)
+		{
+			continue;
+		}
+		if (Comment.find("sRGB display-referred") != std::string::npos)
+		{
+			ImportData.bApplyGammaCorrection = true;
+		}
+		if (Comment.find("y up") != std::string::npos)
+		{
+			ImportData.Swizzle = { EGSplatSwizzleAxis::X, EGSplatSwizzleAxis::Z, EGSplatSwizzleAxis::Y };
+		}
+		if (Comment.find("metres") != std::string::npos)
+		{
+			ImportData.ScaleFactor = 100.0f;
+		}
+	}
+
 	if (!(vertices.hasPropertyType<float>("x")
 		&& vertices.hasPropertyType<float>("y")
 		&& vertices.hasPropertyType<float>("z")))
@@ -87,8 +111,12 @@ bool GSplatImporter::ParsePly(const FString& Filename, UGSplatImportData& Import
 	ImportData.bHasNormals = (vertices.hasPropertyType<float>("nx") && vertices.hasPropertyType<float>("ny") && vertices.hasPropertyType<float>("nz"))
 		|| (vertices.hasPropertyType<uint8_t>("octa_nx") && vertices.hasPropertyType<uint8_t>("octa_ny"));
 
-	// Skipping high-order SH for now
-	ImportData.bHasHighOrderSH = false;
+	// athenea: degree 3, the 45 coefficients 3DGS writes channel by channel.
+	ImportData.bHasHighOrderSH = true;
+	for (uint32 k = 0; k < FGaussianSplatData::NumHighOrderSH; k++)
+	{
+		ImportData.bHasHighOrderSH &= vertices.hasPropertyType<float>(TCHAR_TO_UTF8(*FString::Printf(TEXT("f_rest_%u"), k)));
+	}
 
 	ImportData.bHasMetallicRoughness = (vertices.hasProperty("metallic") || vertices.hasProperty("metallicFactor"))
 		&& (vertices.hasProperty("roughness") || vertices.hasProperty("roughnessFactor"));
@@ -201,8 +229,7 @@ bool GSplatImporter::ImportPly(const UGSplatImportData& ImportData, happly::PLYD
 
 	Splats.bHasNormals = ImportData.bImportNormals;
 
-	// Skipping high-order SH for now
-	Splats.bHasHighOrderSH = false;
+	Splats.bHasHighOrderSH = ImportData.bHasHighOrderSH && ImportData.bImportHighOrderSH;
 
 	Splats.bHasMetallicRoughness = ImportData.bImportMetallicRoughness || ImportData.bPopulateMRWithDefault;
 
@@ -303,6 +330,26 @@ bool GSplatImporter::ImportPly(const UGSplatImportData& ImportData, happly::PLYD
 		}
 	}
 
+	if (Splats.bHasHighOrderSH)
+	{
+		// athenea: kept in the file's layout, splat by splat: f_rest_0..14 are
+		// red's coefficients 1..15, then green's, then blue's.
+		const uint32 NumSH = FGaussianSplatData::NumHighOrderSH;
+		for (uint32 k = 0; k < NumSH; k++)
+		{
+			const std::vector<float> Rest = vertices.getProperty<float>(TCHAR_TO_UTF8(*FString::Printf(TEXT("f_rest_%u"), k)));
+			for (size_t i = 0; i < vertices.count; i++)
+			{
+				Splats.HighOrderHarmonicsCoefficients[i * NumSH + k] = Rest[i];
+			}
+		}
+	}
+
+	Splats.FileAxisX = SwizzleVector(1.0f, 0.0f, 0.0f, ImportData.Swizzle);
+	Splats.FileAxisY = SwizzleVector(0.0f, 1.0f, 0.0f, ImportData.Swizzle);
+	Splats.FileAxisZ = SwizzleVector(0.0f, 0.0f, 1.0f, ImportData.Swizzle);
+	Splats.bLinearizeColor = ImportData.bApplyGammaCorrection;
+
 	auto& positions = Splats.Positions;
 	auto& scales = Splats.Scales;
 	auto& orientations = Splats.Orientations;
@@ -346,16 +393,9 @@ bool GSplatImporter::ImportPly(const UGSplatImportData& ImportData, happly::PLYD
 			sho[i].Z = UCharToFloat(blue[i]);
 		}
 
-		if (ImportData.bApplyGammaCorrection)
-		{
-			sho[i].X = FMath::Pow(sho[i].X, 2.2f);
-			sho[i].Y = FMath::Pow(sho[i].Y, 2.2f);
-			sho[i].Z = FMath::Pow(sho[i].Z, 2.2f);
-		}
-
-		sho[i].X = FMath::Max(sho[i].X, 0.0f);
-		sho[i].Y = FMath::Max(sho[i].Y, 0.0f);
-		sho[i].Z = FMath::Max(sho[i].Z, 0.0f);
+		// athenea: no clamp and no gamma here. The degree-0 term is clamped
+		// with the others once they are summed, and linearised after that
+		// (bLinearizeColor), on the GPU.
 
 		if (bCompressedOpacity)
 		{

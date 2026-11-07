@@ -43,7 +43,7 @@ class GAUSSIANS_API UGSplatAsset : public UObject
 	GENERATED_BODY()
 
 public:
-	UPROPERTY(EditAnywhere, meta=(ShowOnlyInnerProperties))
+	UPROPERTY(EditAnywhere, Category = "Gaussians", meta=(ShowOnlyInnerProperties))
 	FGaussianSplatData Splats;
 
 public:
@@ -58,7 +58,7 @@ public:
 	//~ End UObject Interface
 
 
-	UFUNCTION(BlueprintCallable, CallInEditor)
+	UFUNCTION(BlueprintCallable, CallInEditor, Category = "Gaussians")
 	void RecalculateBounds();
 
 	//--- GPU Resource Management ---//
