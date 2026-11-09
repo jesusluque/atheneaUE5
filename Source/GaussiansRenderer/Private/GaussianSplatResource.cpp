@@ -175,6 +175,19 @@ class FGSAthzDecodeCS : public FGlobalShader
 };
 IMPLEMENT_GLOBAL_SHADER(FGSAthzDecodeCS, "/Plugin/StarLightGS/GSDecode.usf", "GSAthzDecodeCS", SF_Compute);
 
+// athenea: an .athz's CPCA transfer codes expanded by the file's basis.
+class FGSAthzCpcaCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FGSAthzCpcaCS);
+	SHADER_USE_PARAMETER_STRUCT(FGSAthzCpcaCS, FGlobalShader);
+	using FParameters = FGSDecodeFileParameters;
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+};
+IMPLEMENT_GLOBAL_SHADER(FGSAthzCpcaCS, "/Plugin/StarLightGS/GSDecode.usf", "GSAthzCpcaCS", SF_Compute);
+
 // athenea: a .athc v3 TX cloud's streams into the transfer's buffers.
 class FGSDecodeAthc3TxCS : public FGlobalShader
 {
@@ -407,6 +420,19 @@ void FGaussianSplatResource::InitRHI(FRHICommandListBase& RHICmdList)
 						FIntVector(FMath::DivideAndRoundUp(Pages * PageRuns, 8u), 1, 1));
 					Immediate.Transition(FRHITransitionInfo(ScratchUAV, ERHIAccess::UAVCompute, ERHIAccess::UAVCompute));
 				}
+				// A CPCA transfer: the splats' codes into their values.
+				if (SplatData.PackedSpz.Y != 0)
+				{
+					for (uint32 First = 0; First < Count; First += Batch)
+					{
+						FGSDecodeFileParameters CpcaParameters = Parameters;
+						CpcaParameters.Offset = First;
+						CpcaParameters.FractionalBits = uint32(SplatData.PackedSpz.Y);
+						FComputeShaderUtils::Dispatch(Immediate, TShaderMapRef<FGSAthzCpcaCS>(GetGlobalShaderMap(GMaxRHIFeatureLevel)), CpcaParameters,
+							FIntVector(FMath::DivideAndRoundUp(FMath::Min(Batch, Count - First), 64u), 1, 1));
+					}
+					Immediate.Transition(FRHITransitionInfo(ScratchUAV, ERHIAccess::UAVCompute, ERHIAccess::UAVCompute));
+				}
 				Parameters.Offset = Offset;
 				Parameters.FractionalBits = uint32(SplatData.PackedSpz.X);
 			}
@@ -553,6 +579,11 @@ void FGaussianSplatResource::InitRHI(FRHICommandListBase& RHICmdList)
 		CurvatureBuffer = CreateBuffer(SplatData.TransferCurvature, TEXT("GaussianSplatCurvature"), !SplatData.TransferCurvature.IsEmpty());
 	}
 
+	LodLevels = SplatData.LodWords.Num() == int32(SplatData.SplatCount) * 2 ? SplatData.LodLevels : 0u;
+	LodWordsBuffer = CreateBuffer(SplatData.LodWords, TEXT("GaussianSplatLodWords"), LodLevels > 0);
+	bVolume = SplatData.bVolume && SplatData.Volume.Num() == int32(SplatData.SplatCount);
+	VolumeBuffer = CreateBuffer(SplatData.Volume, TEXT("GaussianSplatVolume"), bVolume);
+
 	// Create uniform buffer
 	FGaussianSplatShaderResources Parameters;
 	Parameters.SplatCount = SplatData.SplatCount;
@@ -583,6 +614,21 @@ void FGaussianSplatResource::InitRHI(FRHICommandListBase& RHICmdList)
 	Parameters.FileAxisX = SplatData.FileAxisX;
 	Parameters.FileAxisY = SplatData.FileAxisY;
 	Parameters.FileAxisZ = SplatData.FileAxisZ;
+	Parameters.LodLevels = LodLevels;
+	Parameters.LodFinestLevel = SplatData.LodFinestLevel;
+	Parameters.LodFinestBase = SplatData.LodFinestBase;
+	Parameters.LodExtent = SplatData.LodExtent;
+	Parameters.LodBoundsLo = SplatData.LodBoundsLo;
+	Parameters.LodUnitsToCm = SplatData.bPacked ? SplatData.PackedUnitsToCm : SplatData.FileUnitsToCm;
+	Parameters.LodWords = LodWordsBuffer.SRV;
+	Parameters.VolumeOn = bVolume ? 1u : 0u;
+	Parameters.VolumeDensityScale = SplatData.VolumeDensityScale;
+	Parameters.VolumeEmissionScale = SplatData.VolumeEmissionScale;
+	Parameters.VolumeTemperatureScale = SplatData.VolumeTemperatureScale;
+	Parameters.VolumeTemperatureOffset = SplatData.VolumeTemperatureOffset;
+	Parameters.VolumeAlbedo = SplatData.VolumeAlbedo;
+	Parameters.VolumeEmission = SplatData.VolumeEmission;
+	Parameters.Volume = VolumeBuffer.SRV;
 
 	UniformBuffer = TUniformBufferRef<FGaussianSplatShaderResources>::CreateUniformBufferImmediate(Parameters, UniformBuffer_MultiFrame);
 }
@@ -598,6 +644,8 @@ void FGaussianSplatResource::ReleaseRHI()
 	PackedField.SafeRelease();
 	PackedCurvature.SafeRelease();
 	CurvatureBuffer.SafeRelease();
+	LodWordsBuffer.SafeRelease();
+	VolumeBuffer.SafeRelease();
 	TransferBuffer.SafeRelease();
 	TransferSurfaceBuffer.SafeRelease();
 	TransferCellsBuffer.SafeRelease();

@@ -100,6 +100,50 @@ float SplatScaleMultiplier;
 float SplatOpacityThreshold;
 
 
+// athenea: A BLACK BODY'S LIGHT at `Kelvin` (athenea's volume_blackbody.slang):
+// Planck's law against the CIE 1931 functions (Wyman, Sloan and Shirley's
+// fit), to linear Rec.709 at luminance one, times sigma_SB T^4 / pi * 1e-6 as
+// Cycles' Principled Volume scales it.
+float GSLobe(float x, float Mean, float Left, float Right)
+{
+	const float t = (x - Mean) / (x < Mean ? Left : Right);
+	return exp(-0.5f * t * t);
+}
+
+float3 GSBlackbody(float Kelvin)
+{
+	if (Kelvin < 300.0f)
+	{
+		return 0.0f;
+	}
+	float3 XYZ = 0.0f;
+	for (uint s = 0; s <= 94u; ++s)
+	{
+		const float Nm = 360.0f + 5.0f * float(s);
+		const float E = 1.4387769e7f / (Nm * Kelvin);
+		if (E > 80.0f)
+		{
+			continue;
+		}
+		const float R = Nm / 500.0f;
+		const float Planck = 1.0f / (R * R * R * R * R * (exp(E) - 1.0f));
+		XYZ += Planck * float3(
+			1.056f * GSLobe(Nm, 599.8f, 37.9f, 31.0f) + 0.362f * GSLobe(Nm, 442.0f, 16.0f, 26.7f) - 0.065f * GSLobe(Nm, 501.1f, 20.4f, 26.2f),
+			0.821f * GSLobe(Nm, 568.8f, 46.9f, 40.5f) + 0.286f * GSLobe(Nm, 530.9f, 16.3f, 31.1f),
+			1.217f * GSLobe(Nm, 437.0f, 11.8f, 36.0f) + 0.681f * GSLobe(Nm, 459.0f, 26.0f, 13.8f));
+	}
+	const float3 Rgb = max(float3(dot(float3(3.2404542f, -1.5371385f, -0.4985314f), XYZ),
+		dot(float3(-0.9692660f, 1.8760108f, 0.0415560f), XYZ),
+		dot(float3(0.0556434f, -0.2040259f, 1.0572252f), XYZ)), 0.0f);
+	const float Luminance = dot(float3(0.2126f, 0.7152f, 0.0722f), Rgb);
+	if (!(Luminance > 0.0f))
+	{
+		return 0.0f;
+	}
+	const float T2 = Kelvin * Kelvin * 1.0e-6f;
+	return Rgb / Luminance * (5.670374e-8f / 3.14159265f * T2 * T2 * 1.0e6f);
+}
+
 float3x3 VecToScaleMatrix(in float3 Scale)
 {
 	return float3x3(
@@ -117,6 +161,10 @@ float3x3 VecToScaleMatrix(in float3 Scale)
 #ifndef THREADGROUP_SIZE_1D
 #define THREADGROUP_SIZE_1D 1
 #endif
+
+// athenea: a medium's transmittance to UE's directional light and to the sky,
+// a pair a gaussian (GSVolumeShadow.usf); one pair of zeros for other clouds.
+StructuredBuffer<float2> VolumeShadow;
 
 groupshared uint GS_NumSplats;
 groupshared uint GS_OutBufferStartIndex;
@@ -240,6 +288,28 @@ void GSPrepass(uint3 DispatchThreadId : SV_DispatchThreadID, uint3 GroupId : SV_
 			float3x3 JW = mul(J, transpose((float3x3) PrimaryView.TranslatedWorldToView));
 			float3x3 Covariance2D = mul(JW, mul(transpose(Covariance3D), transpose(JW)));
 
+			// athenea: a SURFEL (a scale of zero, as every merged group of a
+			// .athc's levels is a flat disc) pays the third of a pixel of dilation
+			// back by area, as athenea's splat_project does (surfelPaid): its
+			// disc's area over the area drawn, the union of the disc and a round
+			// half pixel squared. Edge on, the disc has no area and is not drawn;
+			// without this it came out an opaque line, and a far cut's merges a
+			// lattice of them. A gaussian with three scales is drawn as before.
+			float SurfelPaid = 1.0f;
+			{
+				const float3 S = GSResources.Scales[SplatIndex];
+				if (min(min(S.x, S.y), S.z) == 0.0f)
+				{
+					const float A0 = Covariance2D[0][0], C0 = Covariance2D[1][1], B0 = Covariance2D[0][1];
+					const float Half = 0.5f * (A0 + C0);
+					const float Split = sqrt(max(0.25f * (A0 - C0) * (A0 - C0) + B0 * B0, 0.0f));
+					const float L1 = max(Half + Split, 0.0f), L2 = max(Half - Split, 0.0f);
+					const float Disc = sqrt(L1 * L2);
+					const float Drawn = Disc + 0.5f - sqrt(min(L1, 0.5f) * min(L2, 0.5f));
+					SurfelPaid = Drawn > 1.0e-12f ? min(Disc / Drawn, 1.0f) : 1.0f;
+				}
+			}
+
             float X = Covariance2D[0][0] + 0.3f;
             float Y = Covariance2D[1][1] + 0.3f;
 			float Covariance = Covariance2D[0][1];
@@ -258,8 +328,14 @@ void GSPrepass(uint3 DispatchThreadId : SV_DispatchThreadID, uint3 GroupId : SV_
 		    if (Lambda2 > 0.0f)
 		    {
 				float2 DiagonalVector = normalize(float2((Covariance - Y + Lambda1), (-X + Covariance + Lambda1)));
-				float2 MajorAxis = min(3 * sqrt(Lambda1), 1024.0f) * DiagonalVector;
-				float2 MinorAxis = min(3 * sqrt(Lambda2), 1024.0f) * float2(DiagonalVector.y, -DiagonalVector.x);
+				// athenea: the harder kernel's flat top reaches past three sigmas;
+				// its quad is widened by 0.7 (D - 1) sigma, as Spark and athenea's
+				// falloffCutoff widen the cut (D held to 5).
+				const float Hard = GSResources.SHAndOpacities[SplatIndex].a;
+				const float Sigmas = GSResources.VolumeOn != 0u ? 3.5f
+					: Hard > 1.0f ? 3.0f + 0.7f * (min(Hard, 5.0f) - 1.0f) : 3.0f;
+				float2 MajorAxis = min(Sigmas * sqrt(Lambda1), 1024.0f) * DiagonalVector;
+				float2 MinorAxis = min(Sigmas * sqrt(Lambda2), 1024.0f) * float2(DiagonalVector.y, -DiagonalVector.x);
 				
 				float2 MajorAxisMultiplier = MajorAxis / (PrimaryView.ViewSizeAndInvSize.xy * 0.5f);
 				float2 MinorAxisMultiplier = MinorAxis / (PrimaryView.ViewSizeAndInvSize.xy * 0.5f);
@@ -338,6 +414,49 @@ void GSPrepass(uint3 DispatchThreadId : SV_DispatchThreadID, uint3 GroupId : SV_
 						}
 					}
 					GS_ColorOpacity[Index] = GSSplatColor(SplatIndex, LocalView, !ENABLE_RELIGHTING);
+					GS_ColorOpacity[Index].a *= SurfelPaid;
+					if (GSResources.VolumeOn != 0u)
+					{
+						// athenea: A MEDIUM'S GAUSSIAN (athenea's splat_volume): its
+						// optical depth along the ray through its centre, densityScale
+						// sigma sqrt(2 pi) / sqrt(r' Sigma^-1 r) in the file's units, which
+						// the pixel shader takes down by the image gaussian and draws as
+						// 1 - exp(-tau). Carried as a negative opacity.
+						const float3 Ray = normalize(TranslatedWorldPosition.xyz);
+						const float3x3 C = Covariance3D;
+						const float3 C0 = cross(C[1], C[2]), C1 = cross(C[2], C[0]), C2 = cross(C[0], C[1]);
+						const float Det = dot(C[0], C0);
+						// Sigma^-1 r by the cofactors (Sigma symmetric).
+						const float3 InvRay = float3(dot(C0, Ray), dot(C1, Ray), dot(C2, Ray)) / Det;
+						const float Quad = max(dot(Ray, InvRay), 1.0e-12f);
+						const float2 Medium = GSResources.Volume[SplatIndex];
+						const float ToFile = 100.0f / max(GSResources.FileUnitsToCm, 1.0e-6f);
+						const float Tau = GSResources.VolumeDensityScale * Medium.x * 2.50662827f / sqrt(Quad) * ToFile;
+						// Its radiance: what it scatters of UE's directional light and
+						// of the sky (the projected sky's mean and its sun), each through
+						// the medium's shadow on itself (GSVolumeShadow.usf), and what its
+						// absorbing part glows with. The phase is isotropic; multiple
+						// scattering is athenea's octaves (Wrenninge): energy and
+						// extinction halved at each, four of them.
+						const float2 Lit = VolumeShadow[SplatIndex];
+						float2 Octaves = 0.0f;
+						UNROLL
+						for (uint o = 0; o < 4u; ++o)
+						{
+							const float a = exp2(-float(o));
+							Octaves += a * float2(pow(max(Lit.x, 1.0e-6f), a), pow(max(Lit.y, 1.0e-6f), a));
+						}
+						const float3 Albedo = saturate(GS_ColorOpacity[Index].rgb * GSResources.VolumeAlbedo);
+						const float3 Sun = View.DirectionalLightColor.rgb * 3.14159265f * (1.0f / (4.0f * 3.14159265f));
+						const float3 Scattered = Sun * Octaves.x
+							+ (SkySH[0].rgb * 0.28209479f + SkySH[17].rgb * (1.0f / (4.0f * 3.14159265f))) * Octaves.y;
+						float3 Glow = GSResources.VolumeEmission;
+						if (GSResources.VolumeEmissionScale > 0.0f && Medium.y > 0.0f)
+						{
+							Glow += GSResources.VolumeEmissionScale * GSBlackbody(GSResources.VolumeTemperatureOffset + GSResources.VolumeTemperatureScale * Medium.y);
+						}
+						GS_ColorOpacity[Index] = float4(max(Albedo * Scattered + (1.0f - Albedo) * Glow, 0.0f), -Tau);
+					}
 					GS_SharpA[Index] = GSSharpOn ? GSSharpA : uint4(0, 0, 0, 0);
 					GS_SharpB[Index] = GSSharpOn ? GSSharpB : uint4(0, 0, 0, 0);
 
@@ -575,7 +694,18 @@ FRTOut GSSplatting_PS(FOutVertex Input)
     float2 DistanceFromMean = (Input.Mean.xy - Input.Position.xy);
 
     float Power = dot(Input.Conic.xzy, float3(DistanceFromMean * DistanceFromMean, DistanceFromMean.x * DistanceFromMean.y));
-    float Alpha = exp(Power) * Input.Opacity;
+    // athenea: an opacity D over 1 is Spark's harder kernel (athenea's
+    // falloffAlpha): A = exp((D^2 - 1)/e) coincident gaussians, 1 - (1 - g)^A,
+    // a flat top and the gaussian's shoulder past it -- what a .athc's merged
+    // groups are drawn with. Drawn as D times a gaussian, its alpha passed 1:
+    // over-bright rims and the splats behind it darkened.
+    const float Gauss = exp(Power);
+    // athenea: a medium's gaussian (a negative opacity, its optical depth
+    // through the centre): 1 - exp(-tau) of its ray's depth.
+    float Alpha = Input.Opacity < 0.0f ? 1.0f - exp(Input.Opacity * Gauss)
+        : Input.Opacity > 1.0f
+        ? 1.0f - pow(max(1.0f - Gauss, 0.0f), exp((Input.Opacity * Input.Opacity - 1.0f) * 0.36787944f))
+        : Gauss * Input.Opacity;
 
 	float3 Shade = Input.Color;
 	if (any(Input.SharpA != 0u))

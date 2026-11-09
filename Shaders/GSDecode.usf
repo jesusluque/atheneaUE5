@@ -700,7 +700,9 @@ void GSDecodeAthc3CS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	// A paged tree's merged node (children past zero) is drawn at no opacity:
 	// its leaves are drawn instead.
 	const bool Merged = Athc3Desc(2u).x != 0u && Athc3Section(b, 2u).x != 0xFFFFFFFFu && (Athc3Word(b, 2u, n, e, 1u) >> 16) != 0u;
-	OutSHAndOpacities[i] = float4(HighHalf(Shape.z), LowHalf(Shape.w), HighHalf(Shape.w), Merged ? 0.0f : P.w);
+	// Where the tree is cut each frame (bit 4 of Streams2.y), a merge keeps its
+	// opacity and the culling pass chooses.
+	OutSHAndOpacities[i] = float4(HighHalf(Shape.z), LowHalf(Shape.w), HighHalf(Shape.w), Merged && (Streams2.y & 4u) == 0u ? 0.0f : P.w);
 
 	const uint Kept = Streams0.w;
 	const uint Base = i * 45u;
@@ -801,8 +803,16 @@ void GSDecodeAthc3TxCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	{
 		OutCells[i * TxCellWords + c] = Athc3Word(b, 4u, n, e, c);
 	}
-	// CURV: the shape operator, three halves in two words.
-	if (Athc3Desc(8u).x != 0u)
+	// CURV: the shape operator, three halves in two words (.athc), or three
+	// floats (an .athz's geometry layer).
+	if (Athc3Desc(8u).x != 0u && Athc3Desc(8u).y == 3u)
+	{
+		[unroll] for (uint c = 0; c < 3u; ++c)
+		{
+			OutCurvature[i * 3u + c] = asfloat(Athc3Word(b, 8u, n, e, c));
+		}
+	}
+	else if (Athc3Desc(8u).x != 0u)
 	{
 		const uint W0 = Athc3Word(b, 8u, n, e, 0u);
 		const uint W1 = Athc3Word(b, 8u, n, e, 1u);
@@ -1294,5 +1304,76 @@ void GSAthzDecodeCS(uint3 GroupId : SV_GroupID, uint3 Local : SV_GroupThreadID)
 			}
 			acc[k] = 0u;
 		}
+	}
+}
+
+// athenea's athzCpcaUnpack (athz_cpca.slang): a CPCA layer T's four words a
+// splat -- the cluster's id in the low byte, then 24 weights of 4 bits, eight
+// for each block (direct 16, indirect 48, field 48) -- back into the transfer's
+// f16 halves, the cluster's mean plus its axes times the weights, each
+// weight's step its axis's scale over the levels. The basis is the file's,
+// f32: the centroids and three norms, then a block's means, axes and scales.
+// FractionalBits is the CPCA head: count, clusters, components, levels, the
+// three blocks' first floats, the basis, the codes and the transfer out (bytes
+// in InBytes and Scratch), and the transfer's words a splat.
+uint AthzCpca(uint k) { return InBytes.Load(FractionalBits + k * 4u); }
+float AthzBasis(uint i) { return asfloat(InBytes.Load(AthzCpca(7u) + i * 4u)); }
+
+[numthreads(64, 1, 1)]
+void GSAthzCpcaCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint e = Offset + DispatchThreadId.x;
+	if (e >= AthzCpca(0u))
+	{
+		return;
+	}
+	const uint clusters = AthzCpca(1u);
+	const uint k = min(AthzCpca(2u), 8u);
+	const float levels = asfloat(AthzCpca(3u));
+	const uint transferWords = AthzCpca(10u);
+	uint words[4];
+	[unroll] for (uint w = 0; w < 4u; ++w)
+	{
+		words[w] = Scratch.Load(AthzCpca(8u) + (e * 4u + w) * 4u);
+	}
+	const uint id = min(words[0] & 0xFFu, clusters - 1u);
+	const uint dimsOf[3] = { 16u, 48u, 48u };
+	uint j = 0u;
+	uint pending = 0u;
+	for (uint b = 0; b < 3u; ++b)
+	{
+		const uint dims = dimsOf[b];
+		const uint meanAt = AthzCpca(4u + b);
+		const uint means = meanAt + id * dims;
+		const uint axes = meanAt + clusters * dims + id * dims * k;
+		const uint scales = meanAt + clusters * dims + clusters * dims * k + id * k;
+		float weights[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+		for (uint a = 0; a < k; ++a)
+		{
+			const uint bit = 8u + 4u * (b * k + a);
+			const float q = float((words[bit / 32u] >> (bit % 32u)) & 0xFu) - levels;
+			weights[a] = q * AthzBasis(scales + a) / levels;
+		}
+		for (uint d = 0; d < dims; ++d, ++j)
+		{
+			float v = AthzBasis(means + d);
+			for (uint a = 0; a < k; ++a)
+			{
+				v += AthzBasis(axes + d * k + a) * weights[a];
+			}
+			const uint h = f32tof16(clamp(v, -65000.0f, 65000.0f));
+			if ((j & 1u) == 0u)
+			{
+				pending = h;
+			}
+			else
+			{
+				Scratch.Store(AthzCpca(9u) + (e * transferWords + j / 2u) * 4u, pending | (h << 16));
+			}
+		}
+	}
+	if ((j & 1u) != 0u)
+	{
+		Scratch.Store(AthzCpca(9u) + (e * transferWords + j / 2u) * 4u, pending);
 	}
 }

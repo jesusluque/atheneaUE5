@@ -44,6 +44,20 @@ void FGaussianSplatData::CopyFrom(const FGaussianSplatData* Other)
 	bPackedCurvature = Other->bPackedCurvature;
 	FileUnitsToCm = Other->FileUnitsToCm;
 	GlassIor = Other->GlassIor;
+	LodWords = Other->LodWords;
+	LodLevels = Other->LodLevels;
+	LodFinestLevel = Other->LodFinestLevel;
+	LodFinestBase = Other->LodFinestBase;
+	LodBoundsLo = Other->LodBoundsLo;
+	LodExtent = Other->LodExtent;
+	Volume = Other->Volume;
+	bVolume = Other->bVolume;
+	VolumeDensityScale = Other->VolumeDensityScale;
+	VolumeAlbedo = Other->VolumeAlbedo;
+	VolumeEmission = Other->VolumeEmission;
+	VolumeEmissionScale = Other->VolumeEmissionScale;
+	VolumeTemperatureScale = Other->VolumeTemperatureScale;
+	VolumeTemperatureOffset = Other->VolumeTemperatureOffset;
 	Bounds = Other->Bounds;
 }
 
@@ -82,6 +96,14 @@ void FGaussianSplatData::Empty()
 	bPackedCurvature = false;
 	FileUnitsToCm = 100.0f;
 	GlassIor = 0.0f;
+	LodWords.Empty();
+	LodLevels = 0;
+	LodFinestLevel = 0;
+	LodFinestBase = 0;
+	LodBoundsLo = FVector3f::ZeroVector;
+	LodExtent = 0.0f;
+	Volume.Empty();
+	bVolume = false;
 }
 
 void FGaussianSplatData::Resize(uint32 Num)

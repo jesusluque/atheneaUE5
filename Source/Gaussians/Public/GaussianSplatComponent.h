@@ -32,6 +32,34 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Gaussian Splats|Clipping", DisplayName="Exact Match Only")
 	bool bClippingTagsExactMatchOnly = false;
 
+	// athenea: A SEQUENCE -- a medium's frames from athenea vdb2splat, or any
+	// clouds -- drawn one a frame at SequenceFramesPerSecond, the component's
+	// asset switched as the time passes (in the editor too). Empty: the asset
+	// above alone.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Gaussian Splats|Sequence")
+	TArray<TObjectPtr<UGSplatAsset>> SequenceFrames;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Gaussian Splats|Sequence", meta = (ClampMin = "0.01"))
+	float SequenceFramesPerSecond = 24.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Gaussian Splats|Sequence")
+	bool bSequenceLoop = true;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Gaussian Splats|Sequence")
+	bool bSequencePlaying = true;
+
+	// Seconds into the sequence.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Gaussian Splats|Sequence")
+	float SequenceTime = 0.0f;
+
+	// The sequence's frame at a time (seconds), drawn now.
+	UFUNCTION(BlueprintCallable, Category = "Gaussian Splats|Sequence")
+	void SetSequenceTime(float Seconds);
+
+	// Draws another cloud: the delegates and the render state follow it.
+	UFUNCTION(BlueprintCallable, Category = "Gaussian Splats")
+	void SetGaussianSplatAsset(UGSplatAsset* Asset);
+
 public:
 
 	UGaussianSplatComponent();
@@ -46,6 +74,7 @@ public:
 	//~ Begin UActorComponent Interface
 	virtual void OnRegister() override;
 	virtual void OnUnregister() override;
+	virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
 	//~ End UActorComponent Interface
 
 	//~ Begin UPrimitiveComponent Interface
@@ -63,6 +92,7 @@ private:
 
 private:
 	TWeakObjectPtr<UGSplatAsset> PrevGaussianSplatAsset = nullptr;
+	int32 SequenceShown = INDEX_NONE;
 
 #if WITH_EDITORONLY_DATA
 	UPROPERTY()

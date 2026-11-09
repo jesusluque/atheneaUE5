@@ -54,6 +54,14 @@ namespace
 	};
 	static_assert(sizeof(FAthcHeader) == 104, "the .athc header is 104 bytes");
 
+	struct FAthcLevel
+	{
+		uint32 Level;
+		uint32 Groups;
+		uint64 Offset;
+	};
+	static_assert(sizeof(FAthcLevel) == 16, "a .athc level entry is 16 bytes");
+
 	struct FAthcChunk
 	{
 		uint64 Offset;
@@ -207,6 +215,11 @@ namespace GSplatAthc3
 		TArray<uint32> Blocks;
 		TArray<uint8> Data;
 		uint32 Done = 0, Used = 0, Pages = 0, ScratchBytes = 0;
+		// A paged tree's pages in order (the TREE words name them by it): each
+		// one's first splat and its TREE words, page then place|count<<16.
+		TArray<uint32> PageStart;
+		TArray<TArray<uint32>> PageTree;
+		bool bTreeRead = true;
 		bool bCpca = false, bDelta = false;
 		TArray<uint8> Stored, Raw;
 		for (uint32 b = 0; b < BlockCount; b++)
@@ -223,6 +236,11 @@ namespace GSplatAthc3
 			}
 			Blocks.Add(Done);
 			Blocks.Add(n);
+			if (Kind == kKindPage)
+			{
+				PageStart.Add(Done);
+				PageTree.AddDefaulted();
+			}
 			for (uint32 k = 0; k < kSections; k++)
 			{
 				const int32 s = Index[k];
@@ -254,6 +272,35 @@ namespace GSplatAthc3
 						return Fail(FString::Printf(TEXT("a block's section %hs does not gunzip to its %u bytes."), kRead[k], RawBytes));
 					}
 					Bytes = &Raw;
+				}
+				if (k == 2 && Kind == kKindPage)
+				{
+					// The TREE words, as plain words or byte planes; delta-coded
+					// ones leave the cut out. Its two arrays of one word are cut
+					// from a run of whole rows (as GSDecode.usf's Athc3Word reads
+					// them): the run's word r is array r / n's element r % n, and
+					// node e's words are the run's 2e and 2e + 1.
+					TArray<uint32>& T = PageTree.Last();
+					const TArray<uint8>& R = *Bytes;
+					if ((Encoding[2] == 0 || Encoding[2] == 1) && Words[2] == 2 && R.Num() >= int32(n * 8))
+					{
+						T.SetNumZeroed(int32(n * 2));
+						for (uint32 r = 0; r < 2 * n; r++)
+						{
+							const uint32 Arr = r / n, i = r % n;
+							uint32 v = 0;
+							for (uint32 q = 0; q < 4; q++)
+							{
+								const uint32 Byte = Encoding[2] == 0 ? (Arr * n + i) * 4 + q : Arr * n * 4 + q * n + i;
+								v |= uint32(R[int32(Byte)]) << (8 * q);
+							}
+							T[int32(r)] = v;
+						}
+					}
+					else
+					{
+						bTreeRead = false;
+					}
 				}
 				const uint32 SectionAt = uint32(Data.Num());
 				Data.Append(*Bytes);
@@ -320,6 +367,62 @@ namespace GSplatAthc3
 			Splats.bPackedCurvature = Index[8] != INDEX_NONE && Words[8] == 2;
 			Splats.FileUnitsToCm = 100.0f;
 		}
+		// A paged tree's cut, as athenea's lod_tree_cut makes it: each node's
+		// parent from its parent's TREE words (the children's page and place,
+		// and their count), and whether it is a leaf. The culling pass draws a
+		// node that is a leaf or narrow enough on screen and whose parent is
+		// not (GSplatCulling.usf); the merges keep their opacity (bit 4 of
+		// PackedStreams[7]).
+		uint32 TreeNodes = 0;
+		if (Pages > 0 && bTreeRead && PageTree.Num() == PageStart.Num())
+		{
+			TArray<uint32> LodWords;
+			LodWords.Init(~0u, int32(Count) * 2);
+			for (uint32 i = 0; i < Count; i++)
+			{
+				LodWords[int32(i * 2 + 1)] = FGaussianSplatData::kLodTree | FGaussianSplatData::kLodLeaf;
+			}
+			bool bFits = true;
+			for (int32 p = 0; p < PageTree.Num() && bFits; p++)
+			{
+				const TArray<uint32>& T = PageTree[p];
+				for (int32 i = 0; i * 2 + 1 < T.Num(); i++)
+				{
+					const uint32 Node = PageStart[p] + uint32(i);
+					const uint32 ChildPage = T[i * 2], Place = T[i * 2 + 1] & 0xFFFFu, Children = T[i * 2 + 1] >> 16;
+					if (Children == 0)
+					{
+						continue;
+					}
+					if (ChildPage >= uint32(PageStart.Num()) || Node >= Count)
+					{
+						bFits = false;
+						break;
+					}
+					LodWords[int32(Node * 2 + 1)] = FGaussianSplatData::kLodTree;
+					TreeNodes++;
+					for (uint32 c = 0; c < Children; c++)
+					{
+						const uint32 Child = PageStart[int32(ChildPage)] + Place + c;
+						if (Child < Count)
+						{
+							LodWords[int32(Child * 2)] = Node;
+						}
+					}
+				}
+			}
+			if (bFits && TreeNodes > 0)
+			{
+				Splats.LodWords = MoveTemp(LodWords);
+				Splats.LodLevels = 1;
+				Splats.PackedStreams[7] |= 4u;
+			}
+			else
+			{
+				TreeNodes = 0;
+			}
+		}
+
 		const TArray<EGSplatSwizzleAxis>& Swizzle = ImportData.Swizzle;
 		Splats.FileAxisX = SwizzleVector(1.0f, 0.0f, 0.0f, Swizzle);
 		Splats.FileAxisY = SwizzleVector(0.0f, 1.0f, 0.0f, Swizzle);
@@ -335,7 +438,8 @@ namespace GSplatAthc3
 			? FString::Printf(TEXT("of %u values%s%s"), TransferCount, bCpca ? TEXT(", CPCA") : TEXT(""), Splats.CellWords ? TEXT(", cells") : TEXT(""))
 			: TransferCount > 0 ? FString::Printf(TEXT("of %u values not drawn (zonal or another layout)"), TransferCount) : FString(TEXT("none"));
 		UE_LOG(LogGSplatEditor, Display, TEXT("%s: %u gaussians in %u blocks%s, .athc version 3 (CORE encoding %u), %u rest coefficients a colour, %s colour, transfer %s; the levels not read."),
-			*Filename, Count, Used, Pages > 0 ? TEXT(" (error-band pages: the merges drawn at no opacity, the leaves alone seen)") : TEXT(""),
+			*Filename, Count, Used, TreeNodes > 0 ? *FString::Printf(TEXT(" (a paged tree of %u merges, cut each frame by r.Gaussians.Athenea.LodPixels)"), TreeNodes)
+				: Pages > 0 ? TEXT(" (error-band pages: the merges drawn at no opacity, the leaves alone seen)") : TEXT(""),
 			Encoding[0], RestPerColour, (Flags & kAthcLinear) ? TEXT("linear") : TEXT("sRGB"), *TransferText);
 		return true;
 	}
@@ -363,19 +467,77 @@ namespace GSplatAthc3
 		const uint32 MaterialWords = Normals + Emission + ((H.Flags & 16u) ? PbrWords + LobesWords : 0u);
 		const uint32 Row = 4 + 4 + H.SHWords + 1 + MaterialWords + TransferWords + ShadowWords;
 
+		// The merged levels: blocks as the chunks are, a group's octree cell
+		// where a splat has its finest group (the word after the harmonics).
+		// They follow the splats, decoded as they are, and are cut each frame.
+		TArray<FAthcLevel> Levels;
+		if (H.Levels > 0 && H.LevelTable > 0)
+		{
+			Levels.SetNumUninitialized(H.Levels);
+			if (!ReadAt(File, H.LevelTable, Levels.GetData(), uint64(H.Levels) * sizeof(FAthcLevel)))
+			{
+				Levels.Empty();
+			}
+		}
+		uint32 FinestLevel = 0, CoarsestLevel = ~0u;
+		uint64 Groups = 0;
+		for (const FAthcLevel& L : Levels)
+		{
+			Groups += L.Groups;
+			FinestLevel = FMath::Max(FinestLevel, L.Level);
+			CoarsestLevel = FMath::Min(CoarsestLevel, L.Level);
+		}
+		const FAthcLevel* Finest = Levels.FindByPredicate([&](const FAthcLevel& L) { return L.Level == FinestLevel; });
+		if (Levels.Num() > 0 && (Finest == nullptr || Finest->Groups != H.FinestGroups))
+		{
+			UE_LOG(LogGSplatEditor, Warning, TEXT("%s: levels that do not add up; the splats alone are read."), *Filename);
+			Levels.Empty();
+			Groups = 0;
+		}
+		TArray<uint32> LodWords;
+		uint32 FinestBase = 0;
+
 		TArray<uint8> Data;
 		TArray<uint32> Blocks;
 		uint32 Done = 0;
+		// Every block: the chunks' splats, then the levels' groups.
+		struct FBlockSource { uint64 Offset; uint32 Count; uint32 Level; bool bLevel; };
+		TArray<FBlockSource> Sources;
 		for (int32 c = 0; c < Chunks.Num(); c++)
 		{
-			const uint32 n = Chunks[c].Count;
+			Sources.Add({ Chunks[c].Offset, Chunks[c].Count, 0u, false });
+		}
+		for (const FAthcLevel& L : Levels)
+		{
+			Sources.Add({ L.Offset, L.Groups, L.Level, true });
+		}
+		for (int32 c = 0; c < Sources.Num(); c++)
+		{
+			const uint32 n = Sources[c].Count;
 			const uint32 At = uint32(Data.Num());
 			Data.AddUninitialized(int64(n) * Row * 4);
-			if (!ReadAt(File, Chunks[c].Offset, Data.GetData() + At, uint64(n) * Row * 4))
+			if (!ReadAt(File, Sources[c].Offset, Data.GetData() + At, uint64(n) * Row * 4))
 			{
-				return Fail(FString::Printf(TEXT("chunk %d is cut short."), c));
+				return Fail(FString::Printf(TEXT("block %d is cut short."), c));
 			}
 			const uint32 Sh = At + n * 32, Matl = Sh + n * 4 * (H.SHWords + 1), Tx = Matl + n * 4 * MaterialWords, Shad = Tx + n * 4 * TransferWords;
+			if (Levels.Num() > 0)
+			{
+				// The tail: a splat's finest group (leaf), or a group's cell and level.
+				const uint32* TailWords = reinterpret_cast<const uint32*>(Data.GetData() + Sh + n * 4 * H.SHWords);
+				if (Sources[c].bLevel && Sources[c].Level == FinestLevel)
+				{
+					FinestBase = Done;
+				}
+				const uint32 Mark = Sources[c].bLevel
+					? (Sources[c].Level | (Sources[c].Level == CoarsestLevel ? FGaussianSplatData::kLodCoarsest : 0u))
+					: FGaussianSplatData::kLodLeaf;
+				for (uint32 i = 0; i < n; i++)
+				{
+					LodWords.Add(TailWords[i]);
+					LodWords.Add(Mark);
+				}
+			}
 			Blocks.Append({ Done, n,
 				At, 0u, 0u,                                       // CORE: positions, shape
 				Sh, 0u, 0u,                                       // SHRS
@@ -388,9 +550,9 @@ namespace GSplatAthc3
 				0u, 0u, 0u });
 			Done += n;
 		}
-		if (Done != H.Count || uint64(Data.Num()) > 0xFFFFFFF0ull)
+		if (Done != H.Count + Groups || uint64(Data.Num()) > 0xFFFFFFF0ull)
 		{
-			return Fail(FString::Printf(TEXT("its chunks hold %u splats where the header says %u, or past 4 GB."), Done, H.Count));
+			return Fail(FString::Printf(TEXT("its chunks hold %u splats where the header says %u, or past 4 GB."), uint32(Done - Groups), H.Count));
 		}
 
 		uint32 Desc[kSections][8];
@@ -420,7 +582,7 @@ namespace GSplatAthc3
 		ImportData.Swizzle = { EGSplatSwizzleAxis::X, EGSplatSwizzleAxis::Z, EGSplatSwizzleAxis::Y };
 		ImportData.ScaleFactor = 100.0f;
 		ImportData.bApplyGammaCorrection = (H.Flags & kAthcLinear) == 0;
-		ImportData.NumSplats = int32(H.Count);
+		ImportData.NumSplats = int32(Done);
 		ImportData.bHasHighOrderSH = H.RestPerColour > 0;
 		ImportData.bHasNormals = false;
 		ImportData.bHasMetallicRoughness = false;
@@ -428,11 +590,20 @@ namespace GSplatAthc3
 		Splats.Empty();
 		Splats.bPacked = true;
 		Splats.PackedFormat = 5;
-		Splats.SplatCount = H.Count;
+		Splats.SplatCount = Done;
+		if (Levels.Num() > 0)
+		{
+			Splats.LodWords = MoveTemp(LodWords);
+			Splats.LodLevels = uint32(Levels.Num());
+			Splats.LodFinestLevel = FinestLevel;
+			Splats.LodFinestBase = FinestBase;
+			Splats.LodBoundsLo = FVector3f(H.BoundsLo[0], H.BoundsLo[1], H.BoundsLo[2]);
+			Splats.LodExtent = H.Extent;
+		}
 		Splats.bHasHighOrderSH = ImportData.bHasHighOrderSH && ImportData.bImportHighOrderSH;
 		Splats.PackedUnitsToCm = ImportData.ScaleFactor;
 		Splats.PackedBytes = MoveTemp(Data);
-		Splats.PackedStreams = { TableAt, uint32(Chunks.Num()), H.SHWords, Splats.bHasHighOrderSH ? H.RestPerColour : 0u,
+		Splats.PackedStreams = { TableAt, uint32(Sources.Num()), H.SHWords, Splats.bHasHighOrderSH ? H.RestPerColour : 0u,
 			0u, TransferCount, H.Flags, 0u };
 		Splats.bHasTransfer = true;
 		Splats.TransferDirectCount = Direct;
@@ -447,9 +618,9 @@ namespace GSplatAthc3
 		Box += FVector(SwizzleVector(H.BoundsMin[0], H.BoundsMin[1], H.BoundsMin[2], Swizzle) * ImportData.ScaleFactor);
 		Box += FVector(SwizzleVector(H.BoundsMax[0], H.BoundsMax[1], H.BoundsMax[2], Swizzle) * ImportData.ScaleFactor);
 		Splats.SetBounds(FBoxSphereBounds(Box));
-		UE_LOG(LogGSplatEditor, Display, TEXT("%s: %u gaussians in %d chunks, .athc version 2 with a transfer of %u values%s, %u rest coefficients a colour, %s colour; %u levels not read."),
+		UE_LOG(LogGSplatEditor, Display, TEXT("%s: %u gaussians in %d chunks, .athc version 2 with a transfer of %u values%s, %u rest coefficients a colour, %s colour; %d levels of detail (%llu merged groups), cut each frame by r.Gaussians.Athenea.LodPixels."),
 			*Filename, H.Count, Chunks.Num(), TransferCount, Splats.CellWords ? TEXT(" and cells") : TEXT(""), H.RestPerColour,
-			(H.Flags & kAthcLinear) ? TEXT("linear") : TEXT("sRGB"), H.Levels);
+			(H.Flags & kAthcLinear) ? TEXT("linear") : TEXT("sRGB"), Levels.Num(), Groups);
 		return true;
 	}
 }
@@ -522,18 +693,55 @@ bool GSplatImporter::ImportAthc(const FString& Filename, UGSplatImportData& Impo
 	ImportData.bHasNormals = false;
 	ImportData.bHasMetallicRoughness = false;
 
+	// The merged levels: each a block as a chunk's, its groups' octree cells
+	// where a chunk has its splats' finest groups. They follow the splats in
+	// the packed arrays, decoded as the splats are, and cut every frame.
+	TArray<FAthcLevel> Levels;
+	if (H.Levels > 0 && H.LevelTable > 0)
+	{
+		Levels.SetNumUninitialized(H.Levels);
+		if (!ReadAt(*File, H.LevelTable, Levels.GetData(), uint64(H.Levels) * sizeof(FAthcLevel)))
+		{
+			UE_LOG(LogGSplatEditor, Warning, TEXT("%s: the level table is cut short; the splats alone are read."), *Filename);
+			Levels.Empty();
+		}
+	}
+	uint64 Total = H.Count;
+	uint32 FinestLevel = 0, CoarsestLevel = ~0u;
+	for (const FAthcLevel& L : Levels)
+	{
+		Total += L.Groups;
+		FinestLevel = FMath::Max(FinestLevel, L.Level);
+		CoarsestLevel = FMath::Min(CoarsestLevel, L.Level);
+	}
+	const FAthcLevel* Finest = Levels.FindByPredicate([&](const FAthcLevel& L) { return L.Level == FinestLevel; });
+	if (Levels.Num() > 0 && (Finest == nullptr || Finest->Groups != H.FinestGroups || Total > 0x7FFFFFFF))
+	{
+		UE_LOG(LogGSplatEditor, Warning, TEXT("%s: levels that do not add up (finest %u groups where the header says %u); the splats alone are read."),
+			*Filename, Finest ? Finest->Groups : 0u, H.FinestGroups);
+		Levels.Empty();
+		Total = H.Count;
+	}
+
 	Splats.Empty();
 	Splats.bHasNormals = false;
 	Splats.bHasHighOrderSH = H.RestPerColour > 0 && ImportData.bImportHighOrderSH;
 	Splats.bHasMetallicRoughness = false;
 	Splats.bPacked = true;
-	Splats.SplatCount = H.Count;
+	Splats.SplatCount = uint32(Total);
 	Splats.PackedSHWords = H.SHWords;
 	Splats.PackedRestPerColour = Splats.bHasHighOrderSH ? H.RestPerColour : 0;
 	Splats.PackedUnitsToCm = ImportData.ScaleFactor;
-	Splats.PackedPositions.SetNumUninitialized(H.Count);
-	Splats.PackedShape.SetNumUninitialized(int32(H.Count) * 4);
-	Splats.PackedSH.SetNumUninitialized(int32(H.Count * H.SHWords));
+	Splats.PackedPositions.SetNumUninitialized(int32(Total));
+	Splats.PackedShape.SetNumUninitialized(int32(Total) * 4);
+	Splats.PackedSH.SetNumUninitialized(int32(Total * H.SHWords));
+	if (Levels.Num() > 0)
+	{
+		Splats.LodWords.SetNumUninitialized(int32(Total) * 2);
+	}
+	// Where a block's tail (finest groups or cells) starts, after its harmonics.
+	const uint64 TailAfter = 32 + 4 * uint64(H.SHWords);
+	TArray<uint32> Tail;
 
 	uint64 Done = 0;
 	for (uint32 c = 0; c < H.Chunks; c++)
@@ -555,7 +763,57 @@ bool GSplatImporter::ImportAthc(const FString& Filename, UGSplatImportData& Impo
 			UE_LOG(LogGSplatEditor, Error, TEXT("%s: chunk %u is cut short."), *Filename, c);
 			return false;
 		}
+		if (Levels.Num() > 0)
+		{
+			// Each splat's finest-level group: copied, with the leaf mark.
+			Tail.SetNumUninitialized(int32(n));
+			if (!ReadAt(*File, Chunk.Offset + n * TailAfter, Tail.GetData(), n * 4))
+			{
+				UE_LOG(LogGSplatEditor, Error, TEXT("%s: chunk %u's groups are cut short."), *Filename, c);
+				return false;
+			}
+			for (uint64 i = 0; i < n; i++)
+			{
+				Splats.LodWords[int32((Done + i) * 2)] = Tail[int32(i)];
+				Splats.LodWords[int32((Done + i) * 2 + 1)] = FGaussianSplatData::kLodLeaf;
+			}
+		}
 		Done += n;
+	}
+	uint32 FinestBase = 0;
+	for (const FAthcLevel& L : Levels)
+	{
+		const uint64 n = L.Groups;
+		if (L.Level == FinestLevel)
+		{
+			FinestBase = uint32(Done);
+		}
+		Tail.SetNumUninitialized(int32(n));
+		const bool bRead =
+			ReadAt(*File, L.Offset, &Splats.PackedPositions[Done], n * 16)
+			&& ReadAt(*File, L.Offset + n * 16, &Splats.PackedShape[Done * 4], n * 16)
+			&& (H.SHWords == 0 || ReadAt(*File, L.Offset + n * 32, &Splats.PackedSH[Done * H.SHWords], n * 4 * H.SHWords))
+			&& ReadAt(*File, L.Offset + n * TailAfter, Tail.GetData(), n * 4);
+		if (!bRead)
+		{
+			UE_LOG(LogGSplatEditor, Error, TEXT("%s: level %u is cut short."), *Filename, L.Level);
+			return false;
+		}
+		// Each group's cell code and level (and whether it is the coarsest kept).
+		for (uint64 i = 0; i < n; i++)
+		{
+			Splats.LodWords[int32((Done + i) * 2)] = Tail[int32(i)];
+			Splats.LodWords[int32((Done + i) * 2 + 1)] = L.Level | (L.Level == CoarsestLevel ? FGaussianSplatData::kLodCoarsest : 0u);
+		}
+		Done += n;
+	}
+	if (Levels.Num() > 0)
+	{
+		Splats.LodLevels = uint32(Levels.Num());
+		Splats.LodFinestLevel = FinestLevel;
+		Splats.LodFinestBase = FinestBase;
+		Splats.LodBoundsLo = FVector3f(H.BoundsLo[0], H.BoundsLo[1], H.BoundsLo[2]);
+		Splats.LodExtent = H.Extent;
 	}
 
 	const TArray<EGSplatSwizzleAxis>& Swizzle = ImportData.Swizzle;
@@ -572,8 +830,8 @@ bool GSplatImporter::ImportAthc(const FString& Filename, UGSplatImportData& Impo
 	Box += FVector(B);
 	Splats.SetBounds(FBoxSphereBounds(Box));
 
-	UE_LOG(LogGSplatEditor, Display, TEXT("%s: %u gaussians in %u chunks, %u rest coefficients a colour, %s colour, %u levels not read."),
-		*Filename, H.Count, H.Chunks, H.RestPerColour, (H.Flags & kAthcLinear) ? TEXT("linear") : TEXT("sRGB"), H.Levels);
+	UE_LOG(LogGSplatEditor, Display, TEXT("%s: %u gaussians in %u chunks, %u rest coefficients a colour, %s colour; %d levels of detail (%llu merged groups), cut each frame by r.Gaussians.Athenea.LodPixels."),
+		*Filename, H.Count, H.Chunks, H.RestPerColour, (H.Flags & kAthcLinear) ? TEXT("linear") : TEXT("sRGB"), Levels.Num(), Total - H.Count);
 	return true;
 }
 

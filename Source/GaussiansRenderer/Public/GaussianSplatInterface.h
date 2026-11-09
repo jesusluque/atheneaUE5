@@ -2,6 +2,9 @@
 
 
 #include "CoreMinimal.h"
+#include "RHIFwd.h"
+
+class FSceneView;
 
 class FGaussianSplatResource;
 
@@ -27,6 +30,8 @@ public:
 	virtual FRHIUnorderedAccessView* GetIndexCountBufferUAV() const = 0;
 
 	virtual bool RequiresNewCullingPass() const = 0;
+	// athenea: where the cloud stands, for a level of detail cut each frame.
+	virtual FMatrix GetSplatLocalToWorld() const = 0;
 	virtual void MarkIndexBufferUpdated() = 0;
 
 	virtual bool SupportsRelighting() const = 0;

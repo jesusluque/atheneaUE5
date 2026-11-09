@@ -1,5 +1,8 @@
 #include "GaussiansRenderer.h"
 #include "Interfaces/IPluginManager.h"
+#include "HAL/IConsoleManager.h"
+#include "Misc/Paths.h"
+#include "ShaderCore.h"
 
 #define LOCTEXT_NAMESPACE "FGaussiansRendererModule"
 

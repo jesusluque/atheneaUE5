@@ -18,6 +18,79 @@ StructuredBuffer<FGaussians_ClippingVolume> ClippingVolumes;
 
 float SplatScaleMultiplier;
 
+// athenea: a .athc's levels of detail cut this frame, as athenea's CutSelector
+// cuts them (shaders/athenea/lod/lod_cut.slang): a merged group is drawn where
+// its octree cell spans at most LodThreshold pixels at its nearest point to
+// the eye and its parent's cell more; a splat where its finest-level group's
+// cell spans more. LodEyeLocal is the eye in the primitive's local space (cm);
+// the cells are in the file's axes and units. LodThreshold 0 draws the splats.
+float3 LodEyeLocal;
+float LodPixelsPerUnit;
+float LodThreshold;
+
+uint LodCompact(uint v)
+{
+	v &= 0x09249249u;
+	v = (v | (v >> 2)) & 0x030C30C3u;
+	v = (v | (v >> 4)) & 0x0300F00Fu;
+	v = (v | (v >> 8)) & 0x030000FFu;
+	v = (v | (v >> 16)) & 0x000003FFu;
+	return v;
+}
+
+// The pixels a level-`Level` cell spans at its nearest point to the eye.
+float LodCellPixels(uint Cell, uint Level, float3 Eye)
+{
+	const float Edge = GSResources.LodExtent / float(1u << Level);
+	const float3 Lo = GSResources.LodBoundsLo + float3(LodCompact(Cell >> 2), LodCompact(Cell >> 1), LodCompact(Cell)) * Edge;
+	const float3 Nearest = clamp(Eye, Lo, Lo + Edge);
+	return Edge * LodPixelsPerUnit / max(length(Nearest - Eye), 1e-6f);
+}
+
+bool LodSmall(uint Cell, uint Level, float3 Eye)
+{
+	return LodThreshold > 0.0f && LodCellPixels(Cell, Level, Eye) <= LodThreshold;
+}
+
+// A tree node's width on screen, twice its widest deviation over its distance
+// (athenea's treeCutWidth), against the threshold; local centimetres.
+bool LodTreeNarrow(uint Node)
+{
+	const float3 S = GSResources.Scales[Node] * 100.0f;
+	const float Distance = max(length(GSResources.Positions[Node] - LodEyeLocal), 1.0e-3f);
+	return LodThreshold > 0.0f && 2.0f * max(S.x, max(S.y, S.z)) / Distance * LodPixelsPerUnit <= LodThreshold;
+}
+
+bool LodDrawn(uint SplatIndex)
+{
+	// The eye in the file's axes and units (FileAxis* are where the file's axes
+	// point in local space, a signed permutation).
+	const float3 L = LodEyeLocal / GSResources.LodUnitsToCm;
+	const float3 Eye = float3(dot(GSResources.FileAxisX, L), dot(GSResources.FileAxisY, L), dot(GSResources.FileAxisZ, L));
+	const uint A = GSResources.LodWords[SplatIndex * 2];
+	const uint B = GSResources.LodWords[SplatIndex * 2 + 1];
+	if ((B & 0x20000000u) != 0)
+	{
+		// A paged tree's node (athenea's lod_tree_cut): it passes as a leaf or
+		// where it spans at most LodThreshold pixels; it is drawn where it
+		// passes and its parent does not.
+		const bool bLeaf = (B & 0x80000000u) != 0;
+		const bool bHere = bLeaf || LodTreeNarrow(SplatIndex);
+		return bHere && (A == 0xFFFFFFFFu || !LodTreeNarrow(A));
+	}
+	if ((B & 0x80000000u) != 0)
+	{
+		// A splat: drawn where its finest-level group's cell is not small.
+		const uint Cell = GSResources.LodWords[(GSResources.LodFinestBase + A) * 2];
+		return !LodSmall(Cell, GSResources.LodFinestLevel, Eye);
+	}
+	const uint Level = B & 0xFFu;
+	const bool bHere = LodSmall(A, Level, Eye);
+	// The coarsest level the file keeps (bit 30) has no parent to defer to.
+	const bool bAbove = (B & 0x40000000u) == 0 && Level > 0 && LodSmall(A >> 3, Level - 1, Eye);
+	return bHere && !bAbove;
+}
+
 
 struct FOrientedBoundingBox
 {
@@ -139,7 +212,7 @@ void GSplatCullingCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex
 	uint SplatIndex = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUP_SIZE_1D);
 
 	// If there are no clipping volumes, all splats are visible
-	bool bVisible = NumClippingVolumes == 0;
+	bool bVisible = NumClippingVolumes == 0 && SplatIndex < uint(GSResources.SplatCount);
 
 	if (SplatIndex < GSResources.SplatCount && NumClippingVolumes > 0)
 	{
@@ -191,6 +264,11 @@ void GSplatCullingCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex
 				break;
 			} 
 		}
+	}
+
+	if (bVisible && GSResources.LodLevels > 0)
+	{
+		bVisible = LodDrawn(SplatIndex);
 	}
 
 	if (bVisible)

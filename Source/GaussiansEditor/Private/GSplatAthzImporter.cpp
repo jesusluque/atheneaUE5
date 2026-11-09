@@ -19,8 +19,9 @@
 // coded against its parent group -- and the cloud's splats last, laid out as a
 // .athc chunk's arrays, which the version 3 decoders read as encoding 4
 // (GSDecode.usf, GSAthzDecodeCS). The merged levels are decoded only as the
-// splats' parents: what is drawn is the splats. A CPCA layer T (its id and
-// weights) and layer K (a rig) are not read; neither is the curvature. The
+// splats' parents: what is drawn is the splats. A CPCA layer T is decoded as
+// its codes and expanded by the basis the file keeps (GSAthzCpcaCS); the
+// curvature is read with the transfer. Layer K (a rig) is not read. The
 // header's and the pages' CRCs are checked before anything is decoded.
 
 #include "GSplatImporter.h"
@@ -119,11 +120,15 @@ bool GSplatImporter::ImportAthzCloud(const FString& Filename, UGSplatImportData&
 	const uint32 PbrWords = R.Get<uint32>(), LobesWords = R.Get<uint32>(), TransferCount = R.Get<uint32>();
 	const uint32 TransferWords = R.Get<uint32>(), ShadowWords = R.Get<uint32>();
 	uint32 CurvatureWords = 0, CodedTransferWords = 0, InfluenceWords = 0, GradientWords = 0;
+	uint32 CpcaClusters = 0, CpcaComponents = 0;
+	float CpcaLevels = 0.0f;
+	uint64 BasisOffset = 0, BasisBytes = 0;
 	if (Version >= 3)
 	{
 		CurvatureWords = R.Get<uint32>();
 		CodedTransferWords = R.Get<uint32>();
-		R.Get<uint32>(); R.Get<uint32>(); R.Get<float>(); R.Get<uint64>(); R.Get<uint64>();   // CPCA
+		CpcaClusters = R.Get<uint32>(); CpcaComponents = R.Get<uint32>(); CpcaLevels = R.Get<float>();
+		BasisOffset = R.Get<uint64>(); BasisBytes = R.Get<uint64>();
 	}
 	if (Version >= 4)
 	{
@@ -179,9 +184,29 @@ bool GSplatImporter::ImportAthzCloud(const FString& Filename, UGSplatImportData&
 		return Fail(TEXT("a prefix of its bands: the splats' pages are not all in the file."));
 	}
 
-	// The layers decoded: geometry and appearance, the transfer where it is
-	// lossless; and which carry a rANS plane, by kind.
-	const bool bTransfer = (Flags & kFlagTransfer) != 0 && !bCpca && TransferWords > 0;
+	// A CPCA transfer: 4 words a splat against a basis of 256 clusters or
+	// fewer, 8 axes a block, for the 112 values of a TX cloud (athenea's
+	// decodeAsset refuses anything else). Its floats: the centroids and three
+	// norms, then each block's means, axes and scales.
+	const uint32 CpcaDims[3] = { 16, 48, 48 };
+	uint64 BasisFloats = uint64(CpcaClusters) * 112 + 3;
+	uint32 MeanAt[3] = { 0, 0, 0 };
+	for (uint32 b = 0; b < 3; b++)
+	{
+		MeanAt[b] = uint32(BasisFloats);
+		BasisFloats += uint64(CpcaClusters) * CpcaDims[b] * (1 + uint64(CpcaComponents)) + uint64(CpcaClusters) * CpcaComponents;
+	}
+	if (bCpca && (CodedTransferWords != 4 || TransferCount != 112 || TransferWords != 56 || CpcaClusters == 0
+		|| CpcaClusters > 256 || CpcaComponents != 8 || !(CpcaLevels > 0.0f) || BasisBytes < BasisFloats * 4
+		|| BasisOffset > uint64(File.Num()) || BasisBytes > uint64(File.Num()) - BasisOffset))
+	{
+		return Fail(TEXT("a CPCA transfer whose basis does not add up."));
+	}
+
+	// The layers decoded: geometry and appearance, and the transfer, lossless
+	// or as CPCA codes; and which carry a rANS plane, by kind.
+	const bool bTransfer = (Flags & kFlagTransfer) != 0 && TransferWords > 0;
+	const bool bCurvature = CurvatureWords == 3;
 	const uint32 Layers = kLayerG | kLayerA | (bTransfer ? kLayerT : 0u);
 	uint32 HasRans[2] = { 0, 0 };
 	for (uint32 k = 0; k < 2; k++)
@@ -217,6 +242,12 @@ bool GSplatImporter::ImportAthzCloud(const FString& Filename, UGSplatImportData&
 		FieldBases.Add(Lay(L.Groups));
 	}
 	FieldBases.Add(Lay(Count));
+	// A CPCA transfer's values, expanded from the splats' codes.
+	const uint32 CpcaOut = uint32(FMath::Min<uint64>(Scratch, 0xFFFFFFFFull));
+	if (bTransfer && bCpca)
+	{
+		Scratch += uint64(Count) * TransferWords * 4;
+	}
 	if (Scratch > 0xFFFFFFF0ull)
 	{
 		return Fail(TEXT("more than 4 GB to decode into."));
@@ -296,6 +327,13 @@ bool GSplatImporter::ImportAthzCloud(const FString& Filename, UGSplatImportData&
 	const uint32 SourceAt = uint32(Bytes.Num());
 	Bytes.Append(Source);
 	Source.Empty();
+	Align4();
+	uint32 BasisAt = 0;
+	if (bTransfer && bCpca)
+	{
+		BasisAt = uint32(Bytes.Num());
+		Bytes.Append(File.GetData() + BasisOffset, int32(BasisFloats * 4));
+	}
 	File.Empty();
 	Align4();
 	// A descriptor a level, then the splats': kind, first page, pages, the
@@ -320,9 +358,10 @@ bool GSplatImporter::ImportAthzCloud(const FString& Filename, UGSplatImportData&
 	}
 	const uint32 LevelsAt = uint32(Bytes.Num());
 	Bytes.Append(reinterpret_cast<const uint8*>(LevelWords.GetData()), LevelWords.Num() * 4);
-	// The fields decoded: everything but the curvature and layer K.
+	// The fields decoded: everything but layer K; the transfer and its open
+	// directions where layer T is read, the curvature where it is three floats.
 	uint32 Bound = 0;
-	for (uint32 f = 0; f <= 9; f++)
+	for (uint32 f = 0; f <= 10; f++)
 	{
 		Bound |= 1u << f;
 	}
@@ -330,11 +369,25 @@ bool GSplatImporter::ImportAthzCloud(const FString& Filename, UGSplatImportData&
 	{
 		Bound &= ~((1u << 8) | (1u << 9));
 	}
+	if (!bCurvature)
+	{
+		Bound &= ~(1u << 10);
+	}
 	const uint32 Head[27] = { Tables, TableLog, Planes, Layers, HasRans[0], HasRans[1], 8 + SHWords,
 		SHWords, Normals, Emission, PbrWords, LobesWords, CodedTransfer, ShadowWords, CurvatureWords, InfluenceWords, GradientWords,
 		RunGaussians, PageRuns, FreqAt, PlanesAt, PageListAt, SourceAt, LevelsAt, uint32(Levels.Num()) + 1, 0u, Bound };
 	const uint32 HeadAt = uint32(Bytes.Num());
 	Bytes.Append(reinterpret_cast<const uint8*>(Head), sizeof(Head));
+	// GSAthzCpcaCS's head: count, clusters, components, levels, each block's
+	// first float, the basis, the splats' codes, the values out, words a splat.
+	uint32 CpcaAt = 0;
+	if (bTransfer && bCpca)
+	{
+		CpcaAt = uint32(Bytes.Num());
+		const uint32 CpcaHead[11] = { Count, CpcaClusters, CpcaComponents, *reinterpret_cast<const uint32*>(&CpcaLevels),
+			MeanAt[0], MeanAt[1], MeanAt[2], BasisAt, FieldBases.Last()[8], CpcaOut, TransferWords };
+		Bytes.Append(reinterpret_cast<const uint8*>(CpcaHead), sizeof(CpcaHead));
+	}
 
 	// The splats as a .athc v3 block whose sections are in Scratch.
 	const TArray<uint32>& Leaf = FieldBases.Last();
@@ -362,6 +415,10 @@ bool GSplatImporter::ImportAthzCloud(const FString& Filename, UGSplatImportData&
 		Set(4, ShadowWords, { ShadowWords });
 		Set(5, TransferWords, { TransferWords });
 	}
+	if (bTransfer && bCurvature)
+	{
+		Set(8, CurvatureWords, { CurvatureWords });
+	}
 	TArray<uint32> Block;
 	Block.SetNumZeroed(kBlockWords);
 	Block[0] = 0;
@@ -380,7 +437,8 @@ bool GSplatImporter::ImportAthzCloud(const FString& Filename, UGSplatImportData&
 	Section(1, Leaf[2]);              // harmonics
 	Section(3, Leaf[4]);              // normals, emission, pbr, lobes
 	Section(4, Leaf[9]);              // open directions
-	Section(5, Leaf[8]);              // the transfer
+	Section(5, bCpca ? CpcaOut : Leaf[8]);   // the transfer, expanded where it is CPCA
+	Section(8, Leaf[10]);             // the curvature
 	const uint32 TableAt = uint32(Bytes.Num());
 	Bytes.Append(reinterpret_cast<const uint8*>(Desc), sizeof(Desc));
 	Bytes.Append(reinterpret_cast<const uint8*>(Block.GetData()), Block.Num() * 4);
@@ -405,7 +463,7 @@ bool GSplatImporter::ImportAthzCloud(const FString& Filename, UGSplatImportData&
 		| (PbrWords > 0 ? 16u : 0u) | (bTransfer ? 32u : 0u);
 	Splats.PackedStreams = { TableAt, 1u, SHWords, Splats.bHasHighOrderSH ? RestPerColour : 0u,
 		uint32(Scratch), bTransfer ? TransferCount : 0u, AthcFlags, 0u };
-	Splats.PackedSpz = FIntVector(int32(HeadAt), 0, 0);
+	Splats.PackedSpz = FIntVector(int32(HeadAt), int32(CpcaAt), 0);
 	const uint32 Direct = (TransferCount == 9 || TransferCount == 36 || TransferCount == 84) ? 9u
 		: (TransferCount == 16 || TransferCount == 64 || TransferCount == 112) ? 16u : 0u;
 	if (bTransfer && Direct > 0)
@@ -415,6 +473,7 @@ bool GSplatImporter::ImportAthzCloud(const FString& Filename, UGSplatImportData&
 		Splats.CellWords = (ShadowWords == 8 || ShadowWords == 32) ? ShadowWords : 0u;
 		Splats.bPackedTransferField = Direct == 16 && TransferCount == 112;
 		Splats.FileUnitsToCm = 100.0f;
+		Splats.bPackedCurvature = bCurvature;
 	}
 	const TArray<EGSplatSwizzleAxis>& Swizzle = ImportData.Swizzle;
 	Splats.FileAxisX = SwizzleVector(1.0f, 0.0f, 0.0f, Swizzle);
@@ -426,9 +485,10 @@ bool GSplatImporter::ImportAthzCloud(const FString& Filename, UGSplatImportData&
 	Box += FVector(SwizzleVector(BoundsMax[0], BoundsMax[1], BoundsMax[2], Swizzle) * ImportData.ScaleFactor);
 	Splats.SetBounds(FBoxSphereBounds(Box));
 
-	UE_LOG(LogGSplatEditor, Display, TEXT("%s: %u gaussians, .athz version %u, %d merged levels decoded as their parents, %u pages, transfer %s, CRCs checked; the curvature not read."),
+	UE_LOG(LogGSplatEditor, Display, TEXT("%s: %u gaussians, .athz version %u, %d merged levels decoded as their parents, %u pages, transfer %s, curvature %s, CRCs checked."),
 		*Filename, Count, Version, Levels.Num(), LeafFirstPage + LeafPages,
-		bTransfer ? *FString::Printf(TEXT("of %u values"), TransferCount) : bCpca ? TEXT("CPCA, not read") : TEXT("none"));
+		bTransfer ? *FString::Printf(TEXT("of %u values%s"), TransferCount, bCpca ? *FString::Printf(TEXT(" as CPCA codes (%u clusters)"), CpcaClusters) : TEXT("")) : TEXT("none"),
+		bCurvature && bTransfer ? TEXT("read") : TEXT("none"));
 	return true;
 }
 

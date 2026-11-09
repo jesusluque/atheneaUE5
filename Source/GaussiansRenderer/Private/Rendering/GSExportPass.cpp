@@ -5,6 +5,8 @@
 #include "GSDispatchHelper.h"
 #include "RenderGraphBuilder.h"
 #include "RenderGraphUtils.h"
+#include "GlobalShader.h"
+#include "ShaderParameterStruct.h"
 #include "ShaderParameterStruct.h"
 
 

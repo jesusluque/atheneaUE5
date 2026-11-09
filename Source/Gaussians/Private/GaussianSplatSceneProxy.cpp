@@ -228,7 +228,10 @@ FRHIUnorderedAccessView* FGaussianSplatSceneProxy::GetIndexCountBufferUAV() cons
 
 bool FGaussianSplatSceneProxy::RequiresNewCullingPass() const
 {
-	return bRequiresIndexBufferUpdate;
+	// A cloud with levels of detail is cut again every frame: what it draws
+	// follows the eye.
+	const FGaussianSplatResource* Resource = GetResource_RenderThread();
+	return bRequiresIndexBufferUpdate || (Resource != nullptr && Resource->GetLodLevels() > 0);
 }
 
 void FGaussianSplatSceneProxy::MarkIndexBufferUpdated()

@@ -587,7 +587,7 @@ splats.
   skin y el tier compacto; las fusiones de un árbol paginado se decodifican y
   se ocultan, no se omiten.
 - **Otros formatos.** `.athv` (vídeo HEVC), `.athl` (las capas de luz de la
-  web), la transferencia CPCA de un `.athz` y su curvatura; la extensión de sistema de coordenadas de un SPZ; la transformación de
+  web), la capa K de un `.athz`; la extensión de sistema de coordenadas de un SPZ; la transformación de
   un nodo de glTF, más de una primitiva de gaussianas, los accessors sparse y
   `EXT_meshopt_compression`.
 - **La transformación del ParticleField** (una rotación tendría que girar los
@@ -599,3 +599,27 @@ splats.
   del sort.
 - **Almacenamiento f16** para las rutas PLY y USD, y su conversión en la GPU.
 - **Tests automáticos** en el plugin.
+
+## El paquete que hace BuildPlugin (8 nov)
+
+`RunUAT BuildPlugin` compila el plugin sin unity build, cada fichero solo,
+donde la compilación de un proyecto los había juntado. `GSplatImporter.h`
+nombraba `class UGSplatAsset&` dentro de `namespace GSplatImporter`, lo que
+declara un `GSplatImporter::UGSplatAsset` nuevo y vacío; juntos, un fichero
+que había visto la clase real iba antes, y solo `GSplatSceneImporter.cpp`
+fallaba (C2664, C2027). La cabecera declara ahora `UGSplatAsset` en el ámbito
+global, antes del namespace.
+
+Después, la compilación se paraba en ficheros que usaban tipos que nunca
+incluían y que traía la cabecera precompilada compartida del proyecto: los del
+RHI (`RHIFwd.h`, `RHIResources.h`, `RHIFeatureLevel.h`), los del render graph
+(`RenderGraphFwd.h`, `RenderGraphResources.h`), `FGlobalShader`
+(`GlobalShader.h`, `ShaderParameterStruct.h`), `TAutoConsoleVariable`
+(`HAL/IConsoleManager.h`), `FPaths` y los mapeos de directorios de shaders
+(`Misc/Paths.h`, `ShaderCore.h`), `TQueue` (`Containers/Queue.h`),
+`FPackageName` y `UPackage` (`Misc/PackageName.h`, `UObject/Package.h`), y
+`FSceneView`, declarado donde solo se nombra una referencia. En
+`GaussianSplatInterface.h` los tipos del RHI eran la causa de los errores de
+`override` del proxy: sin declarar, se caían los tres métodos del contador de
+índices de la interfaz. Cada fichero incluye ahora lo que usa, y el paquete
+compila.

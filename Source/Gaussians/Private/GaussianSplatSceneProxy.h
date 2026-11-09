@@ -53,6 +53,7 @@ public:
 	virtual FRHIUnorderedAccessView* GetIndexCountBufferUAV() const override;
 
 	virtual bool RequiresNewCullingPass() const override;
+	virtual FMatrix GetSplatLocalToWorld() const override { return GetLocalToWorld(); }
 	virtual void MarkIndexBufferUpdated() override;
 
 	virtual bool SupportsRelighting() const override;

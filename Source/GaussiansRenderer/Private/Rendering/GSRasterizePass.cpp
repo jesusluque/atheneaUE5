@@ -25,6 +25,7 @@
 // time goes.
 DECLARE_GPU_STAT_NAMED(GaussiansPrePass, TEXT("Gaussians: PrePass"));
 DECLARE_GPU_STAT_NAMED(GaussiansSky, TEXT("Gaussians: Sky"));
+DECLARE_GPU_STAT_NAMED(GaussiansMediumShadow, TEXT("Gaussians: Medium shadow"));
 DECLARE_GPU_STAT_NAMED(GaussiansSort, TEXT("Gaussians: Radix Sort"));
 DECLARE_GPU_STAT_NAMED(GaussiansRaster, TEXT("Gaussians: Rasterization"));
 
@@ -37,11 +38,13 @@ static TAutoConsoleVariable<int32> CVarGaussiansMaxSplats(
 );
 
 // athenea: what a TX cloud draws in place of its body, to check a stage of it:
-// 0 the body; 1 the sky's mean radiance as projected (SkySH[0] C0).
+// 0 the body; 1 the sky's mean radiance as projected (SkySH[0] C0); 2-5 the
+// projected sky along the file's +y, -y, +z, -z; 6 which sharp-lobe inputs
+// are on; 7 the albedo as decoded; 100-115 a projected sky coefficient.
 static TAutoConsoleVariable<int32> CVarGaussiansAtheneaDebug(
 	TEXT("r.Gaussians.Athenea.Debug"),
 	0,
-	TEXT("A TX cloud draws: 0 its body; 1 the projected sky's mean radiance."),
+	TEXT("A TX cloud draws: 0 its body; 1 the projected sky's mean radiance; 7 its albedo as decoded."),
 	ECVF_RenderThreadSafe
 );
 
@@ -124,6 +127,8 @@ class FGSPrepassCS : public FGlobalShader
 		SHADER_PARAMETER(float, SkyMips)
 		SHADER_PARAMETER_RDG_TEXTURE(TextureCube, SkyResidual)
 		SHADER_PARAMETER(float, SkyResidualMips)
+		// athenea: a medium's light reaching each gaussian (GSVolumeShadow.usf)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float2>, VolumeShadow)
 
 		SHADER_PARAMETER_STRUCT_INCLUDE(FGaussiansHZBParameters, HZB)
 
@@ -162,6 +167,37 @@ class FGSPrepassCS : public FGlobalShader
 };
 
 IMPLEMENT_GLOBAL_SHADER(FGSPrepassCS, "/Plugin/StarLightGS/GSCompute.usf", "GSPrepass", SF_Compute);
+
+static TAutoConsoleVariable<int32> CVarGaussiansAtheneaMediumShadow(
+	TEXT("r.Gaussians.Athenea.MediumShadow"), 1,
+	TEXT("1: a medium of gaussians is shadowed by itself (a 64^3 grid each frame); 0: every gaussian sees all of each light."),
+	ECVF_RenderThreadSafe);
+
+// athenea: a medium's shadow on itself (GSVolumeShadow.usf): its extinction
+// into a grid, then the light reaching each gaussian through it.
+BEGIN_SHADER_PARAMETER_STRUCT(FGSVolumeShadowParameters, )
+	SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
+	SHADER_PARAMETER_STRUCT_REF(FGaussianSplatShaderResources, GSResource)
+	SHADER_PARAMETER_STRUCT_REF(FPrimitiveUniformShaderParameters, Primitive)
+	SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, Grid)
+	SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, GridIn)
+	SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float2>, OutShadow)
+END_SHADER_PARAMETER_STRUCT()
+
+class FGSVolumeDepositCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FGSVolumeDepositCS)
+	SHADER_USE_PARAMETER_STRUCT(FGSVolumeDepositCS, FGlobalShader);
+	using FParameters = FGSVolumeShadowParameters;
+};
+class FGSVolumeShadowCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FGSVolumeShadowCS)
+	SHADER_USE_PARAMETER_STRUCT(FGSVolumeShadowCS, FGlobalShader);
+	using FParameters = FGSVolumeShadowParameters;
+};
+IMPLEMENT_GLOBAL_SHADER(FGSVolumeDepositCS, "/Plugin/StarLightGS/GSVolumeShadow.usf", "GSVolumeDepositCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FGSVolumeShadowCS, "/Plugin/StarLightGS/GSVolumeShadow.usf", "GSVolumeShadowCS", SF_Compute);
 
 // athenea: the sky light projected onto a TX transfer's harmonics, in a
 // primitive's file frame (GSSkySH.usf).
@@ -438,7 +474,8 @@ void FGSViewExtension::GaussianSplattingPass(
 		constexpr uint32 ResidualSize = 256, ResidualMips = 9;
 		{
 		RDG_EVENT_SCOPE_STAT(GraphBuilder, GaussiansSky, "Gaussians: Sky");
-		if (Resource->HasTransfer() && SkyTexture)
+		// A medium of gaussians reads its mean and its sun as well.
+		if ((Resource->HasTransfer() || Resource->IsVolume()) && SkyTexture)
 		{
 			FGSSkySHCS::FParameters* SkyParameters = GraphBuilder.AllocParameters<FGSSkySHCS::FParameters>();
 			SkyParameters->View = InView.ViewUniformBuffer;
@@ -544,8 +581,63 @@ void FGSViewExtension::GaussianSplattingPass(
 		}
 		}
 
+		// athenea: a medium's shadow on itself, from UE's directional light and
+		// the sky above, a pair a gaussian; one pair for any other cloud.
+		FRDGBufferRef VolumeShadow = nullptr;
+		if (Resource->IsVolume() && CVarGaussiansAtheneaMediumShadow.GetValueOnRenderThread() == 0)
+		{
+			// Unshadowed: every gaussian sees all of each light (1.0f's bits).
+			VolumeShadow = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(FVector2f), FMath::Max(SplatCount, 1u)), TEXT("Gaussians.MediumShadowOff"));
+			AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(VolumeShadow), 0x3F800000u);
+		}
+		else if (Resource->IsVolume())
+		{
+			RDG_EVENT_SCOPE_STAT(GraphBuilder, GaussiansMediumShadow, "Gaussians: Medium shadow");
+			const uint32 Count = FMath::Max(SplatCount, 1u);
+			constexpr uint32 GridCells = 64u * 64u * 64u;
+			FRDGBufferRef Grid = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), GridCells), TEXT("Gaussians.MediumGrid"));
+			VolumeShadow = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(FVector2f), Count), TEXT("Gaussians.MediumShadow"));
+			AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(Grid), 0u);
+			auto Common = [&]()
+			{
+				FGSVolumeShadowParameters* P = GraphBuilder.AllocParameters<FGSVolumeShadowParameters>();
+				P->View = InView.ViewUniformBuffer;
+				P->GSResource = ResourceUniformBuffer;
+				P->Primitive = PrimitiveUniformBuffer;
+				return P;
+			};
+			// A one-element buffer, cleared, for the binding a pass does not use.
+			auto Dummy = [&](const TCHAR* Name)
+			{
+				FRDGBufferRef B = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), 1), Name);
+				AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(B), 0u);
+				return B;
+			};
+			const FIntVector Groups(FMath::DivideAndRoundUp(Count, 64u), 1, 1);
+			{
+				FGSVolumeShadowParameters* P = Common();
+				P->Grid = GraphBuilder.CreateUAV(Grid);
+				P->OutShadow = GraphBuilder.CreateUAV(VolumeShadow);
+				P->GridIn = GraphBuilder.CreateSRV(Dummy(TEXT("Gaussians.MediumGridDummy")));
+				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("GSMediumDeposit"), TShaderMapRef<FGSVolumeDepositCS>(ShaderMap), P, Groups);
+			}
+			{
+				FGSVolumeShadowParameters* P = Common();
+				P->Grid = GraphBuilder.CreateUAV(Dummy(TEXT("Gaussians.MediumGridDummyOut")));
+				P->GridIn = GraphBuilder.CreateSRV(Grid);
+				P->OutShadow = GraphBuilder.CreateUAV(VolumeShadow);
+				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("GSMediumShadow"), TShaderMapRef<FGSVolumeShadowCS>(ShaderMap), P, Groups);
+			}
+		}
+		else
+		{
+			VolumeShadow = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(FVector2f), 1), TEXT("Gaussians.MediumShadowNone"));
+			AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(VolumeShadow), 0u);
+		}
+
 		FGSPrepassCS::FParameters* PassParameters = GraphBuilder.AllocParameters<FGSPrepassCS::FParameters>();
 		PassParameters->SkySH = GraphBuilder.CreateSRV(SkySHBuffer);
+		PassParameters->VolumeShadow = GraphBuilder.CreateSRV(VolumeShadow);
 		PassParameters->AtheneaDebug = uint32(FMath::Max(0, CVarGaussiansAtheneaDebug.GetValueOnRenderThread()));
 		PassParameters->SkyCubemap = SkyTexture ? SkyTexture->TextureRHI : GBlackTextureCube->TextureRHI;
 		PassParameters->SkyCubemapSampler = TStaticSamplerState<SF_Trilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();

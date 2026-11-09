@@ -3,6 +3,7 @@
 #include "RenderGraphBuilder.h"
 #include "RenderGraphUtils.h"
 #include "ShaderParameterStruct.h"
+#include "GlobalShader.h"
 
 class FGSSetupIndirectArgsCS : public FGlobalShader
 {

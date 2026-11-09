@@ -40,6 +40,26 @@ BEGIN_UNIFORM_BUFFER_STRUCT(FGaussianSplatShaderResources, GAUSSIANSRENDERER_API
 	SHADER_PARAMETER_SRV(StructuredBuffer<float>, TransferCurvature)
 	SHADER_PARAMETER(float, FileUnitsToCm)
 	SHADER_PARAMETER(float, GlassIor)
+
+	// athenea: a .athc's levels of detail, cut every frame (GSplatCulling.usf).
+	SHADER_PARAMETER(uint32, LodLevels)
+	SHADER_PARAMETER(uint32, LodFinestLevel)
+	SHADER_PARAMETER(uint32, LodFinestBase)
+	SHADER_PARAMETER(float, LodExtent)
+	SHADER_PARAMETER(FVector3f, LodBoundsLo)
+	SHADER_PARAMETER(float, LodUnitsToCm)
+	SHADER_PARAMETER_SRV(StructuredBuffer<uint>, LodWords)
+
+	// athenea: a medium of gaussians (FGaussianSplatData::bVolume): sigma and
+	// temperature a gaussian, and the medium's constants (GSCompute.usf).
+	SHADER_PARAMETER(uint32, VolumeOn)
+	SHADER_PARAMETER(float, VolumeDensityScale)
+	SHADER_PARAMETER(float, VolumeEmissionScale)
+	SHADER_PARAMETER(float, VolumeTemperatureScale)
+	SHADER_PARAMETER(float, VolumeTemperatureOffset)
+	SHADER_PARAMETER(FVector3f, VolumeAlbedo)
+	SHADER_PARAMETER(FVector3f, VolumeEmission)
+	SHADER_PARAMETER_SRV(StructuredBuffer<float2>, Volume)
 END_UNIFORM_BUFFER_STRUCT()
 
 BEGIN_UNIFORM_BUFFER_STRUCT(FGaussianSplatPrimitiveShaderResources, GAUSSIANSRENDERER_API)
@@ -91,6 +111,8 @@ public:
 
 	// Gets splat count from CPU copy of splat data
 	uint32 GetSplatCount() const { return SplatData.SplatCount; }
+	uint32 GetLodLevels() const { return LodLevels; }
+	bool IsVolume() const { return bVolume; }
 	// Checks from CPU copy of splat data if this resource supports relighting
 	bool SupportsRelighting() const { return SplatData.SupportsRelighting(); }
 	// athenea: whether the colour is an albedo a transfer lights
@@ -140,4 +162,9 @@ private:
 	FBufferResources PackedField;
 	FBufferResources PackedCurvature;
 	FBufferResources CurvatureBuffer;
+	// athenea: a .athc's levels of detail, two words a gaussian.
+	FBufferResources LodWordsBuffer;
+	FBufferResources VolumeBuffer;
+	bool bVolume = false;
+	uint32 LodLevels = 0;
 };

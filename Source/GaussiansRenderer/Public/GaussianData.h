@@ -201,6 +201,60 @@ struct GAUSSIANSRENDERER_API FGaussianSplatData
 	UPROPERTY(EditAnywhere, Category = "Gaussians")
 	float GlassIor = 0.0f;
 
+	// athenea: a .athc's levels of detail (GSplatAthcImporter.cpp), cut every
+	// frame as athenea's CutSelector cuts them (GSplatCulling.usf). The merged
+	// levels' groups follow the splats in the arrays above; two words a
+	// gaussian: a splat's finest-level group and kLodLeaf, or a group's octree
+	// cell code and its level. The octree is the file's (its BoundsLo and
+	// Extent, in the file's units and axes); the finest level's groups start
+	// at LodFinestBase. LodLevels 0: no levels, every gaussian drawn.
+	UPROPERTY()
+	TArray<uint32> LodWords;
+	UPROPERTY(VisibleAnywhere, Category = "Gaussians")
+	uint32 LodLevels = 0;
+	UPROPERTY()
+	uint32 LodFinestLevel = 0;
+	UPROPERTY()
+	uint32 LodFinestBase = 0;
+	UPROPERTY()
+	FVector3f LodBoundsLo = FVector3f::ZeroVector;
+	UPROPERTY()
+	float LodExtent = 0.0f;
+	static constexpr uint32 kLodLeaf = 0x80000000u;
+	static constexpr uint32 kLodCoarsest = 0x40000000u;
+	// A paged tree's node (version 3): its first word is its parent's index
+	// (~0u at a root), and kLodLeaf marks a leaf.
+	static constexpr uint32 kLodTree = 0x20000000u;
+
+	// athenea: a MEDIUM OF GAUSSIANS (primvars:athenea:splat:volume, what
+	// athenea vdb2splat writes): each gaussian a lump of extinction, drawn
+	// with the alpha 1 - exp(-tau) of the optical depth of its pixel's ray
+	// (GSCompute.usf). Two values a gaussian: sigma, its peak extinction in the
+	// file's density units, and its temperature in the file's units; the
+	// colour's constant term holds its albedo. The medium's constants are the
+	// field's primvars, athenea's names and defaults.
+	UPROPERTY()
+	TArray<FVector2f> Volume;
+	UPROPERTY(VisibleAnywhere, Category = "Gaussians")
+	bool bVolume = false;
+	// Density to extinction a file unit of length.
+	UPROPERTY(EditAnywhere, Category = "Gaussians|Volume")
+	float VolumeDensityScale = 1.0f;
+	// The scattering albedo, times each gaussian's.
+	UPROPERTY(EditAnywhere, Category = "Gaussians|Volume")
+	FVector3f VolumeAlbedo = FVector3f(0.8f, 0.8f, 0.8f);
+	// Radiance of the absorbing part: the medium gives off (1 - albedo) times it.
+	UPROPERTY(EditAnywhere, Category = "Gaussians|Volume")
+	FVector3f VolumeEmission = FVector3f::ZeroVector;
+	// A gaussian glows as a black body at its temperature times this (0: no fire).
+	UPROPERTY(EditAnywhere, Category = "Gaussians|Volume")
+	float VolumeEmissionScale = 0.0f;
+	// Kelvin a unit of the file's temperature, and kelvin added to it.
+	UPROPERTY(EditAnywhere, Category = "Gaussians|Volume")
+	float VolumeTemperatureScale = 1.0f;
+	UPROPERTY(EditAnywhere, Category = "Gaussians|Volume")
+	float VolumeTemperatureOffset = 0.0f;
+
 	static constexpr uint32 SurfaceStride = 20;
 
 

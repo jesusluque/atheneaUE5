@@ -4,6 +4,15 @@
 #include "RenderGraphResources.h"
 
 #include "GSViewExtension.h"
+#include "GaussiansRenderer.h"
+#include "HAL/IConsoleManager.h"
+
+// The splats each frame sends to the rasteriser, in the log: what the levels of
+// detail are checked by (r.Gaussians.Athenea.LodPixels changes it).
+static TAutoConsoleVariable<int32> CVarAtheneaLogSplats(
+	TEXT("r.Gaussians.Athenea.LogSplats"), 0,
+	TEXT("1 logs the splats drawn in each frame whose count has come back from the GPU."),
+	ECVF_RenderThreadSafe);
 
 
 void FGSGPUStats::PollStats(FRHICommandListImmediate& RHICmdList)
@@ -28,6 +37,12 @@ void FGSGPUStats::PollStats(FRHICommandListImmediate& RHICmdList)
 
 		// Sample has been processed
 		StatsReadback.Pop();
+	}
+
+	if (CVarAtheneaLogSplats.GetValueOnRenderThread() != 0 && (StatValues[Stat_LitSplatsRendered] > 0 || StatValues[Stat_UnlitSplatsRendered] > 0))
+	{
+		UE_LOG(LogGaussiansRenderer, Display, TEXT("athenea: splats drawn %u lit, %u unlit"),
+			StatValues[Stat_LitSplatsRendered], StatValues[Stat_UnlitSplatsRendered]);
 	}
 
 	// Update stats

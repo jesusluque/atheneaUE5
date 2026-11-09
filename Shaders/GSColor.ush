@@ -512,6 +512,11 @@ float4 GSSplatColor(uint SplatIndex, float3 LocalView, bool bViewDependent)
 			// Whether the sharp lobes are made: (turn computed, curvature kept, residual sky).
 			return float4(GSSharpOn ? 1.0f : 0.0f, GSResources.HasCurvature != 0u ? 1.0f : 0.0f, SkyResidualMips > 0.0f ? 1.0f : 0.0f, ColorOpacity.a);
 		}
+		if (AtheneaDebug == 7u)
+		{
+			// The albedo the body is lit with, as decoded.
+			return float4(Albedo, ColorOpacity.a);
+		}
 		if (AtheneaDebug == 1u)
 		{
 			return float4(SkySH[0].rgb * 0.28209479177387814f, ColorOpacity.a);

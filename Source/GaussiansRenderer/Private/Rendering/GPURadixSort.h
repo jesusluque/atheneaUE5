@@ -2,6 +2,8 @@
 
 #include "RHIShaderPlatform.h"
 #include "RenderGraphFwd.h"
+#include "RHIFeatureLevel.h"
+#include "RHIFwd.h"
 
 
 namespace GPURadixSort

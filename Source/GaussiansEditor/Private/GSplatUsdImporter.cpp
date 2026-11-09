@@ -25,6 +25,8 @@
 #include "pxr/usd/usdGeom/tokens.h"
 #include "pxr/usd/usdGeom/xformable.h"
 #include "pxr/base/gf/matrix4d.h"
+#include "pxr/base/gf/half.h"
+#include "pxr/base/gf/vec3h.h"
 #include "pxr/usd/usdVol/particleField3DGaussianSplat.h"
 #include "USDIncludesEnd.h"
 #endif
@@ -318,6 +320,86 @@ bool GSplatImporter::ImportUsd(const FString& Filename, UGSplatImportData& Impor
 		{
 			const pxr::GfVec3f& N = Normals[i];
 			Splats.Normals[i] = SwizzleVector(N[0], N[1], N[2], Swizzle).GetSafeNormal();
+		}
+	}
+
+	// athenea: a medium of gaussians (athenea vdb2splat): its sigma and
+	// temperature a gaussian, its albedo as the colour's constant term, the
+	// medium's constants from the field's primvars. The file's opacities are
+	// not read (athenea reads none either).
+	{
+		bool bVolume = false;
+		const pxr::UsdAttribute SaidVolume = Field.GetPrim().GetAttribute(pxr::TfToken("primvars:athenea:splat:volume"));
+		bVolume = SaidVolume && SaidVolume.Get(&bVolume, At) && bVolume;
+		auto PerGaussian = [&](const char* Name, pxr::VtFloatArray& Out) {
+			const pxr::UsdGeomPrimvar P = Primvars.GetPrimvar(pxr::TfToken(Name));
+			pxr::VtHalfArray Half;
+			if (P && P.Get(&Out, At) && Out.size() == Count)
+			{
+				return true;
+			}
+			Out.clear();
+			if (P && P.Get(&Half, At) && Half.size() == Count)
+			{
+				Out.reserve(Count);
+				for (const pxr::GfHalf& H : Half)
+				{
+					Out.push_back(float(H));
+				}
+				return true;
+			}
+			return false;
+		};
+		auto Constant = [&](const char* Name, float Default) {
+			const pxr::UsdGeomPrimvar P = Primvars.GetPrimvar(pxr::TfToken(Name));
+			float Value = Default;
+			return P && P.Get(&Value, At) ? Value : Default;
+		};
+		auto Colour = [&](const char* Name, const FVector3f& Default) {
+			const pxr::UsdGeomPrimvar P = Primvars.GetPrimvar(pxr::TfToken(Name));
+			pxr::GfVec3f Value;
+			return P && P.Get(&Value, At) ? FVector3f(Value[0], Value[1], Value[2]) : Default;
+		};
+		pxr::VtFloatArray Sigma, Temperature;
+		if (bVolume && PerGaussian("athenea:volume:sigma", Sigma))
+		{
+			PerGaussian("athenea:volume:temperature", Temperature);
+			pxr::VtVec3fArray Albedo;
+			{
+				const pxr::UsdGeomPrimvar P = Primvars.GetPrimvar(pxr::TfToken("athenea:volume:albedo"));
+				pxr::VtVec3hArray Half;
+				if (!(P && P.Get(&Albedo, At) && Albedo.size() == Count))
+				{
+					Albedo.clear();
+					if (P && P.Get(&Half, At) && Half.size() == Count)
+					{
+						for (const pxr::GfVec3h& H : Half)
+						{
+							Albedo.push_back(pxr::GfVec3f(H));
+						}
+					}
+				}
+			}
+			Splats.bVolume = true;
+			Splats.Volume.SetNumUninitialized(int32(Count));
+			for (size_t i = 0; i < Count; i++)
+			{
+				Splats.Volume[int32(i)] = FVector2f(Sigma[i], Temperature.empty() ? 0.0f : Temperature[i]);
+				const pxr::GfVec3f A = Albedo.empty() ? pxr::GfVec3f(1, 1, 1) : Albedo[i];
+				Splats.ZeroOrderHarmonicsCoefficientsAndOpacities[int32(i)] = FVector4f(A[0], A[1], A[2], 1.0f);
+			}
+			Splats.bHasHighOrderSH = false;
+			ImportData.bApplyGammaCorrection = false;
+			Splats.FileUnitsToCm = ImportData.ScaleFactor;
+			Splats.VolumeDensityScale = Constant("athenea:densityScale", 1.0f);
+			Splats.VolumeAlbedo = Colour("athenea:albedo", FVector3f(0.8f, 0.8f, 0.8f));
+			Splats.VolumeEmission = Colour("athenea:volume:emission", FVector3f::ZeroVector);
+			Splats.VolumeEmissionScale = Constant("athenea:volume:emissionScale", 0.0f);
+			Splats.VolumeTemperatureScale = Constant("athenea:volume:temperatureScale", 1.0f);
+			Splats.VolumeTemperatureOffset = Constant("athenea:volume:temperatureOffset", 0.0f);
+			UE_LOG(LogGSplatEditor, Display, TEXT("%s: a medium of %llu gaussians (density scale %g, emission scale %g, temperature x%g + %g K)."),
+				*Filename, uint64(Count), Splats.VolumeDensityScale, Splats.VolumeEmissionScale,
+				Splats.VolumeTemperatureScale, Splats.VolumeTemperatureOffset);
 		}
 	}
 

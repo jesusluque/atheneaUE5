@@ -1,6 +1,10 @@
 #pragma once
 
 #include "ShaderParameterMacros.h"
+#include "RenderGraphFwd.h"
+#include "RenderGraphResources.h"
+
+class FSceneView;
 
 
 BEGIN_SHADER_PARAMETER_STRUCT(FGSplatGBufferParameters, )

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "RenderGraphFwd.h"
+#include "RHIFwd.h"
 
 
 namespace Gaussians

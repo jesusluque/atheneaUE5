@@ -43,6 +43,12 @@ paquete:
 
 ## 3. Instalación en un proyecto
 
+Una release en GitHub (github.com/jesusluque/atheneaUE5/releases) lleva el
+paquete compilado para Windows (`atheneaUE5-<versión>-UE5.8-Win64.zip`, UE
+5.8, Win64), una versión por etiqueta `v<versión>`. Descomprimido, es la
+carpeta del paquete; está compilado solo para Windows, y otra plataforma lo
+compila desde el código como en la sección 2.
+
 1. Copiar la carpeta del paquete a `<Project>/Plugins/StarLightGS`.
 2. Activar el plugin en el proyecto (`"Plugins": [{ "Name": "StarLightGS", "Enabled": true }]`).
 3. Restringir los formatos de shader del proyecto a SM6 en `Config/DefaultEngine.ini`:
@@ -132,6 +138,15 @@ Lo que se lee, del primer `ParticleField3DGaussianSplat` del stage:
 | `primvars:athenea:splat:transferReflected` | el campo reflejado, 48 valores por gaussiana, junto a la mitad indirecta |
 | `primvars:athenea:splat:curvature` | con una transferencia: el operador de forma, 3 valores por gaussiana (`elementSize` 3: uu, uv, vv en los dos primeros ejes de la gaussiana, uno sobre las unidades del stage); con lo que los lóbulos nítidos giran a lo largo de un splat (§6.1) |
 | `primvars:athenea:splat:transmission`, `:thinWalled`, `:ior` (constante) | con una transferencia: lo que del cuerpo pasa, si es de una pared fina, y el índice de la nube; por encima de 1, sus gaussianas que transmiten son un vidrio sólido que dibuja la lente (§6.1) |
+| `primvars:athenea:splat:volume` | true: las gaussianas son un medio (lo que escribe `athenea vdb2splat`), dibujado como dice §6; no se leen las `opacities` del fichero |
+| `primvars:athenea:volume:sigma` | half o float por gaussiana: su extinción de pico, en las unidades de densidad del medio |
+| `primvars:athenea:volume:temperature` | half o float por gaussiana: su temperatura, en las unidades del fichero (sin ella: 0) |
+| `primvars:athenea:volume:albedo` | color3 por gaussiana, por el del medio (sin él: blanco) |
+| `primvars:athenea:densityScale` (constante) | densidad a extinción por unidad de longitud del stage (por defecto 1) |
+| `primvars:athenea:albedo` (constante) | el albedo de scattering del medio (por defecto gris 0,8) |
+| `primvars:athenea:volume:emission` (constante) | radiancia de la parte que absorbe, por 1 − albedo (por defecto ninguna) |
+| `primvars:athenea:volume:emissionScale` (constante) | una gaussiana brilla como un cuerpo negro a su temperatura por esto (por defecto 0: sin fuego) |
+| `primvars:athenea:volume:temperatureScale`, `:temperatureOffset` (constantes) | kelvin por unidad de la temperatura del fichero, y kelvin sumados (por defecto 1 y 0) |
 | `upAxis` del stage | `Y` → (X, Z, Y); `Z` → (X, −Y, Z) |
 | `metersPerUnit` del stage | posiciones multiplicadas por él y por 100 |
 
@@ -142,6 +157,11 @@ Los valores se leen en la primera muestra de tiempo, así que una nube cuyos
 arrays están animados importa su primer frame. La transformación propia del
 prim no se aplica; el importador avisa cuando no es la identidad, y en su
 lugar se coloca el actor.
+
+Las constantes de un medio se leen de los primvars del field, como las lee
+athenea; un stage que referencia un frame de `vdb2splat` y las fija encima
+(como hacen los stages de look de athenea) se importa con ellas. También son
+ajustes del asset (*Gaussians | Volume*), que se pueden cambiar tras importar.
 
 ### 4.4 Ficheros `.athc`
 
@@ -192,10 +212,63 @@ describen donde la v2 los coloca. Sus palabras de armónicos pueden ser una en
 grado 0 (el escritor de la web guarda una palabra ficticia, como permite el
 layout de athenea).
 
-Todavía no se lee: los niveles fusionados (los niveles de detalle del
-fichero), la radiancia emitida (bit 2), las normales de una nube sin
-transferencia, ni la curvatura y los tamaños de LoD (bit 6). La nube dibuja su
-nivel más fino, completo.
+Todavía no se lee: la radiancia emitida (bit 2), las normales de una nube sin
+transferencia, ni la curvatura y los tamaños de LoD (bit 6).
+
+**Niveles de detalle** (versiones 1 y 2, las de athenea). Los niveles
+fusionados se leen con los splats: los grupos de cada nivel siguen a los
+splats en el asset, decodificados en la GPU como ellos, con dos palabras cada
+uno (el código de celda del octree y el nivel de un grupo; el grupo del nivel
+más fino de un splat). En cada frame el pase de culling los corta como athenea
+(`lod_cut.slang`): un grupo fusionado se dibuja donde su celda abarca como
+mucho `r.Gaussians.Athenea.LodPixels` píxeles en su punto más cercano al ojo y
+la de su padre abarca más (el nivel más grueso que guarda el fichero no tiene
+padre al que ceder); un splat se dibuja donde la celda de su grupo del nivel
+más fino abarca más. Las celdas son el octree del fichero (su `boundsLo` y su
+`extent`), con el ojo llevado a los ejes y unidades del fichero. Una nube con
+niveles se recorta en cada frame, tenga o no volúmenes de recorte.
+
+| Variable de consola | Por defecto | Qué hace |
+|---|---|---|
+| `r.Gaussians.Athenea.LodPixels` | `1` | los píxeles que puede abarcar una celda fusionada antes de que se dibujen sus hijos en su lugar; `0` dibuja todos los splats y ningún grupo fusionado, como antes de leer los niveles |
+| `r.Gaussians.Athenea.LogSplats` | `0` | `1` escribe en el log los splats que cada frame manda al rasterizador (`athenea: splats drawn N lit, M unlit`), con un frame o dos de retraso: con lo que se comprueba el corte |
+
+Un grupo fusionado se dibuja con el kernel que le da athenea: una opacidad D
+mayor que 1 es el kernel más duro de Spark, 1 − (1 − g)^A con
+A = exp((D² − 1)/e), una meseta que pasa de tres desviaciones, y su quad se
+ensancha 0,7 (D − 1) desviaciones; una gaussiana con una escala cero (un
+disco plano) devuelve el tercio de píxel de dilatación como lo hace el
+`surfelPaid` de athenea, su opacidad por el área de su disco sobre el área
+dibujada, de modo que una vista de canto no se dibuja.
+
+El árbol paginado de un fichero versión 3 (las páginas del `.athz` de una
+escena web) se corta cada frame como lo corta el `lod_tree_cut.slang` de
+athenea: el padre de cada nodo se nombra al importar a partir de las palabras
+`TREE` de su padre (la página de los hijos, el sitio del primero en ella y
+cuántos son; los dos arrays de una página salen de una tira de filas
+enteras); un nodo pasa si es una hoja o si el doble de su desviación mayor
+sobre su distancia abarca como mucho `LodPixels` píxeles, y se dibuja si pasa
+y su padre no. En la primera de las nubes del cuerpo de la escena web del
+peón (1.782.669 gaussianas, 891.383 de ellas hojas) a 1 px: las hojas a la
+distancia de encuadre, 279.890 a cuatro veces ella y 10.394 a dieciséis (86
+veces menos), RMS de imagen frente al corte apagado 0,013 y 0,011; la escena
+entera (sus tres nubes) dibuja 2.095.435 de cerca y 16.142 a dieciséis
+veces.
+
+El objeto de una escena web puede venir partido en varios `.athc` que se
+completan entre sí (el cuerpo del peón son dos); cada uno es un asset propio,
+con el nombre del primero, y se colocan todos juntos. Una importación desde
+un script guarda solo el asset que devuelve la tarea de importación: los
+demás se guardan con *Save All* del editor (o con
+`EditorLoadingAndSavingUtils.save_dirty_packages`), o vuelven vacíos en la
+siguiente sesión.
+
+Lo que falta de los niveles: el streaming (todos los chunks están en el asset;
+no se carga nada según lo pida el corte), separar vidrio y láminas (athenea
+nunca dibuja fusionados sus grupos; aquí sí), los niveles fusionados de un
+fichero versión 3 (bloques de tipo 0, frente a un árbol paginado) y las
+guardas del árbol paginado (la fracción relajada de athenea para una fusión
+que cruza un borde de color).
 
 ### 4.5 Ficheros `.splat`, `.spz`, `.sog` y glTF
 
@@ -267,23 +340,31 @@ la palabra anterior). Se lee:
 - la cabecera, la tabla de assets (la disposición de la nube, los niveles, la
   codificación de los planos de los dos tipos, las frecuencias de rANS) y la
   tabla de páginas, en la CPU; los bytes codificados de las páginas de las
-  capas G y A, y T donde la transferencia es sin pérdida, se guardan tal como
-  están;
+  capas G, A y T se guardan tal como están, y la base de una transferencia
+  CPCA (f32, tal como la guarda el fichero);
 - en el dispositivo cuando se crea el recurso: las tablas expandidas, cada
   nivel fusionado decodificado empezando por el más grueso (una palabra puede
   estar codificada respecto a su grupo padre), y luego los splats, en arrays
   dispuestos como un chunk de `.athc`, que los decodificadores de la versión 3
-  dibujan y reiluminan (§4.4).
+  dibujan y reiluminan (§4.4). Una capa T CPCA se decodifica como cuatro
+  palabras por splat -- el id del cluster y 24 pesos de 4 bits, ocho por cada
+  bloque de la transferencia (directa 16, indirecta 48, campo 48) -- y una
+  pasada propia las convierte en los 112 valores: la media del cluster más sus
+  ejes por los pesos, el paso de cada peso la escala de su eje entre los
+  niveles (`athzCpcaUnpack` de athenea). La curvatura (tres floats por splat,
+  en la capa G) se lee con la transferencia, así que un cristal macizo se
+  dibuja como lente (§4.4).
 
 Antes de decodificar nada se comprueban el CRC-32 de la cabecera (sobre sus
 primeros 60 bytes) y el de cada página (sobre los bytes de sus capas, en el
 orden de las capas): un fichero corrupto o cortado se rechaza, nombrando la
 página (`page N is corrupt`).
 
-No se lee: una capa T CPCA (su id de cluster y sus pesos: la nube se dibuja sin
-iluminar), la capa K (el rig de una nube con skinning), la curvatura, y un
-fichero que es un prefijo de sus bandas (se
-rechaza: no están todos sus splats).
+No se lee: la capa K (el rig de una nube con skinning), y un fichero que es
+un prefijo de sus bandas (se rechaza: no están todos sus splats). Una
+transferencia CPCA cuya base no cuadra con la tabla del asset (256 clusters o
+menos, 8 ejes por bloque, 112 valores, los bytes en el fichero) se rechaza
+(`a CPCA transfer whose basis does not add up`).
 
 ### 4.5.2 El `.athz` de una escena web
 
@@ -390,6 +471,45 @@ Se muestran en el asset bajo **Gaussians**:
   nítidos y el vidrio se dibujan como dice el §6.1.
 - **Iluminado** (el de upstream): el base colour como albedo, escrito en el
   GBuffer de UE donde la cobertura supera 0,3. No usa los armónicos.
+- **Medio** (`primvars:athenea:splat:volume`): el alfa de cada gaussiana en un
+  píxel es 1 − exp(−τ g), τ = densityScale · σ · √(2π) / √(rᵀ Σ⁻¹ r) su
+  profundidad óptica a lo largo del rayo r por su centro (en las unidades del
+  stage) y g la gaussiana en imagen, cortada a 3,5 desviaciones; su color es
+  `albedo · dispersada + (1 − albedo) · brillo`, siendo la luz dispersada el
+  la luz direccional del nivel, la media proyectada de su sky light y el sol
+  del cielo, cada una con fase isótropa y a través de la sombra del medio
+  sobre sí mismo, y el brillo la emisión del medio más `emissionScale` por el
+  cuerpo negro de athenea a `temperatureOffset + temperatureScale · T` (la
+  ley de Planck contra las funciones CIE 1931, a luminancia
+  σ_SB T⁴ / π · 10⁻⁶). La sombra se calcula cada frame en la GPU
+  (`GSVolumeShadow.usf`): la extinción de cada gaussiana, hasta tres
+  desviaciones, va a una rejilla de 64³ sobre los límites del primitivo, y
+  desde cada centro se avanza la profundidad óptica hacia la luz direccional
+  y hacia cinco direcciones del cielo de arriba (el cenit y cuatro a 45°); el
+  scattering múltiple son las cuatro octavas de athenea (Wrenninge: energía y
+  extinción a la mitad en cada una). Se dibuja en la ruta sin iluminar,
+  ordenado con el resto de splats. Lo que falta: la sombra del medio sobre
+  otras nubes y la suya sobre él, las luces puntuales, spot y rect, y una
+  fase anisótropa. `r.Gaussians.Athenea.MediumShadow 0` deja fuera la sombra
+  (cada gaussiana ve toda la luz de cada fuente). Medido con `ue_time.sh` en
+  la explosión en el aire de EmberGen reproduciéndose a 24 fps (20.000
+  gaussianas por frame, 1280 × 720, medianas de 300 frames): la sombra lleva
+  0,94 ms por frame (`GPU/GaussiansMediumShadow`), el raster 4,3 ms; el frame
+  entero de GPU 11,2 ms con la sombra y 11,9 ms sin ella, lo mismo dentro de
+  la dispersión entre ejecuciones.
+
+### 6.0 Secuencias
+
+Un componente reproduce una lista de assets como secuencia (*Gaussian Splats |
+Sequence*): `SequenceFrames`, un asset por frame (los frames de un medio de
+`athenea vdb2splat`, o cualquier nube); `SequenceFramesPerSecond` (por
+defecto 24); `bSequenceLoop` (por defecto activo; si no, se queda en el último
+frame); `bSequencePlaying` y `SequenceTime` (segundos), que también se
+reproducen en los viewports del editor. `SetSequenceTime` muestra el frame de
+un instante, desde Blueprints o Python. Cada frame es su propio asset en la
+GPU; el componente cambia cuál dibuja. `Tools/athenea/setup_sequence.py`
+importa una carpeta de frames en uno, y `capture_sequence.py` renderiza
+frames suyos (§7.1).
 
 ### 6.1 El cielo que ilumina una nube TX
 
@@ -446,7 +566,7 @@ Se muestran en el asset bajo **Gaussians**:
 
 | Variable de consola | Valor | Efecto |
 |---|---|---|
-| `r.Gaussians.Athenea.Debug` | `0` | una nube TX dibuja su cuerpo |
+| `r.Gaussians.Athenea.Debug` | `0` | qué dibuja una nube TX: `0` su cuerpo; `1` la radiancia media del cielo proyectado; `2`-`5` el cielo proyectado a lo largo de +y, -y, +z, -z del fichero; `6` qué entradas de los lóbulos nítidos están activas; `7` su albedo tal como se decodifica; `100`-`115` un coeficiente del cielo proyectado, más 4 |
 | | `1` | la radiancia media del cielo proyectado (`SkySH[0] · C0`) |
 | | `2` a `5` | el cielo proyectado reconstruido a lo largo de +y, −y, +z, −z del fichero |
 | | `6` | si se hacen los lóbulos nítidos de un splat: en rojo el giro calculado, en verde la curvatura conservada, en azul el cielo residual |
@@ -513,6 +633,38 @@ UnrealEditor.exe <Project>.uproject /Game/Level -game -RenderOffscreen -ResX=128
   termina desde fuera una vez escrito el CSV.
 - La GPU debe estar libre: en una máquina compartida, comprobar `nvidia-smi`
   (y WSL, cuyos procesos no lista) antes de medir.
+
+### 7.3 Movie Render Queue
+
+Una cámara de Sequencer renderiza un actor de splats con Movie Render Queue
+(el plugin `MovieRenderPipeline`, activado en el proyecto), y desde la línea
+de comandos sin ventana:
+
+```bat
+UnrealEditor-Cmd.exe <Proyecto>.uproject /Game/Nivel -game -LevelSequence=/Game/Mrq/Seq ^
+  -MoviePipelineConfig=/Game/Mrq/Cfg -RenderOffscreen -Unattended -NoTextureStreaming -NoSplash -log
+```
+
+`setup_mrq.py NIVEL NOMBRE [FRAMES] [WARMUP] [MUESTRAS] [AA]` crea los dos
+assets para un nivel con un actor de splats: una secuencia cuya cámara de cine
+da una vuelta alrededor de la nube, y una configuración que escribe PNG en
+`shots/mrq_<NOMBRE>`.
+
+Un splat no escribe velocidades, así que el antialiasing temporal del motor y
+el motion blur lo emborronan cuando la cámara se mueve: con la configuración
+por defecto (TAA, una muestra temporal), una cámara que gira 15 grados por
+frame dibujó la rejilla de la Corvette como estelas horizontales. Por
+separado (`setup_mrq.py ... taa-noblur` y `none-blur`), el TAA solo dibuja un
+splat en movimiento dos veces, la copia del historial junto a la del frame, y
+el motion blur solo lo estira: las velocidades que escriben los splats todavía
+no son las que esperan ninguno de los dos. Hay que
+forzar el antialiasing a *None*, tomar muestras espaciales en su lugar
+(`spatial_sample_count`, 4 aquí) y poner `r.MotionBlurQuality 0` en las
+variables de consola de la configuración (`setup_mrq.py ... none`): los
+mismos frames salen nítidos. Hay que mantener frames de calentamiento (8 aquí)
+para que el cielo con el que se ilumina una nube TX esté proyectado antes de
+escribir el primer frame, y fijar la exposición como en 7.1, porque las dos
+configuraciones expusieron el mismo frame de forma distinta.
 
 ## 8. Unreal MCP (opcional)
 

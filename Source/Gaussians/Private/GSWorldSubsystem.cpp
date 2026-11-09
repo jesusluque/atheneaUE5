@@ -7,6 +7,8 @@
 #include "GaussianSplatSceneProxy.h"
 
 #include "AssetRegistry/AssetRegistryModule.h"
+#include "Misc/PackageName.h"
+#include "UObject/Package.h"
 
 
 void UGSWorldSubsystem::Initialize(FSubsystemCollectionBase& Collection)

@@ -16,6 +16,11 @@ UGaussianSplatComponent::UGaussianSplatComponent()
 
 	ClippingTags.AddTag(UGameplayTagsManager::Get().RequestGameplayTag("StarLightGS.ClippingVolumes.Default", false));
 
+	// A sequence plays in the editor's viewports as in the game.
+	PrimaryComponentTick.bCanEverTick = true;
+	PrimaryComponentTick.bStartWithTickEnabled = true;
+	bTickInEditor = true;
+
 #if WITH_EDITORONLY_DATA
 	bVisualizeComponent = true;
 
@@ -160,4 +165,53 @@ AGaussianSplatActor::AGaussianSplatActor(const FObjectInitializer& Initializer)
 {
 	GaussianSplatComponent = CreateDefaultSubobject<UGaussianSplatComponent>(TEXT("GaussianSplatComponent"));
 	RootComponent = GaussianSplatComponent;
+}
+
+void UGaussianSplatComponent::SetGaussianSplatAsset(UGSplatAsset* Asset)
+{
+	if (Asset == GaussianSplatAsset)
+	{
+		return;
+	}
+	if (auto Prev = PrevGaussianSplatAsset.Pin())
+	{
+		Prev->OnAssetUpdate.RemoveDynamic(this, &UGaussianSplatComponent::OnAssetUpdated);
+	}
+	GaussianSplatAsset = Asset;
+	PrevGaussianSplatAsset = GaussianSplatAsset;
+	if (GaussianSplatAsset)
+	{
+		GaussianSplatAsset->OnAssetUpdate.AddDynamic(this, &UGaussianSplatComponent::OnAssetUpdated);
+	}
+	UpdateBounds();
+	MarkRenderStateDirty();
+}
+
+void UGaussianSplatComponent::SetSequenceTime(float Seconds)
+{
+	SequenceTime = Seconds;
+	const int32 Count = SequenceFrames.Num();
+	if (Count == 0)
+	{
+		return;
+	}
+	int32 Frame = FMath::FloorToInt32(SequenceTime * FMath::Max(SequenceFramesPerSecond, 0.01f));
+	Frame = bSequenceLoop ? ((Frame % Count) + Count) % Count : FMath::Clamp(Frame, 0, Count - 1);
+	if (Frame != SequenceShown || SequenceFrames[Frame] != GaussianSplatAsset)
+	{
+		SequenceShown = Frame;
+		if (SequenceFrames[Frame])
+		{
+			SetGaussianSplatAsset(SequenceFrames[Frame]);
+		}
+	}
+}
+
+void UGaussianSplatComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
+{
+	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
+	if (SequenceFrames.Num() > 0)
+	{
+		SetSequenceTime(bSequencePlaying ? SequenceTime + DeltaTime : SequenceTime);
+	}
 }

@@ -2,6 +2,7 @@
 
 #include "RenderGraphBuilder.h"
 #include "RenderGraphUtils.h"
+#include "HAL/IConsoleManager.h"
 #include "RendererInterface.h"
 #include "RendererClasses.h"
 #include "ScreenPass.h"
@@ -27,6 +28,9 @@ class FGSplatCullingCS : public FGlobalShader
 		SHADER_PARAMETER_STRUCT_REF(FPrimitiveUniformShaderParameters, Primitive)
 
 		SHADER_PARAMETER(float, SplatScaleMultiplier)
+		SHADER_PARAMETER(FVector3f, LodEyeLocal)
+		SHADER_PARAMETER(float, LodPixelsPerUnit)
+		SHADER_PARAMETER(float, LodThreshold)
 
 		SHADER_PARAMETER(int32, NumClippingVolumes)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FGaussians_ClippingVolume>, ClippingVolumes)
@@ -44,6 +48,13 @@ class FGSplatCullingCS : public FGlobalShader
 
 	static uint32 GetThreadGroupSize1D() { return 128; }
 };
+
+// athenea: the pixels a merged cell may span before its children are drawn in
+// its place (athenea's lod threshold, 1 by default); 0 draws every splat.
+static TAutoConsoleVariable<float> CVarAtheneaLodPixels(
+	TEXT("r.Gaussians.Athenea.LodPixels"), 1.0f,
+	TEXT("athenea levels of detail: the pixels a merged cell may span before its children are drawn in its place (0: every splat)."),
+	ECVF_RenderThreadSafe);
 
 IMPLEMENT_GLOBAL_SHADER(FGSplatCullingCS, "/Plugin/StarLightGS/GSplatCulling.usf", "GSplatCullingCS", SF_Compute);
 
@@ -158,6 +169,12 @@ void FGSViewExtension::GSCullingPass(
 			PassParameters->Primitive = PrimitiveUniformBuffer;
 
 			PassParameters->SplatScaleMultiplier = Proxy->GetScaleMultiplier();
+			// athenea's cut: the eye in the primitive's local space, and the
+			// pixels a unit at unit distance spans (half the view's height times
+			// the projection's y scale).
+			PassParameters->LodEyeLocal = FVector3f(Proxy->GetSplatLocalToWorld().InverseTransformPosition(ViewInfo.ViewMatrices.GetViewOrigin()));
+			PassParameters->LodPixelsPerUnit = 0.5f * float(ViewInfo.ViewRect.Height()) * float(ViewInfo.ViewMatrices.GetProjectionMatrix().M[1][1]);
+			PassParameters->LodThreshold = FMath::Max(CVarAtheneaLodPixels.GetValueOnRenderThread(), 0.0f);
 
 			PassParameters->NumClippingVolumes = NumCullingVolumes;
 			PassParameters->ClippingVolumes = GraphBuilder.CreateSRV(CullingVolumesBuffer);

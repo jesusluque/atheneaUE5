@@ -543,7 +543,7 @@ are decoded only as the splats' parents.
   curvature, the occlusion codebook, a zonal transfer, the skin and the
   compact tier; a paged tree's merges are decoded and hidden, not left out.
 - **Other formats.** `.athv` (HEVC video), `.athl` (the web's light layers),
-  an `.athz`'s CPCA transfer and its curvature;
+  an `.athz`'s layer K;
   an SPZ's coordinate-system extension; a glTF node's transform, more than one
   gaussian primitive, sparse accessors and `EXT_meshopt_compression`.
 - **The ParticleField's transform** (a rotation would have to turn the
@@ -554,3 +554,25 @@ are decoded only as the splats' parents.
   64 workgroups and 32 bits.
 - **f16 storage** for the PLY and USD paths, and their conversion on the GPU.
 - **Automated tests** in the plugin.
+
+## The package BuildPlugin makes (8 Nov)
+
+`RunUAT BuildPlugin` compiles the plugin without a unity build, each file
+alone, where a project's build had merged them. `GSplatImporter.h` named
+`class UGSplatAsset&` inside `namespace GSplatImporter`, which declares a new,
+empty `GSplatImporter::UGSplatAsset`; merged, a file that had seen the real
+class came first, and alone `GSplatSceneImporter.cpp` failed (C2664, C2027).
+The header now declares `UGSplatAsset` at global scope before the namespace.
+
+Past that, the build stopped on files that used types they never included,
+which the project's shared precompiled header had brought in: the RHI's
+(`RHIFwd.h`, `RHIResources.h`, `RHIFeatureLevel.h`), the render graph's
+(`RenderGraphFwd.h`, `RenderGraphResources.h`), `FGlobalShader`
+(`GlobalShader.h`, `ShaderParameterStruct.h`), `TAutoConsoleVariable`
+(`HAL/IConsoleManager.h`), `FPaths` and the shader directory mappings
+(`Misc/Paths.h`, `ShaderCore.h`), `TQueue` (`Containers/Queue.h`),
+`FPackageName` and `UPackage` (`Misc/PackageName.h`, `UObject/Package.h`), and
+`FSceneView`, declared where only a reference is named. In
+`GaussianSplatInterface.h` the RHI types were the cause of the proxy's
+`override` errors: undeclared, the interface's three index count methods were
+dropped. Each file now includes what it uses, and the package builds.

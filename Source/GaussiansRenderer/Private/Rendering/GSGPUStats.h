@@ -1,5 +1,11 @@
 #pragma once
 
+#include "CoreMinimal.h"
+#include "RHIFwd.h"
+#include "RenderGraphFwd.h"
+#include "RHIResources.h"
+#include "Containers/Queue.h"
+
 
 class FGSGPUStats
 {

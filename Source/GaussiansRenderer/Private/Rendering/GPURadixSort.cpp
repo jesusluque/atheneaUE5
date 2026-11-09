@@ -1,6 +1,7 @@
 #include "GPURadixSort.h"
 
 #include "ShaderParameterStruct.h"
+#include "GlobalShader.h"
 #include "RenderGraph.h"
 #include "ShaderCompilerCore.h"
 

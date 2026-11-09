@@ -1,6 +1,7 @@
 #pragma once
 
 class UGSplatImportData;
+class UGSplatAsset;
 struct FGaussianSplatData;
 
 
@@ -40,7 +41,7 @@ namespace GSplatImporter
 	// .athc, its sky) or athenea's paged cloud ('ATHZ'); GSplatSceneImporter.cpp.
 	bool IsAthzFile(const FString& Filename);
 	bool IsAthzScene(const FString& Filename);
-	bool ImportAthzScene(const FString& Filename, UObject* InParent, FName InName, EObjectFlags Flags, class UGSplatAsset& First);
+	bool ImportAthzScene(const FString& Filename, UObject* InParent, FName InName, EObjectFlags Flags, UGSplatAsset& First);
 	bool ImportAthzCloud(const FString& Filename, UGSplatImportData& ImportData, FGaussianSplatData& Splats);
 
 	// athenea: glTF with KHR_gaussian_splatting, .glb or .gltf (GSplatGltfImporter.cpp).
