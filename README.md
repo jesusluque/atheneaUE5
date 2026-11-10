@@ -33,7 +33,9 @@ Documentation, in English and Spanish, is in [`Docs/athenea`](Docs/athenea):
 (requirements, building, importing, rendering and timing without a window),
 [development](Docs/athenea/development.md) and
 [decisions](Docs/athenea/decisions.md) (every change against upstream, why,
-and what was measured). Test scripts are in [`Tools/athenea`](Tools/athenea).
+and what was measured). A [tutorial](Docs/athenea/tutorial-large-scene.md)
+takes a town of 106 million gaussians from the capture to a level that flies
+in real time. Test scripts are in [`Tools/athenea`](Tools/athenea).
 
 Requirements: UE 5.8.4, Win64, DirectX 12 with shader model 6 only (see
 operations §3). Licence: MIT, upstream's and this fork's alike (`LICENSE`
