@@ -13,9 +13,9 @@
 </p>
 
 <p align="center">
-  <a href="Docs/athenea/media/atheneaUE5-1.2.mp4"><img src="Docs/athenea/images/atheneaUE5.gif" alt="atheneaUE5 1.2: a town of 106 million gaussians in real time, levels of detail, relightable clouds, fire and smoke" width="432"></a>
+  <a href="Docs/athenea/media/town_flight.mp4"><img src="Docs/athenea/images/town_flight.gif" alt="A flight over a town of 106 million gaussians in Unreal Engine, with its frame rate" width="92%"></a>
 </p>
-<p align="center"><i>A drone capture of a town, 106 million gaussians, at 63 to 147 frames a second at 1080p on an RTX 3070 Laptop, and what else the plugin draws. Click for <a href="Docs/athenea/media/atheneaUE5-1.2.mp4">the video</a>.</i></p>
+<p align="center"><i>A drone capture of a town, 106 million gaussians, flown in Unreal Engine at 1080p on an RTX 3070 Laptop, with the frame rate measured live (shown here twice as fast). Click for <a href="Docs/athenea/media/town_flight.mp4">the video</a>.</i></p>
 
 ## Where it comes from
 
