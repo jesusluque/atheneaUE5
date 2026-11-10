@@ -20,6 +20,36 @@ Spanish: [tutorial-large-scene.es.md](tutorial-large-scene.es.md).
 
 ## 2. From the capture to `.athc` files (athenea)
 
+The plugin reads many gaussian formats (section 11), and a small capture can
+be dropped on the editor as it comes. A capture of this size has to be a
+`.athc`: it is the format that carries levels of detail and stays packed on
+the GPU.
+
+### 2.1 Getting athenea
+
+[athenea](https://github.com/jesusluque/athenea) is the renderer the plugin
+follows; its command line does the conversion. Its
+[releases](https://github.com/jesusluque/athenea/releases) carry it built for
+Windows (`athenea-<version>-windows-x64-setup.exe` or `.zip`), macOS and
+Linux. The conversion runs on the GPU (Metal, Direct3D 12, Vulkan or CUDA).
+
+### 2.2 What converts
+
+`athenea convert INPUT OUTPUT.athc` takes a 3DGS `.ply`, a `.splat`, a
+`.spz`, a `.sog` (or an unbundled SOG's `meta.json`), an `.asg`, or a USD
+stage with a `ParticleField3DGaussianSplat`
+([athenea's manual, `athenea convert`](https://github.com/jesusluque/athenea/blob/main/docs/operations.md)).
+
+| Option | Default | Here | What it is |
+|---|---|---|---|
+| `--chunk-splats` | `65536` | `262144` | gaussians a chunk of the file: larger chunks, fewer of them (102 a part here) |
+| `--max-group-fraction` | `0.5` | default | the most cells the finest merged level may hold, per gaussian |
+| `--merged-opacity` | `5` | default | the most a merged gaussian's opacity may be; over 1 it is drawn with a harder kernel, which keeps the mass of gaussians that covered their cell more than once |
+| `--degree` | `3` | default | the spherical harmonics kept (0 to 3); this capture carries degree 0 |
+| `--rotate-x` | `0` | not allowed | a `.athc` holds the cloud as it is; a capture that comes out upside down is turned on its actor in the level (section 5) |
+
+### 2.3 The conversion
+
 athenea writes a `.athc` of at most 4 GiB of records, so a capture larger
 than that goes a part at a time. A part is a run of consecutive records of
 the PLY; nothing is sorted or chosen. Smaller parts also convert in less
@@ -35,14 +65,35 @@ python Tools/athenea/ply_parts.py town.ply 1.5
 for p in 0 1 2 3; do athenea convert town_$p.ply town_$p.athc --chunk-splats 262144; done
 ```
 
-Measured (an Apple M-series laptop): 8 to 13 seconds a part, 4.8 GB of
-memory at the peak, and four files of 1.04 to 1.09 GB, each 26.6 million
-gaussians in 102 chunks with 10 levels.
+On Windows, the second step in PowerShell:
 
-What the conversion does: it sorts the gaussians along a Morton curve, so an
-octree cell's gaussians are a run of the file, and writes for every cell of
-every level one merged gaussian that stands for its children. A finest cell
-of this capture holds some 55 gaussians.
+```powershell
+0..3 | % { athenea convert "town_$_.ply" "town_$_.athc" --chunk-splats 262144 }
+```
+
+Each conversion ends with a line that says what was written:
+
+```
+town_0.athc: 26593132 splats in 102 chunks, 10 levels, 1041.7 MB
+```
+
+Measured (an Apple M-series laptop): 8 to 13 seconds a part, 4.8 GB of
+memory at the peak, and four files of 1.04 to 1.09 GB.
+
+### 2.4 What a `.athc` holds
+
+- **The gaussians, sorted along a Morton curve**, so an octree cell's
+  gaussians are a run of the file, in chunks of `--chunk-splats`.
+- **Levels of detail**: for every cell of every level of the octree, one
+  merged gaussian that stands for its children (10 levels here; a finest cell
+  holds some 55 gaussians).
+- **Everything packed**: position and opacity, four words of shape (scale,
+  rotation, base colour) and the harmonics, 40 bytes a gaussian on disk at
+  degree 0. The plugin copies them to the GPU unchanged (32 bytes a gaussian)
+  and the shaders decode them.
+
+The plugin's manual has the format's details
+([`.athc` files](operations.md#44-athc-files)).
 
 ## 3. The Unreal project
 
@@ -214,3 +265,23 @@ does, so a shot can be checked in one against the other.
 - **A cloud that casts shadows** is not cut by the frustum by default
   (`LodFrustum` 1 does it, and its shadows are then cast only by what the
   view shows).
+
+## 11. Gaussian file types the plugin reads
+
+Each is imported the same way (dropped on the Content Browser, or
+**Import**); the links go to the manual's section on each.
+
+| Format | Extensions | Levels of detail | In the manual |
+|---|---|---|---|
+| 3DGS PLY | `.ply` | no | [what each format gives](operations.md#41-what-each-format-gives), [PLY files athenea wrote](operations.md#42-ply-files-athenea-wrote) |
+| USD ParticleField | `.usd` `.usda` `.usdc` | no | [USD stages](operations.md#43-usd-stages) |
+| athenea chunked cloud | `.athc` (versions 1 to 3) | yes | [`.athc` files](operations.md#44-athc-files), [very large scenes](operations.md#454-very-large-scenes) |
+| athenea paged cloud | `.athz` | yes | [athenea's own `.athz`](operations.md#451-atheneas-own-athz) |
+| athenea web scene | `.athz` (a zip of `.athc` clouds and a sky) | as its clouds | [a web scene's `.athz`](operations.md#452-a-web-scenes-athz) |
+| antimatter15 splat | `.splat` | no | [`.splat`, `.spz`, `.sog` and glTF files](operations.md#45-splat-spz-sog-and-gltf-files) |
+| Niantic SPZ | `.spz` (versions 2 to 4) | no | the same section |
+| PlayCanvas SOG | `.sog`, `meta.json` | no | the same section |
+| glTF `KHR_gaussian_splatting` | `.glb` `.gltf` | no | the same section |
+
+Relightable (TX) clouds come as USD, `.athc` or `.athz`. A file can also be
+loaded while the game runs ([loading at runtime](operations.md#453-loading-at-runtime)).
