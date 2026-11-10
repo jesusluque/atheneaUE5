@@ -75,10 +75,6 @@ mediante **Import**, o desde Python con un `AssetImportTask`. Cada uno crea un
 
 ### 4.1 Lo que da cada formato
 
-![Los ficheros de prueba en UE 5.8: arriba nubes horneadas (biker .spz y .glb, cat .spz, dwarf .splat, sh3 .ply y .sog, el peón como .ply, close .spz, pawn .athc y .usdc); abajo nubes reiluminadas (TX) bajo el cielo de estudio (el cuerpo de la escena web del peón, su cabeza de vidrio, paint y dragon USD, el close .athz y .spz del Corvette)](images/formats.jpg)
-
-*Los ficheros de prueba en UE 5.8: nubes horneadas arriba, reiluminadas (TX) abajo.*
-
 | Formato | Extensiones | Diálogo | Ejes y unidades | Espacio de color | Armónicos | Se guarda como |
 |---|---|---|---|---|---|---|
 | PLY 3DGS | `.ply` | sí, salvo en modo desatendido | el swizzle y la escala del diálogo; un PLY de athenea los indica en su comentario (4.2) | la opción de gamma del diálogo; un PLY de athenea lo indica | `f_rest_0..44`, grado 3 | arrays float |

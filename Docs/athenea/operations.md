@@ -74,10 +74,6 @@ draws.
 
 ### 4.1 What each format gives
 
-![The test files in UE 5.8: top two rows baked clouds (biker .spz and .glb, cat .spz, dwarf .splat, sh3 .ply and .sog, the pawn as .ply, close .spz, pawn .athc and .usdc); bottom row relit (TX) clouds under the studio sky (the pawn web scene's body, its glass top, paint and dragon USD, the Corvette close .athz and .spz)](images/formats.jpg)
-
-*The test files in UE 5.8: baked clouds above, relit (TX) clouds below.*
-
 | Format | Extensions | Dialogue | Axes and units | Colour space | Harmonics | Kept as |
 |---|---|---|---|---|---|---|
 | 3DGS PLY | `.ply` | yes, unless unattended | the dialogue's swizzle and scale; an athenea PLY says them in its comment (4.2) | the dialogue's gamma option; an athenea PLY says it | `f_rest_0..44`, degree 3 | float arrays |
