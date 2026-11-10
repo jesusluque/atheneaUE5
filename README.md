@@ -53,6 +53,17 @@ Here the sky turns once round a fixed camera.
 </tr>
 <tr>
 <td colspan="2" valign="top">
+<img src="Docs/athenea/images/relight_street.gif" alt="A relit dragon standing in a street of the captured town while the sun turns">
+<h3>A relit cloud inside a capture</h3>
+A relightable (TX) dragon stands in a street of the town while Unreal's sun
+turns once round: the whole frame on the left, the dragon enlarged on the
+right. The dragon and the sky follow the light; the town is a baked capture
+and keeps the light it was captured with
+(<a href="Docs/athenea/media/relight_street.mp4">the video</a>).
+</td>
+</tr>
+<tr>
+<td colspan="2" valign="top">
 <img src="Docs/athenea/images/explosions.jpg" alt="Fire and smoke as gaussians">
 <h3>Fire and smoke</h3>
 Media of gaussians from <code>athenea vdb2splat</code> (OpenVDB volumes): the
