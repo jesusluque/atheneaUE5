@@ -41,8 +41,9 @@ void FGSGPUStats::PollStats(FRHICommandListImmediate& RHICmdList)
 
 	if (CVarAtheneaLogSplats.GetValueOnRenderThread() != 0 && (StatValues[Stat_LitSplatsRendered] > 0 || StatValues[Stat_UnlitSplatsRendered] > 0))
 	{
-		UE_LOG(LogGaussiansRenderer, Display, TEXT("athenea: splats drawn %u lit, %u unlit"),
-			StatValues[Stat_LitSplatsRendered], StatValues[Stat_UnlitSplatsRendered]);
+		UE_LOG(LogGaussiansRenderer, Display, TEXT("athenea: splats drawn %u lit, %u unlit, LodPixels x%.2f"),
+			StatValues[Stat_LitSplatsRendered], StatValues[Stat_UnlitSplatsRendered],
+			FMath::Max(1.0f, *reinterpret_cast<const float*>(&StatValues[Stat_LodBudgetScale])));
 	}
 
 	// Update stats

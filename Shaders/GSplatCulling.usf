@@ -3,6 +3,7 @@
 #include "/Engine/Private/Quaternion.ush"
 
 #include "Shared/GaussiansDefinitions.h"
+#include "GSSplatData.ush"
 
 
 #ifndef THREADGROUP_SIZE_1D
@@ -18,78 +19,7 @@ StructuredBuffer<FGaussians_ClippingVolume> ClippingVolumes;
 
 float SplatScaleMultiplier;
 
-// athenea: a .athc's levels of detail cut this frame, as athenea's CutSelector
-// cuts them (shaders/athenea/lod/lod_cut.slang): a merged group is drawn where
-// its octree cell spans at most LodThreshold pixels at its nearest point to
-// the eye and its parent's cell more; a splat where its finest-level group's
-// cell spans more. LodEyeLocal is the eye in the primitive's local space (cm);
-// the cells are in the file's axes and units. LodThreshold 0 draws the splats.
-float3 LodEyeLocal;
-float LodPixelsPerUnit;
-float LodThreshold;
-
-uint LodCompact(uint v)
-{
-	v &= 0x09249249u;
-	v = (v | (v >> 2)) & 0x030C30C3u;
-	v = (v | (v >> 4)) & 0x0300F00Fu;
-	v = (v | (v >> 8)) & 0x030000FFu;
-	v = (v | (v >> 16)) & 0x000003FFu;
-	return v;
-}
-
-// The pixels a level-`Level` cell spans at its nearest point to the eye.
-float LodCellPixels(uint Cell, uint Level, float3 Eye)
-{
-	const float Edge = GSResources.LodExtent / float(1u << Level);
-	const float3 Lo = GSResources.LodBoundsLo + float3(LodCompact(Cell >> 2), LodCompact(Cell >> 1), LodCompact(Cell)) * Edge;
-	const float3 Nearest = clamp(Eye, Lo, Lo + Edge);
-	return Edge * LodPixelsPerUnit / max(length(Nearest - Eye), 1e-6f);
-}
-
-bool LodSmall(uint Cell, uint Level, float3 Eye)
-{
-	return LodThreshold > 0.0f && LodCellPixels(Cell, Level, Eye) <= LodThreshold;
-}
-
-// A tree node's width on screen, twice its widest deviation over its distance
-// (athenea's treeCutWidth), against the threshold; local centimetres.
-bool LodTreeNarrow(uint Node)
-{
-	const float3 S = GSResources.Scales[Node] * 100.0f;
-	const float Distance = max(length(GSResources.Positions[Node] - LodEyeLocal), 1.0e-3f);
-	return LodThreshold > 0.0f && 2.0f * max(S.x, max(S.y, S.z)) / Distance * LodPixelsPerUnit <= LodThreshold;
-}
-
-bool LodDrawn(uint SplatIndex)
-{
-	// The eye in the file's axes and units (FileAxis* are where the file's axes
-	// point in local space, a signed permutation).
-	const float3 L = LodEyeLocal / GSResources.LodUnitsToCm;
-	const float3 Eye = float3(dot(GSResources.FileAxisX, L), dot(GSResources.FileAxisY, L), dot(GSResources.FileAxisZ, L));
-	const uint A = GSResources.LodWords[SplatIndex * 2];
-	const uint B = GSResources.LodWords[SplatIndex * 2 + 1];
-	if ((B & 0x20000000u) != 0)
-	{
-		// A paged tree's node (athenea's lod_tree_cut): it passes as a leaf or
-		// where it spans at most LodThreshold pixels; it is drawn where it
-		// passes and its parent does not.
-		const bool bLeaf = (B & 0x80000000u) != 0;
-		const bool bHere = bLeaf || LodTreeNarrow(SplatIndex);
-		return bHere && (A == 0xFFFFFFFFu || !LodTreeNarrow(A));
-	}
-	if ((B & 0x80000000u) != 0)
-	{
-		// A splat: drawn where its finest-level group's cell is not small.
-		const uint Cell = GSResources.LodWords[(GSResources.LodFinestBase + A) * 2];
-		return !LodSmall(Cell, GSResources.LodFinestLevel, Eye);
-	}
-	const uint Level = B & 0xFFu;
-	const bool bHere = LodSmall(A, Level, Eye);
-	// The coarsest level the file keeps (bit 30) has no parent to defer to.
-	const bool bAbove = (B & 0x40000000u) == 0 && Level > 0 && LodSmall(A >> 3, Level - 1, Eye);
-	return bHere && !bAbove;
-}
+#include "GSLod.ush"
 
 
 struct FOrientedBoundingBox
@@ -216,15 +146,15 @@ void GSplatCullingCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex
 
 	if (SplatIndex < GSResources.SplatCount && NumClippingVolumes > 0)
 	{
-		float3 LocalPosition = GSResources.Positions[SplatIndex];
+		float3 LocalPosition = GSPos(SplatIndex);
 		float4 TranslatedWorldPosition = DFTransformLocalToTranslatedWorld(LocalPosition, MakeDFMatrix4x3(Primitive.PositionHigh, Primitive.LocalToRelativeWorld), MakeDFVector3(0, 0));
 
 		FOrientedBoundingBox SplatOBB;
 		SplatOBB.Origin = TranslatedWorldPosition.xyz;
-		SplatOBB.Axes = mul((float3x3) Primitive.RelativeWorldToLocal, QuatToMatrix(GSResources.Orientations[SplatIndex]));
+		SplatOBB.Axes = mul((float3x3) Primitive.RelativeWorldToLocal, QuatToMatrix(GSRot(SplatIndex)));
 		// 3 standard deviations of the gaussian included to capture 99.7% of volume
 		// Factor of 100 to convert to Unreal units
-		SplatOBB.HalfExtents = 300.0f * GSResources.Scales[SplatIndex] * Primitive.NonUniformScale.xyz * Primitive.NonUniformScale.xyz * SplatScaleMultiplier;
+		SplatOBB.HalfExtents = 300.0f * GSScl(SplatIndex) * Primitive.NonUniformScale.xyz * Primitive.NonUniformScale.xyz * SplatScaleMultiplier;
 
 		bVisible = true;
 
@@ -271,6 +201,21 @@ void GSplatCullingCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex
 		bVisible = LodDrawn(SplatIndex);
 	}
 
+#if GS_WAVE_APPEND
+	// athenea: one atomic a wave, not one a splat: a large cloud's cut keeps
+	// millions a frame, every one of which added to the same counter.
+	const uint WaveVisible = WaveActiveCountBits(bVisible);
+	uint WaveBase = 0;
+	if (WaveIsFirstLane() && WaveVisible > 0)
+	{
+		InterlockedAdd(RWSplatIndexBufferAllocator[0], WaveVisible, WaveBase);
+	}
+	WaveBase = WaveReadLaneFirst(WaveBase);
+	if (bVisible)
+	{
+		RWSplatIndices[WaveBase + WavePrefixCountBits(bVisible)] = SplatIndex;
+	}
+#else
 	if (bVisible)
 	{
 		// Splat was not culled and its index should be written to the index buffer
@@ -279,4 +224,122 @@ void GSplatCullingCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex
 		InterlockedAdd(RWSplatIndexBufferAllocator[0], 1, OutIndex);
 		RWSplatIndices[OutIndex] = SplatIndex;
 	}
+#endif
+}
+
+
+// athenea: THE CUT BY ITS GROUPS. A .athc's splats lie in their finest-level
+// groups' order, each group's one run (GSResources.LodGroupStarts). Where
+// nothing but the levels culls, the pass walks the groups -- half a million
+// a part of a town, not its 27 million splats: a merged group drawn writes
+// its own index, and a finest-level group whose splats are drawn writes its
+// run's. The same indices as the pass over the splats, in another order.
+[numthreads(THREADGROUP_SIZE_1D, 1, 1)]
+void GSplatCullingGroupsCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint i = GSResources.LodSplatsEnd + GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUP_SIZE_1D);
+	if (i >= uint(GSResources.SplatCount))
+	{
+		return;
+	}
+	const bool bSelf = LodDrawn(i);
+	uint First = 0u;
+	uint Count = 0u;
+	uint Kept = 0u;
+	float Fraction = 1.0f;
+	const uint B = GSResources.LodWords[i * 2 + 1];
+	if ((B & 0xFFu) == GSResources.LodFinestLevel && i >= GSResources.LodFinestBase && i - GSResources.LodFinestBase < GSResources.LodFinestGroups)
+	{
+		const uint g = i - GSResources.LodFinestBase;
+		if (LodGroupSplats(i, LodEyeFile()))
+		{
+			First = GSResources.LodGroupStarts[g];
+			Count = (g + 1u < GSResources.LodFinestGroups ? GSResources.LodGroupStarts[g + 1u] : GSResources.LodSplatsEnd) - First;
+			// The splats thinned (GSLod.ush): those its fraction keeps.
+			Fraction = LodThinFraction(i, LodEyeFile());
+			Kept = Count;
+			if (Fraction < 1.0f)
+			{
+				Kept = 0u;
+				for (uint c = 0u; c < Count; c++)
+				{
+					Kept += LodThinKeeps(First + c, First, Fraction) ? 1u : 0u;
+				}
+			}
+		}
+	}
+	const uint Total = Kept + (bSelf ? 1u : 0u);
+	if (Total > 0u)
+	{
+		uint Base;
+		InterlockedAdd(RWSplatIndexBufferAllocator[0], Total, Base);
+		if (bSelf)
+		{
+			RWSplatIndices[Base] = i;
+			Base++;
+		}
+		for (uint k = 0u; k < Count; k++)
+		{
+			if (LodThinKeeps(First + k, First, Fraction))
+			{
+				RWSplatIndices[Base] = First + k;
+				Base++;
+			}
+		}
+	}
+}
+
+
+// athenea: each finest-level group's state for this view's cut (GSLod.ush).
+RWBuffer<uint> RWLodGroupState;
+uint LodFinestGroups;
+
+[numthreads(THREADGROUP_SIZE_1D, 1, 1)]
+void GSLodStateCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint g = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUP_SIZE_1D);
+	if (g < LodFinestGroups)
+	{
+		const uint Group = GSResources.LodFinestBase + g;
+		RWLodGroupState[g] = LodGroupSplats(Group, LodEyeFile()) ? asuint(LodThinFraction(Group, LodEyeFile())) : 0u;
+	}
+}
+
+
+// athenea: the view's splat budget, kept from frame to frame. [1] is what the
+// last frame's prepasses wanted to draw (before the buffers' end cut it), [2]
+// the capacity they had when the clouds held more than it (0 otherwise). The
+// splats a cut sends go as the inverse square of its threshold, so a frame
+// that wanted more than the capacity raises the factor by the square root of
+// the excess over 85 % of it; short of that the factor moves 1 % a frame, up
+// over nine tenths of the capacity and down under three quarters, down to 1.
+RWBuffer<uint> RWLodBudget;
+uint LodBudgetOn;
+
+[numthreads(1, 1, 1)]
+void GSLodBudgetCS()
+{
+	float Scale = asfloat(RWLodBudget[0]);
+	Scale = Scale >= 1.0f && Scale < 1.0e6f ? Scale : 1.0f;
+	const float Wanted = float(RWLodBudget[1]);
+	const float Cap = float(RWLodBudget[2]);
+	if (LodBudgetOn == 0u || Cap <= 0.0f)
+	{
+		Scale = 1.0f;
+	}
+	else
+	{
+		// In small steps, so the cut does not move all at once: a frame over
+		// nine tenths of the capacity raises the factor 1 %, one under three
+		// quarters lowers it 1 %. A threshold stepped by several percent
+		// shifted every thinned group's fraction in one frame, a pulse across
+		// the whole transition. Only a frame that wanted more than there is
+		// room for is answered at once.
+		const float Fill = Wanted / Cap;
+		Scale = Fill > 1.0f ? Scale * sqrt(Fill / 0.85f) * 1.02f : Fill > 0.9f ? Scale * 1.01f : Fill < 0.75f ? Scale * 0.99f : Scale;
+		Scale = clamp(Scale, 1.0f, 1024.0f);
+	}
+	RWLodBudget[0] = asuint(Scale);
+	RWLodBudget[1] = 0u;
+	RWLodBudget[2] = 0u;
 }

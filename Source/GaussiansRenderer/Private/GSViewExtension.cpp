@@ -102,7 +102,8 @@ void FGSViewExtension::PostRenderBasePassDeferred_RenderThread(FRDGBuilder& Grap
 			InView,
 			AllProxies,
 			ClippingVolumeParameters,
-			bForceEnable
+			bForceEnable,
+			GetLodBudget(GraphBuilder, InView)
 		);
 
 		ClippingVolumeContainer->ClearClippingDirtyFlags();
@@ -119,7 +120,7 @@ void FGSViewExtension::PostRenderBasePassDeferred_RenderThread(FRDGBuilder& Grap
 			GSplatGBuffer.Clear(GraphBuilder);
 		}
 
-		GaussianSplattingPass(GraphBuilder, InView, GSplatGBuffer.GetRenderTargetBindings(false, SceneTexturesData.Depth.Target), RelightableProxies, GPUStats.Get());
+		GaussianSplattingPass(GraphBuilder, InView, GSplatGBuffer.GetRenderTargetBindings(false, SceneTexturesData.Depth.Target), RelightableProxies, GPUStats.Get(), GetLodBudget(GraphBuilder, InView));
 		GSCompositionPass(GraphBuilder, InView, GSplatGBuffer, RenderTargets);
 
 		// This hack is required for the case where the scene contains only splats and no other
@@ -161,12 +162,12 @@ void FGSViewExtension::PrePostProcessPass_RenderThread(FRDGBuilder& GraphBuilder
 			TSet<IGaussianSplatInterface*> AllProxies = RelightableProxies.Union(NonRelightableProxies);
 			if (!AllProxies.IsEmpty())
 			{
-				GaussianSplattingPass(GraphBuilder, InView, RenderTargets, AllProxies, GPUStats.Get());
+				GaussianSplattingPass(GraphBuilder, InView, RenderTargets, AllProxies, GPUStats.Get(), GetLodBudget(GraphBuilder, InView));
 			}
 		}
 		else
 		{
-			GaussianSplattingPass(GraphBuilder, InView, RenderTargets, NonRelightableProxies, GPUStats.Get());
+			GaussianSplattingPass(GraphBuilder, InView, RenderTargets, NonRelightableProxies, GPUStats.Get(), GetLodBudget(GraphBuilder, InView));
 		}
 	}
 }
@@ -174,6 +175,21 @@ void FGSViewExtension::PrePostProcessPass_RenderThread(FRDGBuilder& GraphBuilder
 void FGSViewExtension::PostRenderViewFamily_RenderThread(FRDGBuilder& GraphBuilder, FSceneViewFamily& InViewFamily)
 {
 	GPUStats->ProcessEndRender(GraphBuilder);
+}
+
+FRDGBufferRef FGSViewExtension::GetLodBudget(FRDGBuilder& GraphBuilder, const FSceneView& InView)
+{
+	const uint32 Key = InView.State ? InView.State->GetViewKey() : 0u;
+	if (TRefCountPtr<FRDGPooledBuffer>* Pooled = LodBudgets.Find(Key))
+	{
+		return GraphBuilder.RegisterExternalBuffer(*Pooled);
+	}
+	// A new view starts at the threshold as set: factor 1, nothing wanted.
+	FRDGBufferRef Budget = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), 4), TEXT("Gaussians.LodBudget"));
+	static const uint32 Initial[4] = { 0x3f800000u, 0u, 0u, 0u };
+	GraphBuilder.QueueBufferUpload(Budget, Initial, sizeof(Initial), ERDGInitialDataFlags::NoCopy);
+	LodBudgets.Add(Key, GraphBuilder.ConvertToExternalBuffer(Budget));
+	return Budget;
 }
 
 bool FGSViewExtension::IsActiveThisFrame_Internal(const FSceneViewExtensionContext& Context) const

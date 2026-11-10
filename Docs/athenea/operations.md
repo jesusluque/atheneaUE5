@@ -74,6 +74,10 @@ draws.
 
 ### 4.1 What each format gives
 
+![The test files in UE 5.8: top two rows baked clouds (biker .spz and .glb, cat .spz, dwarf .splat, sh3 .ply and .sog, the pawn as .ply, close .spz, pawn .athc and .usdc); bottom row relit (TX) clouds under the studio sky (the pawn web scene's body, its glass top, paint and dragon USD, the Corvette close .athz and .spz)](images/formats.jpg)
+
+*The test files in UE 5.8: baked clouds above, relit (TX) clouds below.*
+
 | Format | Extensions | Dialogue | Axes and units | Colour space | Harmonics | Kept as |
 |---|---|---|---|---|---|---|
 | 3DGS PLY | `.ply` | yes, unless unattended | the dialogue's swizzle and scale; an athenea PLY says them in its comment (4.2) | the dialogue's gamma option; an athenea PLY says it | `f_rest_0..44`, degree 3 | float arrays |
@@ -163,6 +167,10 @@ settings (*Gaussians | Volume*), to be changed after the import.
 
 ### 4.4 `.athc` files
 
+![pawn.athc at one, four and sixteen times the framing distance (rows): the levels off, at 1 px (the default) and at 8 px (columns); the far rows enlarged](images/lod_athc.jpg)
+
+*pawn.athc's levels of detail: at 1 px, 121,241 splats at four times the distance and 8,725 at sixteen, against 325,833.*
+
 What is read: the header, the chunk table, and from each chunk the positions
 (float4: xyz in metres, linear opacity), the four shape words and the
 harmonic words, copied unchanged into the asset. Versions 1 and 2 are read.
@@ -220,7 +228,26 @@ cloud with levels is culled every frame, whatever its clipping volumes.
 | Console variable | Default | What it does |
 |---|---|---|
 | `r.Gaussians.Athenea.LodPixels` | `1` | the pixels a merged cell may span before its children are drawn in its place; `0` draws every splat and no merged group, as before the levels were read |
-| `r.Gaussians.Athenea.LogSplats` | `0` | `1` logs the splats each frame sends to the rasteriser (`athenea: splats drawn N lit, M unlit`), a frame or two late: what the cut is checked by |
+| `r.Gaussians.Athenea.TightQuads` | `1` | a splat of opacity a is drawn out to √(2 ln 255a) deviations, where it falls under 1/255, instead of three (a harder kernel and a medium keep theirs); `0` draws every quad to three |
+| `r.Gaussians.Athenea.LodDissolve` | `2` | each merged group switches to its children at its own threshold, `LodPixels` times this to the power h − ½ (h hashed from its cell and level, a tree node's from its index), so the cut's edge is spread over a band of distances instead of sliding over the scene as one ring; no gaussian is drawn twice or missed, and the mean detail is `LodPixels`'s. `1` is athenea's cut |
+| `r.Gaussians.Athenea.LodBudget` | `1` | `1` raises `LodPixels` for a view while its frames want more splats than `r.Gaussians.MaxSplats` holds (§4.5.4); `0` keeps the threshold as set and leaves the excess out |
+| `r.Gaussians.Athenea.LodMorph` | `2` | over 1, a gaussian is drawn toward its parent group while the parent is within this many of its own thresholds of being drawn, fully at one (athenea's `--lod-morph`): position, scales, rotation and colour, its opacity keeping its mass. With `LodThin` on (the default) it is the merged levels' alone, which it does not soften; without it, it softens the splats it moves. Up to 1 is no morph |
+| `r.Gaussians.Athenea.FrontToBack` | `8` | N (up to 16) draws the unlit splats front to back into a buffer of their own, in N batches each twice the one before; after each, the pixels already opaque are closed to what later batches would draw behind them, and the buffer goes over the scene. The image is the same; 8 measured fastest. Under a temporal anti-aliasing the nearest showing splat's velocity is written too. `0` draws back to front |
+| `r.Gaussians.Athenea.LodFrustum` | `2` | a view's cut leaves out the octree cells its frustum does not reach (a tenth wider than the image, each cell grown by an edge and a half), so the prepass walks what the view shows. The shadow passes draw the same list: `2` does it for the clouds that cast no shadow, `1` for every cloud (whose shadows are then cast only by what the view shows), `0` for none |
+| `r.Gaussians.Athenea.LodGroupState` | `1` | each finest-level group is judged once a view and its splats read the result; `0` has every splat judge its group's cell itself (the same cut, 1.5 to 2 ms slower on a cloud of 106 M) |
+| `r.Gaussians.Athenea.LodGroupRuns` | `1` | a `.athc` (versions 1 and 2) is cut by walking its groups: a merged group drawn writes its own index, a finest-level group whose splats are drawn writes its run of them (the splats lie in their groups' order). Used where nothing but the levels culls the cloud (no clipping volume); `0` walks every splat |
+| `r.Gaussians.Athenea.LodThin` | `4` | over 1, a finest-level group's splats are thinned before the group is drawn in their place (athenea's `--lod-thin`): while its cell spans under this many thresholds a fraction of them is drawn, halving with each equal step of the logarithm; which ones is a splat's place in its group's run, the same every frame, and a group's first splat is never dropped. Those drawn take the mass of those dropped (a little wider, more opaque up to 1 and never past it) and, in the band's last half, are drawn toward the group's merged gaussian, all the way at the switch. With it `LodMorph` is the merged levels' alone. Up to 1: every splat |
+| `r.Gaussians.Athenea.LodThinLeast` | `0.03125` | the fraction of a group's splats `LodThin` leaves where the group takes their place |
+| `r.Gaussians.Athenea.LodMorphSplats` | `0` | `LodMorph` for the splats alone (toward their finest-level group); it softens the near ground, which `LodThin` does not |
+| `r.Gaussians.Athenea.Dilation` | `0.3` | the low-pass every gaussian's image is spread by, in pixels squared (0.3 is the 3DGS reference's and athenea's); wider calms a far cloud's shimmer and softens it |
+| `r.Gaussians.Athenea.LodSweep` | `0` | for measuring: `LodPixels` is multiplied by 2 to the power (this × a sawtooth of the frame number, 0 to 1 over 128 frames), so a still view changes only as groups switch |
+| `r.Gaussians.Athenea.MipPaid` | `1` | `1` draws a gaussian the low-pass spread at its opacity times √(det before / det after), as athenea does (Mip-Splatting), so a sub-pixel gaussian keeps its energy and no more; `0` draws the spread one at full opacity |
+| `r.Gaussians.Relighting` | `true` | upstream's: the global switch for relit clouds (lit splats written to the GBuffer); off, every cloud is drawn unlit |
+| `r.Gaussians.AlphaCutoff` | `0.3` | upstream's: the coverage, 0 to 1, from which a lit splat pixel is composited into the GBuffer |
+| `r.Gaussians.OpacityThreshold` | `0` | upstream's: only splats more opaque than this are drawn |
+| `r.Gaussians.Debug.CullEveryFrame` | `false` | upstream's, for debugging: the culling against clipping volumes runs every frame, not only when something moved |
+| `r.Gaussians.Debug.DisableViewExtension` | `false` | upstream's, for debugging: the view extension draws nothing in the primary view |
+| `r.Gaussians.Athenea.LogSplats` | `0` | `1` logs the splats each frame sends to the rasteriser (`athenea: splats drawn N lit, M unlit, LodPixels xF`), a frame or two late: what the cut is checked by |
 
 A merged group is drawn with the kernel athenea gives it: an opacity D over 1
 is Spark's harder kernel, 1 − (1 − g)^A with A = exp((D² − 1)/e), a flat top
@@ -248,11 +275,18 @@ saves only the asset the import task returns: the others are saved with the
 editor's *Save All* (or `EditorLoadingAndSavingUtils.save_dirty_packages`),
 or they come back empty in the next session.
 
+Glass and sheets are kept apart, as athenea keeps them (`lodKeptApart`): in a
+TX cloud, a group whose transmission passes a half, or a thin wall's with
+any, is never drawn, and the splats under it always are. A cloud that is all
+glass is therefore drawn whole at any distance (the dragon_glass and the
+pawn's glass top: 82,892 and 292,056 splats at sixteen times the framing
+distance), where an opaque TX piece still coarsens (close.athz: 1,197 of
+404,092).
+
 Not done for the levels: streaming (every chunk is in the asset; nothing is
-loaded as the cut asks), glass and sheets kept apart (athenea never draws
-their groups merged; here they are), a version 3 file's merged levels (kind
-0 blocks, as opposed to a paged tree), and the paged tree's guards
-(athenea's relaxed share for a merge across a colour edge).
+loaded as the cut asks), a version 3 file's merged levels (kind 0 blocks, as
+opposed to a paged tree), and the paged tree's guards (athenea's relaxed
+share for a merge across a colour edge).
 
 ### 4.5 `.splat`, `.spz`, `.sog` and glTF files
 
@@ -330,6 +364,15 @@ group, an exclusive or, or against the word before it). Read:
   axes times the weights, each weight's step its axis's scale over the levels
   (athenea's `athzCpcaUnpack`). The curvature (three floats a splat, in layer
   G) is read with the transfer, so a solid glass is drawn as a lens (§4.4).
+- its levels of detail: each merged level is drawn too, as a block of its own
+  after the splats, its CPCA transfer expanded as theirs is, and cut every
+  frame as a `.athc`'s levels (§4.4, `r.Gaussians.Athenea.LodPixels`); the two
+  words a gaussian the cut reads are written on the device from the decoded
+  tails (a splat's finest group, a group's octree cell). pawntop.athz
+  (292,056 splats, 7 levels of 85,972 groups) at 1 px draws 17,243 at sixteen
+  times the framing distance, image RMS 0.0028 against the cut off.
+
+  ![pawntop.athz near, then at sixteen times the distance with the levels off and at 1 px](images/lod_athz.jpg)
 
 Before anything is decoded the header's CRC-32 (over its first 60 bytes) and
 each page's (over its layers' bytes, in layer order) are checked: a corrupt
@@ -342,6 +385,10 @@ basis does not match the asset table (256 clusters or fewer, 8 axes a block,
 does not add up`).
 
 ### 4.5.2 A web scene's `.athz`
+
+![athenea's pawn web scene in UE: its body (two .athc files that complete each other) and its glass top, relit by the studio sky](images/pawn_web_scene.jpg)
+
+*A web scene's three clouds placed together.*
 
 The web publishes a scene as a `.athz` zip: a `scene.json` (version 2:
 units, up axis, objects with their files and transforms, cameras, sky), each
@@ -360,6 +407,51 @@ An object's transform other than the identity is logged, not applied, and no
 level is made: a level places the actors, a sky light and a camera
 (`setup_scene.py`, development §6). athenea's own `.athz`, the paged cloud
 whose header is `ATHZ`, is told apart by its first bytes.
+
+### 4.5.3 Loading at runtime
+
+A `.athc` (versions 1 to 3, with its levels of detail) or a paged `.athz`
+cloud can be loaded from disk while the game runs, in a packaged build as in
+the editor: `UGSplatRuntimeLibrary::LoadGaussianSplatFile(Path)` (Blueprint:
+*Load Gaussian Splat File*) reads it with the same importer the editor uses
+and returns a new transient asset, or none where the file does not read (the
+log says why); `SetGaussianSplatAsset` gives it to a splat component. Its GPU
+resource is made when the component first draws it. The bicycle's `.athc`
+(6.1 million gaussians, 275 MB) loads in 0.1 s on the test machine. Other
+formats (PLY, SPZ, SOG, glTF, USD, a web scene's `.athz`) are imported in the
+editor; the `.athc` and `.athz` importers and the codecs they need are the
+runtime modules' for this.
+
+### 4.5.4 Very large scenes
+
+A `.athc` of more than 20 million splats keeps athenea's packed arrays on the
+GPU in place of the decoded ones (32 bytes a splat in place of 56; every pass
+unpacks what it reads, `GSSplatData.ush`); `r.Gaussians.Athenea.PackedResident`
+forces it on (1) or off (-1), read when a resource is made. athenea writes a
+`.athc` of at most 4 GiB of records, so a larger capture is cut into parts of
+consecutive records, each converted alone and placed together
+(`Tools/athenea/parts_level.py`). `r.Gaussians.MaxSplats` (default 5 million)
+bounds the splats drawn in a frame, not the scene. Past it, the splats of the
+clouds drawn last were left out, so whole parts of a large scene went missing
+until the view wanted fewer. Now the cut keeps the frame within it:
+`r.Gaussians.Athenea.LodBudget` (1 by default) raises `LodPixels` for a view
+whose last frame wanted more than 85 % of the buffers, by the square root of
+the excess (the splats a cut sends go as the inverse square of its
+threshold), and lowers it back 3 % a frame, down to the value set, once a
+frame wants under 60 %. The factor lives on the device, one per view; it
+counts only when the clouds hold more than `MaxSplats`, and acts only on
+clouds with levels of detail. The first frame or two of a view that
+overflows still leave splats out. `LogSplats` prints the factor
+(`LodPixels xF`).
+
+Measured on a real town of 106 million gaussians (a drone
+capture, four `.athc` parts of 26.6 million): it loads and draws on an
+RTX 3070 Laptop (8 GB); at 1920 × 1080 from an oblique view over the whole
+town, `LodPixels` 2 and `MaxSplats` 12 million, the GPU frame is 34.9 ms
+(culling 7.4, prepass 5.5, sort 2.5, raster 18.2; medians of 300 frames).
+At 1 px the cut keeps nearly every splat from above: a `.athc` has at most 10
+levels, whose finest cells over 3.9 km are 3.8 m across, more than a pixel
+from 1.8 km.
 
 ### 4.6 Messages
 
@@ -469,6 +561,23 @@ Shown on the asset under **Gaussians**:
   (`GPU/GaussiansMediumShadow`), the raster 4.3 ms; the whole GPU frame 11.2 ms
   with the shadow and 11.9 ms without it, the same within the runs' spread.
 
+![The EmberGen mid-air explosion over the San Giuseppe bridge and the Blender fireball over a cloudy sky, each a sequence of 20,000 volumetric gaussians a frame, lit by the HDRI behind it](images/explosions.jpg)
+
+*Media of gaussians as sequences, rendered offscreen in UE 5.8.*
+
+![The fireball's frame 40: athenea's raster (left, a dim dome and a key light) and UE (right, the studio sky and a key light), the same cloud](images/medium_vs_athenea.jpg)
+
+*A medium against athenea's raster of the same frame; the brightness follows each one's lighting.*
+
+**Shadows.** A splat actor casts into UE's shadow maps (virtual shadow maps
+included) by default: its component's *Cast Shadow* is on, and
+`r.Gaussians.Shadows` (default 1) turns every cloud's off. Each gaussian whose
+opacity is 0.9 or more is drawn opaque into the shadow pass, so the shadow is
+hard and the soft parts of a cloud (smoke, hair, edges) cast none; a medium
+of gaussians casts none. Splats receive UE's shadows only when relit
+(upstream's path). Translucent shadows are athenea-research's proposal 108,
+not done.
+
 ### 6.0 Sequences
 
 A component plays a list of assets as a sequence (*Gaussian Splats |
@@ -476,7 +585,11 @@ Sequence*): `SequenceFrames`, one asset a frame (a medium's frames from
 `athenea vdb2splat`, or any clouds); `SequenceFramesPerSecond` (default 24);
 `bSequenceLoop` (default on, else it holds the last frame); `bSequencePlaying`
 and `SequenceTime` (seconds), which also play in the editor's viewports.
-`SetSequenceTime` shows the frame at a time, from Blueprints or Python. Every
+`SetSequenceTime` shows the frame at a time, from Blueprints or Python.
+`SequenceTime` is keyable in Sequencer: with `bSequencePlaying` off, a track on
+it chooses the frame, which is how Movie Render Queue renders a sequence
+frame by frame (`setup_mrq.py ... --sequence` makes such a shot: the fireball's
+72 frames rendered from the command line in 36 s). Every
 frame is its own asset on the GPU; the component switches which one it draws.
 `Tools/athenea/setup_sequence.py` imports a folder of frames into one, and
 `capture_sequence.py` renders frames of it (§7.1).
@@ -600,6 +713,14 @@ UnrealEditor.exe <Project>.uproject /Game/Level -game -RenderOffscreen -ResX=128
   from outside once the CSV is written.
 - The GPU must be free: on a shared machine, check `nvidia-smi` (and WSL,
   whose processes it does not list) before timing.
+- With no window there is no present to pace the game thread: once the GPU
+  frame is long (tens of ms), it queues some thirty frames of 2-5 ms, then
+  waits about a second for them. `FrameTime` is then not the frame's
+  duration, and `GPUTime` is refreshed only every few frames. The frame rate
+  is counted over whole bursts (a run of frames and the stall that closes it):
+  a fixed window of 2 s holds one burst or two and reads half or the whole
+  rate. The per-frame GPU cost is the `GPU/Gaussians*` columns.
+- `-benchmark -fps=30` (fixed steps) does not avoid it.
 
 ### 7.3 Movie Render Queue
 
@@ -628,6 +749,51 @@ spatial samples instead (`spatial_sample_count`, 4 here), and set
 none`): the same frames are sharp. Keep warm-up frames (8 here) so the sky a
 TX cloud is lit by is projected before the first frame is written, and fix the
 exposure as in 7.1, since the two configs exposed the same frame differently.
+
+### 7.4 A flight with its frame rate
+
+`Tools/athenea/fly_sequence.py LEVEL NAME SECONDS RESX RESY EX/EY/EZ:TX/TY/TZ ...`
+saves `LEVEL_fly`: the level with an atmosphere and a sun that casts no
+shadow, a sequence (`/Game/Mrq/Seq_NAME`, 30 fps) whose cine camera (60
+degrees across) follows a Catmull-Rom path through the poses (eye : target,
+centimetres), eased in and out, a sequence actor that plays it when the level
+begins, and an MRQ config (`Cfg_NAME`: PNG at RESX x RESY, no AA, no motion
+blur, and the console variables given as `CVAR=VALUE;...`: `LodPixels` 2 and
+`MaxSplats` 12 M unless given). Poses are separated by `/`, since
+`-ExecCmds` splits at commas; `capture_poses.py` renders stills of candidate
+poses first.
+
+- **Measured.** `LEVEL_fly` in `-game` (7.2), real time: the sequence advances
+  by the world's step, which UE clamps at 0.4 s (`MaxUndilatedFrameTime`), so
+  the sequence time of a frame is the sum of its steps clamped at 0.4 s from
+  the first frame; the frame rate at that moment is counted as in 7.2.
+- **Drawn.** The same sequence through MRQ (7.3), then the measured rate drawn
+  over its frames.
+
+**The image as athenea's.** `LEVEL_fly` holds an unbound post-process volume:
+tone curve 0 (no filmic curve), no vignette, gamut expansion or blue
+correction, and the exposure as it is (bias 0). Measured on the street frame:
+linear mean 0.1584, 0.1789, 0.1235 against athenea's 0.1584, 0.1788, 0.1232
+for the same view. In real time, not through a linear EXR. Read an MRQ PNG
+with its alpha unassociated (`oiiotool --iconfig oiio:UnassociatedAlpha 1`):
+its alpha is not coverage, and premultiplying by it makes a frame look up to
+1.8 times darker than it is.
+
+`mrq_variant.py NAME RESX RESY FIRST LAST [CVAR=VALUE;...]` makes an MRQ config
+for a few frames of an existing sequence with console variables of its own,
+to tell apart what changes them. `mrq.AA=1` among the variables renders
+them with the engine's temporal anti-aliasing (TSR) instead of none, and
+`mrq.Rate=N` at N frames a second instead of the sequence's own (a multiple
+of it is the same move in slow motion). `hold_sequence.py SOURCE NAME FRAME
+FRAMES` copies `Seq_SOURCE` to `Seq_NAME` with the camera held where it is at
+FRAME, for FRAMES frames: what changes from one frame to the next is then the
+renderer's own. `place_camera.py LEVEL EYE:TARGET` puts a
+level's BenchCamera at a pose for the -game timings.
+
+`flip_level.py LEVEL` turns a level's clouds over about X (a rotation, not a
+mirror) and lifts them back into the Z range they held, for captures whose up
+came out as -Z: a scene seen only from below, or foliage close up wherever
+the camera stands, is one.
 
 ## 8. Unreal MCP (optional)
 

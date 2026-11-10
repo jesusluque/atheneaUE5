@@ -20,6 +20,7 @@
 #include "ScenePrivate.h"
 #include "SceneProxies/SkyLightSceneProxy.h"
 #include "SystemTextures.h"
+#include "PixelShaderUtils.h"
 
 // athenea: each stage of a splat frame timed apart, so a profile says where the
 // time goes.
@@ -134,6 +135,17 @@ class FGSPrepassCS : public FGlobalShader
 
 		// Out
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint32>, Counter)
+		// athenea: the view's splat budget, what this frame wanted
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, LodBudgetOut)
+		SHADER_PARAMETER(uint32, LodBudgetCap)
+		SHADER_PARAMETER(FVector3f, LodEyeLocal)
+		SHADER_PARAMETER(float, LodPixelsPerUnit)
+		SHADER_PARAMETER(float, LodThreshold)
+		SHADER_PARAMETER(float, LodDissolve)
+		SHADER_PARAMETER(float, LodMorph)
+		SHADER_PARAMETER(float, LodMorphSplats)
+		SHADER_PARAMETER(float, LodThin)
+		SHADER_PARAMETER(float, LodThinLeast)
 
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float2>, OutSSPositions)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, OutSSScale)
@@ -153,6 +165,9 @@ class FGSPrepassCS : public FGlobalShader
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OutGaussianIDX)
 
 		SHADER_PARAMETER(uint32, BufferCapacity)
+		SHADER_PARAMETER(uint32, TightQuads)
+		SHADER_PARAMETER(uint32, MipPay)
+		SHADER_PARAMETER(float, MipDilation)
 
 		RDG_BUFFER_ACCESS(IndirectArgs, ERHIAccess::IndirectArgs)
 	END_SHADER_PARAMETER_STRUCT()
@@ -167,6 +182,18 @@ class FGSPrepassCS : public FGlobalShader
 };
 
 IMPLEMENT_GLOBAL_SHADER(FGSPrepassCS, "/Plugin/StarLightGS/GSCompute.usf", "GSPrepass", SF_Compute);
+
+// athenea: a faint splat's quad sized by its opacity instead of three sigmas.
+static TAutoConsoleVariable<int32> CVarGaussiansAtheneaTightQuads(
+	TEXT("r.Gaussians.Athenea.TightQuads"), 1,
+	TEXT("1: a splat of opacity a is drawn out to sqrt(2 ln 255a) sigmas (where it falls under 1/255), not three; 0: three sigmas."),
+	ECVF_RenderThreadSafe);
+
+// athenea: the 0.3 px spread paid back from a gaussian's opacity (Mip-Splatting).
+static TAutoConsoleVariable<int32> CVarGaussiansAtheneaMipPaid(
+	TEXT("r.Gaussians.Athenea.MipPaid"), 1,
+	TEXT("1: a gaussian's opacity times sqrt(det before / det after) the 0.3 px spread, as athenea draws it (Mip-Splatting); 0: the spread at full opacity."),
+	ECVF_RenderThreadSafe);
 
 static TAutoConsoleVariable<int32> CVarGaussiansAtheneaMediumShadow(
 	TEXT("r.Gaussians.Athenea.MediumShadow"), 1,
@@ -326,6 +353,106 @@ BEGIN_SHADER_PARAMETER_STRUCT(FSplattingPassPipelineParameters, )
 END_SHADER_PARAMETER_STRUCT()
 
 
+static TAutoConsoleVariable<float> CVarGaussiansAtheneaDilation(
+	TEXT("r.Gaussians.Athenea.Dilation"), 0.3f,
+	TEXT("athenea: the low-pass every gaussian's image is spread by, in pixels squared (0.3: the 3DGS reference's and athenea's). Wider calms the shimmer of a far cloud's sub-pixel gaussians at the cost of sharpness; with MipPaid the spread is paid back from the opacity, so the brightness holds."),
+	ECVF_RenderThreadSafe);
+
+// athenea: the splats front to back (GSFront.usf).
+static TAutoConsoleVariable<int32> CVarGaussiansAtheneaFrontToBack(
+	TEXT("r.Gaussians.Athenea.FrontToBack"), 8,
+	TEXT("athenea: unlit splats drawn front to back into a buffer of their own, in this many batches (each twice the one before, at most 16), the pixels already opaque dropping what later batches draw behind them; the buffer then goes over the scene, and where the view has a temporal anti-aliasing the nearest showing splat's velocity with it. 0: back to front, as before."),
+	ECVF_RenderThreadSafe);
+
+class FSplattingFrontVS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FSplattingFrontVS)
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_STRUCT_INCLUDE(FSplattingPassVS::FParameters, Base)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, FrontBatches)
+		SHADER_PARAMETER(uint32, FrontBatch)
+	END_SHADER_PARAMETER_STRUCT()
+
+	SHADER_USE_PARAMETER_STRUCT(FSplattingFrontVS, FGlobalShader);
+
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("GS_FRONT_TO_BACK"), 1);
+		OutEnvironment.SetDefine(TEXT("ENABLE_RELIGHTING"), 0);
+	}
+};
+IMPLEMENT_GLOBAL_SHADER(FSplattingFrontVS, "/Plugin/StarLightGS/GSCompute.usf", "GSSplatting_VS", SF_Vertex);
+
+class FSplattingFrontPS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FSplattingFrontPS)
+	using FParameters = FSplattingPassPS::FParameters;
+	SHADER_USE_PARAMETER_STRUCT(FSplattingFrontPS, FGlobalShader);
+
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("GS_FRONT_TO_BACK"), 1);
+		OutEnvironment.SetDefine(TEXT("ENABLE_RELIGHTING"), 0);
+	}
+};
+IMPLEMENT_GLOBAL_SHADER(FSplattingFrontPS, "/Plugin/StarLightGS/GSCompute.usf", "GSSplatting_PS", SF_Pixel);
+
+BEGIN_SHADER_PARAMETER_STRUCT(FSplattingFrontPipelineParameters, )
+	SHADER_PARAMETER_STRUCT_INCLUDE(FSplattingFrontVS::FParameters, VertexShader)
+	SHADER_PARAMETER_STRUCT_INCLUDE(FSplattingPassPS::FParameters, PixelShader)
+END_SHADER_PARAMETER_STRUCT()
+
+class FGSFrontBatchesCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FGSFrontBatchesCS)
+	SHADER_USE_PARAMETER_STRUCT(FGSFrontBatchesCS, FGlobalShader);
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, FrontCount)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OutFrontArgs)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OutFrontBatches)
+		SHADER_PARAMETER(uint32, FrontBatchCount)
+	END_SHADER_PARAMETER_STRUCT()
+};
+IMPLEMENT_GLOBAL_SHADER(FGSFrontBatchesCS, "/Plugin/StarLightGS/GSFront.usf", "GSFrontBatchesCS", SF_Compute);
+
+class FGSFrontSaturatePS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FGSFrontSaturatePS)
+	SHADER_USE_PARAMETER_STRUCT(FGSFrontSaturatePS, FGlobalShader);
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float4>, FrontColor)
+		SHADER_PARAMETER(float, FrontOpaque)
+		RENDER_TARGET_BINDING_SLOTS()
+	END_SHADER_PARAMETER_STRUCT()
+};
+IMPLEMENT_GLOBAL_SHADER(FGSFrontSaturatePS, "/Plugin/StarLightGS/GSFront.usf", "GSFrontSaturatePS", SF_Pixel);
+
+class FGSFrontCompositePS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FGSFrontCompositePS)
+	SHADER_USE_PARAMETER_STRUCT(FGSFrontCompositePS, FGlobalShader);
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float4>, FrontColor)
+		RENDER_TARGET_BINDING_SLOTS()
+	END_SHADER_PARAMETER_STRUCT()
+};
+IMPLEMENT_GLOBAL_SHADER(FGSFrontCompositePS, "/Plugin/StarLightGS/GSFront.usf", "GSFrontCompositePS", SF_Pixel);
+
+class FGSFrontVelocityPS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FGSFrontVelocityPS)
+	SHADER_USE_PARAMETER_STRUCT(FGSFrontVelocityPS, FGlobalShader);
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float>, FrontNearest)
+		RENDER_TARGET_BINDING_SLOTS()
+	END_SHADER_PARAMETER_STRUCT()
+};
+IMPLEMENT_GLOBAL_SHADER(FGSFrontVelocityPS, "/Plugin/StarLightGS/GSFront.usf", "GSFrontVelocityPS", SF_Pixel);
+
 // Static blend / stencil states
 
 using FRelitBlendState = TStaticBlendState<
@@ -339,6 +466,14 @@ using FUnlitBlendState = TStaticBlendState<
 	/* Velocity: */ CW_RGBA, BO_Add, BF_One, BF_Zero, BO_Add, BF_One, BF_Zero
 >;
 
+// Front to back: each splat under what the buffer holds.
+using FFrontBlendState = TStaticBlendState<
+	/* Color:    */ CW_RGBA, BO_Add, BF_InverseDestAlpha, BF_One, BO_Add, BF_InverseDestAlpha, BF_One,
+	/* Nearest:  */ CW_RED, BO_Max, BF_One, BF_One, BO_Max, BF_One, BF_One
+>;
+using FFrontCompositeBlendState = TStaticBlendState<CW_RGBA, BO_Add, BF_One, BF_InverseSourceAlpha, BO_Add, BF_One, BF_InverseSourceAlpha>;
+using FFrontSaturateDepthState = TStaticDepthStencilState<true, CF_Always>;
+
 using FRelitDepthStencilState = TStaticDepthStencilState<false, CF_DepthNearOrEqual>;
 using FUnlitDepthStencilState = TStaticDepthStencilState<false, CF_DepthNearOrEqual>;
 
@@ -348,7 +483,8 @@ void FGSViewExtension::GaussianSplattingPass(
 	const FSceneView& InView,
 	const FRenderTargetBindingSlots& RenderTargets,
 	const TSet<IGaussianSplatInterface*>& Proxies,
-	const FGSGPUStats* GPUStats)
+	const FGSGPUStats* GPUStats,
+	FRDGBufferRef LodBudget)
 {
 	// Don't call this when there are no proxies
 	check(!Proxies.IsEmpty());
@@ -359,6 +495,23 @@ void FGSViewExtension::GaussianSplattingPass(
 
 	// Create transient buffers
 	int32 Capacity = CVarGaussiansMaxSplats.GetValueOnRenderThread();
+	uint32 LodBudgetCap = 0;
+	// athenea: no more than the frame's clouds hold -- the transient buffers
+	// (about 68 bytes a gaussian) were made at r.Gaussians.MaxSplats every
+	// frame, 340 MB at the default, whatever was drawn.
+	{
+		uint64 Held = 0;
+		for (auto Proxy : Proxies)
+		{
+			if (const FGaussianSplatResource* Resource = Proxy->GetResource_RenderThread())
+			{
+				Held += Resource->GetSplatCount();
+			}
+		}
+		// The budget counts only where the clouds hold more than the buffers.
+		LodBudgetCap = Held > uint64(FMath::Max(Capacity, 1)) ? uint32(FMath::Max(Capacity, 1)) : 0u;
+		Capacity = int32(FMath::Clamp<uint64>(Held, 1, uint64(FMath::Max(Capacity, 1))));
+	}
 
 	FRDGBufferRef NDCPositionsBuffer = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(FVector2f), Capacity), TEXT("Gaussians.NDCPositions"));
 	FRDGBufferRef NDCScalesBuffer = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), Capacity), TEXT("Gaussians.NDCScales"));
@@ -395,6 +548,11 @@ void FGSViewExtension::GaussianSplattingPass(
 	TShaderMapRef<FGSPrepassCS> PrePassShader(ShaderMap, Permutation);
 	TShaderMapRef<FSplattingPassVS> VertexShader(ShaderMap, Permutation);
 	TShaderMapRef<FSplattingPassPS> PixelShader(ShaderMap, Permutation);
+
+	// athenea: unlit splats front to back, where asked and there is a depth
+	// buffer to copy (GSFront.usf).
+	const int32 FrontBatches = bRelighting || RenderTargets.DepthStencil.GetTexture() == nullptr || RenderTargets[0].GetTexture() == nullptr
+		? 0 : FMath::Clamp(CVarGaussiansAtheneaFrontToBack.GetValueOnRenderThread(), 0, 16);
 
 	bool bAnySplatsRendered = false;
 	// athenea: the sky light's captured cubemap, which a TX cloud is lit by
@@ -658,6 +816,20 @@ void FGSViewExtension::GaussianSplattingPass(
 		PassParameters->HZB = Gaussians::GetHZBParameters(GraphBuilder, ViewInfo, Gaussians::EHZBType::FurthestHZB);
 
 		PassParameters->Counter = GraphBuilder.CreateUAV(RasterIndirectArgsBuffer, PF_R32_UINT);
+		PassParameters->LodBudgetOut = GraphBuilder.CreateUAV(LodBudget, PF_R32_UINT);
+		PassParameters->LodBudgetCap = LodBudgetCap;
+		{
+			// The cut's own numbers, for its morph (GSLod.ush).
+			const FGSLodCut Cut = GSLodCutOf(*Proxy, ViewInfo);
+			PassParameters->LodEyeLocal = Cut.EyeLocal;
+			PassParameters->LodPixelsPerUnit = Cut.PixelsPerUnit;
+			PassParameters->LodThreshold = Cut.Threshold;
+			PassParameters->LodDissolve = Cut.Dissolve;
+			PassParameters->LodMorph = Cut.Morph;
+			PassParameters->LodMorphSplats = Cut.MorphSplats;
+			PassParameters->LodThin = Cut.Thin;
+			PassParameters->LodThinLeast = Cut.ThinLeast;
+		}
 
 		PassParameters->OutSSPositions = GraphBuilder.CreateUAV(NDCPositionsBuffer, PF_G32R32F);
 		PassParameters->OutSSScale = GraphBuilder.CreateUAV(NDCScalesBuffer, PF_A32B32G32R32F);
@@ -677,6 +849,9 @@ void FGSViewExtension::GaussianSplattingPass(
 		}
 
 		PassParameters->BufferCapacity = Capacity;
+		PassParameters->TightQuads = CVarGaussiansAtheneaTightQuads.GetValueOnRenderThread() != 0 ? 1u : 0u;
+		PassParameters->MipPay = CVarGaussiansAtheneaMipPaid.GetValueOnRenderThread() != 0 ? 1u : 0u;
+		PassParameters->MipDilation = FMath::Clamp(CVarGaussiansAtheneaDilation.GetValueOnRenderThread(), 0.0f, 16.0f);
 
 		PassParameters->IndirectArgs = ComputeIndirectArgs;
 
@@ -712,7 +887,7 @@ void FGSViewExtension::GaussianSplattingPass(
 			1,
 			UINT32_MAX, 
 			GMaxRHIFeatureLevel,
-			!bRelighting  // Unlit splats must be sorted back-to-front
+			!bRelighting && FrontBatches == 0  // Unlit splats must be sorted back-to-front, unless drawn front to back
 		);
 
 		GaussianIndexBuffer = InValues[Index];
@@ -753,6 +928,97 @@ void FGSViewExtension::GaussianSplattingPass(
 		// TODO: Verify quantity of render targets based on whether relighting is enabled or not
 		PassParameters->PixelShader.RenderTargets = RenderTargets;
 
+		if (FrontBatches > 0)
+		{
+			FRDGTextureRef SceneColor = RenderTargets[0].GetTexture();
+			FRDGTextureRef SceneDepth = RenderTargets.DepthStencil.GetTexture();
+			FRDGTextureRef Front = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2D(SceneColor->Desc.Extent, PF_FloatRGBA,
+				FClearValueBinding::Transparent, TexCreate_RenderTargetable | TexCreate_ShaderResource), TEXT("Gaussians.Front"));
+			// The nearest showing splat's depth, for the scene's velocity (TSR reads it).
+			// Only a temporal method reads it, and a second target costs a
+			// sixth of the pass: without one none is written.
+			FRDGTextureRef SceneVelocity = IsTemporalAccumulationBasedMethod(ViewInfo.AntiAliasingMethod) ? RenderTargets[1].GetTexture() : nullptr;
+			FRDGTextureRef FrontVelocity = SceneVelocity == nullptr ? nullptr : GraphBuilder.CreateTexture(FRDGTextureDesc::Create2D(SceneColor->Desc.Extent, PF_R32_FLOAT,
+				FClearValueBinding::Black, TexCreate_RenderTargetable | TexCreate_ShaderResource), TEXT("Gaussians.FrontNearest"));
+			// A depth of the splats' own: the scene's, then the opaque pixels brought near.
+			FRDGTextureRef FrontDepth = GraphBuilder.CreateTexture(SceneDepth->Desc, TEXT("Gaussians.FrontDepth"));
+			AddCopyTexturePass(GraphBuilder, SceneDepth, FrontDepth);
+
+			FRDGBufferRef FrontArgs = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateIndirectDesc<FRHIDrawIndirectParameters>(FrontBatches), TEXT("Gaussians.FrontArgs"));
+			FRDGBufferRef FrontBases = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), FrontBatches), TEXT("Gaussians.FrontBatches"));
+			{
+				FGSFrontBatchesCS::FParameters* Batches = GraphBuilder.AllocParameters<FGSFrontBatchesCS::FParameters>();
+				Batches->FrontCount = GraphBuilder.CreateSRV(RasterIndirectArgsBuffer, PF_R32_UINT);
+				Batches->OutFrontArgs = GraphBuilder.CreateUAV(FrontArgs, PF_R32_UINT);
+				Batches->OutFrontBatches = GraphBuilder.CreateUAV(FrontBases, PF_R32_UINT);
+				Batches->FrontBatchCount = uint32(FrontBatches);
+				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("GSFrontBatches"), TShaderMapRef<FGSFrontBatchesCS>(ShaderMap), Batches, FIntVector(1, 1, 1));
+			}
+			TShaderMapRef<FSplattingFrontVS> FrontVS(ShaderMap);
+			TShaderMapRef<FSplattingFrontPS> FrontPS(ShaderMap);
+			for (int32 Batch = 0; Batch < FrontBatches; Batch++)
+			{
+				auto* P = GraphBuilder.AllocParameters<FSplattingFrontPipelineParameters>();
+				P->VertexShader.Base = PassParameters->VertexShader;
+				P->VertexShader.Base.IndirectArgs = FrontArgs;
+				P->VertexShader.FrontBatches = GraphBuilder.CreateSRV(FrontBases, PF_R32_UINT);
+				P->VertexShader.FrontBatch = uint32(Batch);
+				P->PixelShader = PassParameters->PixelShader;
+				P->PixelShader.RenderTargets = FRenderTargetBindingSlots();
+				P->PixelShader.RenderTargets[0] = FRenderTargetBinding(Front, Batch == 0 ? ERenderTargetLoadAction::EClear : ERenderTargetLoadAction::ELoad);
+				if (FrontVelocity != nullptr)
+				{
+					P->PixelShader.RenderTargets[1] = FRenderTargetBinding(FrontVelocity, Batch == 0 ? ERenderTargetLoadAction::EClear : ERenderTargetLoadAction::ELoad);
+				}
+				P->PixelShader.RenderTargets.DepthStencil = FDepthStencilBinding(FrontDepth, ERenderTargetLoadAction::ELoad, ERenderTargetLoadAction::ELoad, FExclusiveDepthStencil::DepthRead_StencilNop);
+				GraphBuilder.AddPass(
+					RDG_EVENT_NAME("GSRasterizeFront %d", Batch),
+					P,
+					ERDGPassFlags::Raster,
+					[P, FrontVS, FrontPS, Batch, ViewRect = ViewInfo.ViewRect](FRHICommandList& RHICmdList)
+					{
+						RHICmdList.SetViewport(ViewRect.Min.X, ViewRect.Min.Y, 0.0f, ViewRect.Max.X, ViewRect.Max.Y, 1.0f);
+						FGraphicsPipelineStateInitializer GraphicsPSOInit;
+						RHICmdList.ApplyCachedRenderTargets(GraphicsPSOInit);
+						GraphicsPSOInit.BlendState = FFrontBlendState::GetRHI();
+						GraphicsPSOInit.RasterizerState = TStaticRasterizerState<FM_Solid, CM_None>::GetRHI();
+						GraphicsPSOInit.DepthStencilState = FUnlitDepthStencilState::GetRHI();
+						GraphicsPSOInit.BoundShaderState.VertexDeclarationRHI = GEmptyVertexDeclaration.VertexDeclarationRHI;
+						GraphicsPSOInit.BoundShaderState.VertexShaderRHI = FrontVS.GetVertexShader();
+						GraphicsPSOInit.BoundShaderState.PixelShaderRHI = FrontPS.GetPixelShader();
+						GraphicsPSOInit.PrimitiveType = PT_TriangleStrip;
+						SetGraphicsPipelineState(RHICmdList, GraphicsPSOInit, 0);
+						SetShaderParameters(RHICmdList, FrontVS, FrontVS.GetVertexShader(), P->VertexShader);
+						SetShaderParameters(RHICmdList, FrontPS, FrontPS.GetPixelShader(), P->PixelShader);
+						RHICmdList.DrawPrimitiveIndirect(P->VertexShader.Base.IndirectArgs->GetIndirectRHICallBuffer(), uint32(Batch) * sizeof(FRHIDrawIndirectParameters));
+					}
+				);
+				if (Batch + 1 < FrontBatches)
+				{
+					FGSFrontSaturatePS::FParameters* Saturate = GraphBuilder.AllocParameters<FGSFrontSaturatePS::FParameters>();
+					Saturate->FrontColor = Front;
+					Saturate->FrontOpaque = 0.996f;
+					Saturate->RenderTargets.DepthStencil = FDepthStencilBinding(FrontDepth, ERenderTargetLoadAction::ELoad, ERenderTargetLoadAction::ELoad, FExclusiveDepthStencil::DepthWrite_StencilNop);
+					FPixelShaderUtils::AddFullscreenPass(GraphBuilder, ShaderMap, RDG_EVENT_NAME("GSFrontSaturate %d", Batch),
+						TShaderMapRef<FGSFrontSaturatePS>(ShaderMap), Saturate, ViewInfo.ViewRect, nullptr, nullptr, FFrontSaturateDepthState::GetRHI());
+				}
+			}
+			FGSFrontCompositePS::FParameters* Composite = GraphBuilder.AllocParameters<FGSFrontCompositePS::FParameters>();
+			Composite->FrontColor = Front;
+			Composite->RenderTargets[0] = FRenderTargetBinding(SceneColor, ERenderTargetLoadAction::ELoad);
+			FPixelShaderUtils::AddFullscreenPass(GraphBuilder, ShaderMap, RDG_EVENT_NAME("GSFrontComposite"),
+				TShaderMapRef<FGSFrontCompositePS>(ShaderMap), Composite, ViewInfo.ViewRect, FFrontCompositeBlendState::GetRHI());
+			if (FrontVelocity != nullptr)
+			{
+				FGSFrontVelocityPS::FParameters* Velocity = GraphBuilder.AllocParameters<FGSFrontVelocityPS::FParameters>();
+				Velocity->View = InView.ViewUniformBuffer;
+				Velocity->FrontNearest = FrontVelocity;
+				Velocity->RenderTargets[0] = FRenderTargetBinding(SceneVelocity, ERenderTargetLoadAction::ELoad);
+				FPixelShaderUtils::AddFullscreenPass(GraphBuilder, ShaderMap, RDG_EVENT_NAME("GSFrontVelocity"),
+					TShaderMapRef<FGSFrontVelocityPS>(ShaderMap), Velocity, ViewInfo.ViewRect);
+			}
+		}
+		else
 		GraphBuilder.AddPass(
 			RDG_EVENT_NAME("GSRasterizePass"),
 			PassParameters,
@@ -802,5 +1068,6 @@ void FGSViewExtension::GaussianSplattingPass(
 			RasterIndirectArgsBuffer,
 			sizeof(uint32)
 		);
+		GPUStats->SetStatFromGPU(GraphBuilder, FGSGPUStats::Stat_LodBudgetScale, LodBudget, 0);
 	}
 }

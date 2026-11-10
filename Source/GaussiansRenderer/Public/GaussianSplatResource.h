@@ -14,10 +14,16 @@ BEGIN_UNIFORM_BUFFER_STRUCT(FGaussianSplatShaderResources, GAUSSIANSRENDERER_API
 	SHADER_PARAMETER_SRV(StructuredBuffer<float3>, Scales)
 	SHADER_PARAMETER_SRV(StructuredBuffer<float4>, Orientations)
 	SHADER_PARAMETER_SRV(StructuredBuffer<float4>, SHAndOpacities)
+	// athenea: a .athc's packed arrays kept resident in place of the decoded
+	// ones (GSSplatData.ush): positions and opacity, four shape words a splat.
+	SHADER_PARAMETER(uint32, PackedResident)
+	SHADER_PARAMETER(float, PackedUnitsToCm)
+	SHADER_PARAMETER_SRV(StructuredBuffer<float4>, PackedPositions)
+	SHADER_PARAMETER_SRV(StructuredBuffer<uint>, PackedShape)
 
 	// Optional buffers
 	SHADER_PARAMETER_SRV(StructuredBuffer<float3>, Normals)
-	SHADER_PARAMETER_SRV(StructuredBuffer<float>, HighOrderSH)
+	SHADER_PARAMETER_SRV(StructuredBuffer<uint>, HighOrderSH)   // halves, 46 a splat (GSColor.ush)
 	SHADER_PARAMETER_SRV(StructuredBuffer<float2>, MetallicRoughness)
 
 	// athenea: how the colour is read (GS_COLOR_* in GSCompute.usf), and the
@@ -45,10 +51,17 @@ BEGIN_UNIFORM_BUFFER_STRUCT(FGaussianSplatShaderResources, GAUSSIANSRENDERER_API
 	SHADER_PARAMETER(uint32, LodLevels)
 	SHADER_PARAMETER(uint32, LodFinestLevel)
 	SHADER_PARAMETER(uint32, LodFinestBase)
+	SHADER_PARAMETER_ARRAY(FUintVector4, LodLevelRuns, [12])
 	SHADER_PARAMETER(float, LodExtent)
 	SHADER_PARAMETER(FVector3f, LodBoundsLo)
 	SHADER_PARAMETER(float, LodUnitsToCm)
 	SHADER_PARAMETER_SRV(StructuredBuffer<uint>, LodWords)
+	// athenea: where each finest-level group's splats begin (the splats are in
+	// the groups' order), the first group element, and the finest groups' count.
+	SHADER_PARAMETER_SRV(StructuredBuffer<uint>, LodGroupStarts)
+	SHADER_PARAMETER(uint32, LodSplatsEnd)
+	SHADER_PARAMETER(uint32, LodFinestGroups)
+	SHADER_PARAMETER(uint32, LodGroupRuns)
 
 	// athenea: a medium of gaussians (FGaussianSplatData::bVolume): sigma and
 	// temperature a gaussian, and the medium's constants (GSCompute.usf).
@@ -112,6 +125,11 @@ public:
 	// Gets splat count from CPU copy of splat data
 	uint32 GetSplatCount() const { return SplatData.SplatCount; }
 	uint32 GetLodLevels() const { return LodLevels; }
+	// athenea: the finest merged level's groups (0: no levels, or a paged tree).
+	uint32 GetLodFinestGroups() const { return LodFinestGroups; }
+	// athenea: the finest groups whose splats are one run each, in order (0: not so, or not known).
+	uint32 GetLodGroupRuns() const { return LodGroupRuns == LodFinestGroups ? LodGroupRuns : 0u; }
+	uint32 GetLodSplatsEnd() const { return LodSplatsEnd; }
 	bool IsVolume() const { return bVolume; }
 	// Checks from CPU copy of splat data if this resource supports relighting
 	bool SupportsRelighting() const { return SplatData.SupportsRelighting(); }
@@ -164,7 +182,14 @@ private:
 	FBufferResources CurvatureBuffer;
 	// athenea: a .athc's levels of detail, two words a gaussian.
 	FBufferResources LodWordsBuffer;
+	FBufferResources LodGroupStartsBuffer;
+	uint32 LodGroupRuns = 0;
+	uint32 LodSplatsEnd = 0;
+	FBufferResources PackedPositionsBuffer;
+	FBufferResources PackedShapeBuffer;
+	bool bPackedResident = false;
 	FBufferResources VolumeBuffer;
 	bool bVolume = false;
 	uint32 LodLevels = 0;
+	uint32 LodFinestGroups = 0;
 };

@@ -19,14 +19,16 @@
 //   each chunk    positions (16 B a splat), shape (16 B), SH (4 * shWords B),
 //                 then the finest group, normals, emission, extras
 
-#include "GSplatImporter.h"
+#include "GSplatRuntimeImport.h"
 #include "GSplatImportData.h"
+#include "GenericPlatform/GenericPlatformFile.h"
+#include "HAL/PlatformFileManager.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
 
-#if WITH_EDITOR
 
 #include "AtheneaCodecs.h"
 #include "GaussianData.h"
-#include "GaussiansEditorModule.h"
 #include "HAL/PlatformFileManager.h"
 #include "Misc/Paths.h"
 
@@ -95,7 +97,7 @@ namespace GSplatAthc3
 	{
 		auto Fail = [&](const FString& Why)
 		{
-			UE_LOG(LogGSplatEditor, Error, TEXT("%s: %s"), *Filename, *Why);
+			UE_LOG(LogGSplatImport, Error, TEXT("%s: %s"), *Filename, *Why);
 			return false;
 		};
 		uint8 H[176];
@@ -437,7 +439,7 @@ namespace GSplatAthc3
 		const FString TransferText = bTransfer
 			? FString::Printf(TEXT("of %u values%s%s"), TransferCount, bCpca ? TEXT(", CPCA") : TEXT(""), Splats.CellWords ? TEXT(", cells") : TEXT(""))
 			: TransferCount > 0 ? FString::Printf(TEXT("of %u values not drawn (zonal or another layout)"), TransferCount) : FString(TEXT("none"));
-		UE_LOG(LogGSplatEditor, Display, TEXT("%s: %u gaussians in %u blocks%s, .athc version 3 (CORE encoding %u), %u rest coefficients a colour, %s colour, transfer %s; the levels not read."),
+		UE_LOG(LogGSplatImport, Display, TEXT("%s: %u gaussians in %u blocks%s, .athc version 3 (CORE encoding %u), %u rest coefficients a colour, %s colour, transfer %s; the levels not read."),
 			*Filename, Count, Used, TreeNodes > 0 ? *FString::Printf(TEXT(" (a paged tree of %u merges, cut each frame by r.Gaussians.Athenea.LodPixels)"), TreeNodes)
 				: Pages > 0 ? TEXT(" (error-band pages: the merges drawn at no opacity, the leaves alone seen)") : TEXT(""),
 			Encoding[0], RestPerColour, (Flags & kAthcLinear) ? TEXT("linear") : TEXT("sRGB"), *TransferText);
@@ -453,7 +455,7 @@ namespace GSplatAthc3
 	{
 		auto Fail = [&](const FString& Why)
 		{
-			UE_LOG(LogGSplatEditor, Error, TEXT("%s: %s"), *Filename, *Why);
+			UE_LOG(LogGSplatImport, Error, TEXT("%s: %s"), *Filename, *Why);
 			return false;
 		};
 		const uint32 PbrWords = Extra[0], LobesWords = Extra[1], TransferCount = Extra[2], TransferWords = Extra[3], ShadowWords = Extra[4];
@@ -490,7 +492,7 @@ namespace GSplatAthc3
 		const FAthcLevel* Finest = Levels.FindByPredicate([&](const FAthcLevel& L) { return L.Level == FinestLevel; });
 		if (Levels.Num() > 0 && (Finest == nullptr || Finest->Groups != H.FinestGroups))
 		{
-			UE_LOG(LogGSplatEditor, Warning, TEXT("%s: levels that do not add up; the splats alone are read."), *Filename);
+			UE_LOG(LogGSplatImport, Warning, TEXT("%s: levels that do not add up; the splats alone are read."), *Filename);
 			Levels.Empty();
 			Groups = 0;
 		}
@@ -618,7 +620,7 @@ namespace GSplatAthc3
 		Box += FVector(SwizzleVector(H.BoundsMin[0], H.BoundsMin[1], H.BoundsMin[2], Swizzle) * ImportData.ScaleFactor);
 		Box += FVector(SwizzleVector(H.BoundsMax[0], H.BoundsMax[1], H.BoundsMax[2], Swizzle) * ImportData.ScaleFactor);
 		Splats.SetBounds(FBoxSphereBounds(Box));
-		UE_LOG(LogGSplatEditor, Display, TEXT("%s: %u gaussians in %d chunks, .athc version 2 with a transfer of %u values%s, %u rest coefficients a colour, %s colour; %d levels of detail (%llu merged groups), cut each frame by r.Gaussians.Athenea.LodPixels."),
+		UE_LOG(LogGSplatImport, Display, TEXT("%s: %u gaussians in %d chunks, .athc version 2 with a transfer of %u values%s, %u rest coefficients a colour, %s colour; %d levels of detail (%llu merged groups), cut each frame by r.Gaussians.Athenea.LodPixels."),
 			*Filename, H.Count, Chunks.Num(), TransferCount, Splats.CellWords ? TEXT(" and cells") : TEXT(""), H.RestPerColour,
 			(H.Flags & kAthcLinear) ? TEXT("linear") : TEXT("sRGB"), Levels.Num(), Groups);
 		return true;
@@ -635,7 +637,7 @@ bool GSplatImporter::ImportAthc(const FString& Filename, UGSplatImportData& Impo
 	TUniquePtr<IFileHandle> File(FPlatformFileManager::Get().GetPlatformFile().OpenRead(*Filename));
 	if (!File)
 	{
-		UE_LOG(LogGSplatEditor, Error, TEXT("Cannot open %s."), *Filename);
+		UE_LOG(LogGSplatImport, Error, TEXT("Cannot open %s."), *Filename);
 		return false;
 	}
 
@@ -646,18 +648,18 @@ bool GSplatImporter::ImportAthc(const FString& Filename, UGSplatImportData& Impo
 	}
 	if (!ReadAt(*File, 0, &H, sizeof(H)) || FMemory::Memcmp(H.Magic, "ATHC", 4) != 0)
 	{
-		UE_LOG(LogGSplatEditor, Error, TEXT("%s: no ATHC magic."), *Filename);
+		UE_LOG(LogGSplatImport, Error, TEXT("%s: no ATHC magic."), *Filename);
 		return false;
 	}
 	if (H.Version < 1 || H.Version > 2)
 	{
-		UE_LOG(LogGSplatEditor, Error, TEXT("%s: version %u, this reads 1 and 2."), *Filename, H.Version);
+		UE_LOG(LogGSplatImport, Error, TEXT("%s: version %u, this reads 1 and 2."), *Filename, H.Version);
 		return false;
 	}
 	if (H.Count == 0 || H.ChunkSplats == 0 || H.Chunks != (uint64(H.Count) + H.ChunkSplats - 1) / H.ChunkSplats
 		|| H.RestPerColour > 15 || (H.SHWords != (H.RestPerColour * 3 + 1) / 2 && !(H.RestPerColour == 0 && H.SHWords == 1)))
 	{
-		UE_LOG(LogGSplatEditor, Error, TEXT("%s: a header that does not add up (%u splats, %u chunks of %u, %u rest, %u words)."),
+		UE_LOG(LogGSplatImport, Error, TEXT("%s: a header that does not add up (%u splats, %u chunks of %u, %u rest, %u words)."),
 			*Filename, H.Count, H.Chunks, H.ChunkSplats, H.RestPerColour, H.SHWords);
 		return false;
 	}
@@ -666,7 +668,7 @@ bool GSplatImporter::ImportAthc(const FString& Filename, UGSplatImportData& Impo
 	Chunks.SetNumUninitialized(H.Chunks);
 	if (!ReadAt(*File, H.ChunkTable, Chunks.GetData(), uint64(H.Chunks) * sizeof(FAthcChunk)))
 	{
-		UE_LOG(LogGSplatEditor, Error, TEXT("%s: the chunk table is cut short."), *Filename);
+		UE_LOG(LogGSplatImport, Error, TEXT("%s: the chunk table is cut short."), *Filename);
 		return false;
 	}
 	// A TX cloud's chunks carry the material, the transfer and the cells after
@@ -677,7 +679,7 @@ bool GSplatImporter::ImportAthc(const FString& Filename, UGSplatImportData& Impo
 		uint32 Extra[8];
 		if (!ReadAt(*File, 104, Extra, sizeof(Extra)))
 		{
-			UE_LOG(LogGSplatEditor, Error, TEXT("%s: the extra header is cut short."), *Filename);
+			UE_LOG(LogGSplatImport, Error, TEXT("%s: the extra header is cut short."), *Filename);
 			return false;
 		}
 		return GSplatAthc3::FromV2(*File, Filename, H, Extra, Chunks, ImportData, Splats);
@@ -702,7 +704,7 @@ bool GSplatImporter::ImportAthc(const FString& Filename, UGSplatImportData& Impo
 		Levels.SetNumUninitialized(H.Levels);
 		if (!ReadAt(*File, H.LevelTable, Levels.GetData(), uint64(H.Levels) * sizeof(FAthcLevel)))
 		{
-			UE_LOG(LogGSplatEditor, Warning, TEXT("%s: the level table is cut short; the splats alone are read."), *Filename);
+			UE_LOG(LogGSplatImport, Warning, TEXT("%s: the level table is cut short; the splats alone are read."), *Filename);
 			Levels.Empty();
 		}
 	}
@@ -717,7 +719,7 @@ bool GSplatImporter::ImportAthc(const FString& Filename, UGSplatImportData& Impo
 	const FAthcLevel* Finest = Levels.FindByPredicate([&](const FAthcLevel& L) { return L.Level == FinestLevel; });
 	if (Levels.Num() > 0 && (Finest == nullptr || Finest->Groups != H.FinestGroups || Total > 0x7FFFFFFF))
 	{
-		UE_LOG(LogGSplatEditor, Warning, TEXT("%s: levels that do not add up (finest %u groups where the header says %u); the splats alone are read."),
+		UE_LOG(LogGSplatImport, Warning, TEXT("%s: levels that do not add up (finest %u groups where the header says %u); the splats alone are read."),
 			*Filename, Finest ? Finest->Groups : 0u, H.FinestGroups);
 		Levels.Empty();
 		Total = H.Count;
@@ -750,7 +752,7 @@ bool GSplatImporter::ImportAthc(const FString& Filename, UGSplatImportData& Impo
 		const uint32 Expected = FMath::Min(H.ChunkSplats, H.Count - c * H.ChunkSplats);
 		if (Chunk.Count != Expected)
 		{
-			UE_LOG(LogGSplatEditor, Error, TEXT("%s: chunk %u holds %u splats, where %u were due."), *Filename, c, Chunk.Count, Expected);
+			UE_LOG(LogGSplatImport, Error, TEXT("%s: chunk %u holds %u splats, where %u were due."), *Filename, c, Chunk.Count, Expected);
 			return false;
 		}
 		const uint64 n = Chunk.Count;
@@ -760,7 +762,7 @@ bool GSplatImporter::ImportAthc(const FString& Filename, UGSplatImportData& Impo
 			&& (H.SHWords == 0 || ReadAt(*File, Chunk.Offset + n * 32, &Splats.PackedSH[Done * H.SHWords], n * 4 * H.SHWords));
 		if (!bRead)
 		{
-			UE_LOG(LogGSplatEditor, Error, TEXT("%s: chunk %u is cut short."), *Filename, c);
+			UE_LOG(LogGSplatImport, Error, TEXT("%s: chunk %u is cut short."), *Filename, c);
 			return false;
 		}
 		if (Levels.Num() > 0)
@@ -769,7 +771,7 @@ bool GSplatImporter::ImportAthc(const FString& Filename, UGSplatImportData& Impo
 			Tail.SetNumUninitialized(int32(n));
 			if (!ReadAt(*File, Chunk.Offset + n * TailAfter, Tail.GetData(), n * 4))
 			{
-				UE_LOG(LogGSplatEditor, Error, TEXT("%s: chunk %u's groups are cut short."), *Filename, c);
+				UE_LOG(LogGSplatImport, Error, TEXT("%s: chunk %u's groups are cut short."), *Filename, c);
 				return false;
 			}
 			for (uint64 i = 0; i < n; i++)
@@ -796,7 +798,7 @@ bool GSplatImporter::ImportAthc(const FString& Filename, UGSplatImportData& Impo
 			&& ReadAt(*File, L.Offset + n * TailAfter, Tail.GetData(), n * 4);
 		if (!bRead)
 		{
-			UE_LOG(LogGSplatEditor, Error, TEXT("%s: level %u is cut short."), *Filename, L.Level);
+			UE_LOG(LogGSplatImport, Error, TEXT("%s: level %u is cut short."), *Filename, L.Level);
 			return false;
 		}
 		// Each group's cell code and level (and whether it is the coarsest kept).
@@ -830,9 +832,8 @@ bool GSplatImporter::ImportAthc(const FString& Filename, UGSplatImportData& Impo
 	Box += FVector(B);
 	Splats.SetBounds(FBoxSphereBounds(Box));
 
-	UE_LOG(LogGSplatEditor, Display, TEXT("%s: %u gaussians in %u chunks, %u rest coefficients a colour, %s colour; %d levels of detail (%llu merged groups), cut each frame by r.Gaussians.Athenea.LodPixels."),
+	UE_LOG(LogGSplatImport, Display, TEXT("%s: %u gaussians in %u chunks, %u rest coefficients a colour, %s colour; %d levels of detail (%llu merged groups), cut each frame by r.Gaussians.Athenea.LodPixels."),
 		*Filename, H.Count, H.Chunks, H.RestPerColour, (H.Flags & kAthcLinear) ? TEXT("linear") : TEXT("sRGB"), Levels.Num(), Total - H.Count);
 	return true;
 }
 
-#endif // WITH_EDITOR

@@ -2,6 +2,7 @@
 #include "/Engine/Private/ComputeShaderUtils.ush"
 
 #include "/Engine/Generated/GeneratedUniformBuffers.ush"
+#include "GSSplatData.ush"
 
 #ifndef ENABLE_RELIGHTING
 #define ENABLE_RELIGHTING false
@@ -36,10 +37,10 @@ void GSExportPassCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 		uint SplatIndex = IndexBuffer[Index];
 
 		// Copy data into output buffers
-		RWPositions[Index] = GSResources.Positions[SplatIndex];
-		RWScales[Index] = GSResources.Scales[SplatIndex];
-		RWOrientations[Index] = GSResources.Orientations[SplatIndex];
-		RWSHAndOpacities[Index] = GSResources.SHAndOpacities[SplatIndex];
+		RWPositions[Index] = GSPos(SplatIndex);
+		RWScales[Index] = GSScl(SplatIndex);
+		RWOrientations[Index] = GSRot(SplatIndex);
+		RWSHAndOpacities[Index] = GSShOp(SplatIndex);
 
 		RWNormals[Index] = GSResources.Normals[SplatIndex];
 		RWMetallicRoughness[Index] = GSResources.MetallicRoughness[SplatIndex];

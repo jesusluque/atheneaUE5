@@ -24,13 +24,15 @@
 // curvature is read with the transfer. Layer K (a rig) is not read. The
 // header's and the pages' CRCs are checked before anything is decoded.
 
-#include "GSplatImporter.h"
+#include "GSplatRuntimeImport.h"
 #include "GSplatImportData.h"
+#include "GenericPlatform/GenericPlatformFile.h"
+#include "HAL/PlatformFileManager.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
 
-#if WITH_EDITOR
 
 #include "GaussianData.h"
-#include "GaussiansEditorModule.h"
 #include "Misc/Crc.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
@@ -76,7 +78,7 @@ bool GSplatImporter::ImportAthzCloud(const FString& Filename, UGSplatImportData&
 	using namespace GSplatAthz;
 	auto Fail = [&](const FString& Why)
 	{
-		UE_LOG(LogGSplatEditor, Error, TEXT("%s: %s"), *Filename, *Why);
+		UE_LOG(LogGSplatImport, Error, TEXT("%s: %s"), *Filename, *Why);
 		return false;
 	};
 	TArray<uint8> File;
@@ -242,11 +244,18 @@ bool GSplatImporter::ImportAthzCloud(const FString& Filename, UGSplatImportData&
 		FieldBases.Add(Lay(L.Groups));
 	}
 	FieldBases.Add(Lay(Count));
-	// A CPCA transfer's values, expanded from the splats' codes.
+	// A CPCA transfer's values, expanded from the splats' codes, then from
+	// each level's (its merged groups are drawn too, and lit as the splats).
 	const uint32 CpcaOut = uint32(FMath::Min<uint64>(Scratch, 0xFFFFFFFFull));
+	TArray<uint32> LevelCpcaOut;
 	if (bTransfer && bCpca)
 	{
 		Scratch += uint64(Count) * TransferWords * 4;
+		for (const FLevel& L : Levels)
+		{
+			LevelCpcaOut.Add(uint32(FMath::Min<uint64>(Scratch, 0xFFFFFFFFull)));
+			Scratch += uint64(L.Groups) * TransferWords * 4;
+		}
 	}
 	if (Scratch > 0xFFFFFFF0ull)
 	{
@@ -387,6 +396,13 @@ bool GSplatImporter::ImportAthzCloud(const FString& Filename, UGSplatImportData&
 		const uint32 CpcaHead[11] = { Count, CpcaClusters, CpcaComponents, *reinterpret_cast<const uint32*>(&CpcaLevels),
 			MeanAt[0], MeanAt[1], MeanAt[2], BasisAt, FieldBases.Last()[8], CpcaOut, TransferWords };
 		Bytes.Append(reinterpret_cast<const uint8*>(CpcaHead), sizeof(CpcaHead));
+		// One head a level after the splats' (PackedSpz.Z says how many in all).
+		for (int32 l = 0; l < Levels.Num(); l++)
+		{
+			const uint32 LevelHead[11] = { Levels[l].Groups, CpcaClusters, CpcaComponents, *reinterpret_cast<const uint32*>(&CpcaLevels),
+				MeanAt[0], MeanAt[1], MeanAt[2], BasisAt, FieldBases[l][8], LevelCpcaOut[l], TransferWords };
+			Bytes.Append(reinterpret_cast<const uint8*>(LevelHead), sizeof(LevelHead));
+		}
 	}
 
 	// The splats as a .athc v3 block whose sections are in Scratch.
@@ -419,29 +435,66 @@ bool GSplatImporter::ImportAthzCloud(const FString& Filename, UGSplatImportData&
 	{
 		Set(8, CurvatureWords, { CurvatureWords });
 	}
-	TArray<uint32> Block;
-	Block.SetNumZeroed(kBlockWords);
-	Block[0] = 0;
-	Block[1] = Count;
-	auto Section = [&](uint32 k, uint32 Base)
+	// A block for the splats, then one a merged level: its groups follow the
+	// splats in the asset, decoded as they are and cut every frame
+	// (GSplatCulling.usf), as a .athc's levels.
+	TArray<uint32> Blocks;
+	auto AddBlock = [&](uint32 First, uint32 N, const TArray<uint32>& Bases, uint32 TransferBase)
 	{
-		Block[2 + k * 3] = 0;
-		Block[3 + k * 3] = kScratchWords;
-		Block[4 + k * 3] = Base;
+		TArray<uint32> Block;
+		Block.SetNumZeroed(kBlockWords);
+		Block[0] = First;
+		Block[1] = N;
+		for (uint32 k = 0; k < kSections; k++)
+		{
+			Block[2 + k * 3] = kNone;
+		}
+		auto Section = [&](uint32 k, uint32 Base)
+		{
+			Block[2 + k * 3] = 0;
+			Block[3 + k * 3] = kScratchWords;
+			Block[4 + k * 3] = Base;
+		};
+		Section(0, Bases[0]);             // positions, then shape
+		Section(1, Bases[2]);             // harmonics
+		Section(3, Bases[4]);             // normals, emission, pbr, lobes
+		Section(4, Bases[9]);             // open directions
+		Section(5, TransferBase);         // the transfer, expanded where it is CPCA
+		Section(8, Bases[10]);            // the curvature
+		Blocks.Append(Block);
 	};
-	for (uint32 k = 0; k < kSections; k++)
+	AddBlock(0, Count, Leaf, bCpca ? CpcaOut : Leaf[8]);
+	uint32 Groups = 0;
+	TArray<uint32> LevelFirst;
+	for (int32 l = 0; l < Levels.Num(); l++)
 	{
-		Block[2 + k * 3] = kNone;
+		LevelFirst.Add(Count + Groups);
+		AddBlock(Count + Groups, Levels[l].Groups, FieldBases[l], bCpca && bTransfer ? LevelCpcaOut[l] : FieldBases[l][8]);
+		Groups += Levels[l].Groups;
 	}
-	Section(0, Leaf[0]);              // positions, then shape
-	Section(1, Leaf[2]);              // harmonics
-	Section(3, Leaf[4]);              // normals, emission, pbr, lobes
-	Section(4, Leaf[9]);              // open directions
-	Section(5, bCpca ? CpcaOut : Leaf[8]);   // the transfer, expanded where it is CPCA
-	Section(8, Leaf[10]);             // the curvature
+	const uint32 Total = Count + Groups;
 	const uint32 TableAt = uint32(Bytes.Num());
 	Bytes.Append(reinterpret_cast<const uint8*>(Desc), sizeof(Desc));
-	Bytes.Append(reinterpret_cast<const uint8*>(Block.GetData()), Block.Num() * 4);
+	Bytes.Append(reinterpret_cast<const uint8*>(Blocks.GetData()), Blocks.Num() * 4);
+	// What GSAthzLodCS writes the levels' words from: the rows, then a row a
+	// block -- first element, elements, its word (kLodLeaf for the splats, the
+	// level and kLodCoarsest for the coarsest), where its tail is in Scratch
+	// (a splat's finest group, a group's octree cell).
+	const uint32 LodAt = uint32(Bytes.Num());
+	{
+		TArray<uint32> Rows = { uint32(Levels.Num()) + 1u, Total, Count, 0x80000000u, Leaf[3] };
+		uint32 Coarsest = ~0u;
+		for (const FLevel& L : Levels)
+		{
+			Coarsest = FMath::Min(Coarsest, L.Level);
+		}
+		for (int32 l = 0; l < Levels.Num(); l++)
+		{
+			Rows.Append({ LevelFirst[l], Levels[l].Groups, Levels[l].Level | (Levels[l].Level == Coarsest ? 0x40000000u : 0u), FieldBases[l][3] });
+		}
+		Rows.Insert(0u, 2);   // the splats' first element
+		Bytes.Append(reinterpret_cast<const uint8*>(Rows.GetData()), Rows.Num() * 4);
+	}
 
 	ImportData.Swizzle = { EGSplatSwizzleAxis::X, EGSplatSwizzleAxis::Z, EGSplatSwizzleAxis::Y };
 	ImportData.ScaleFactor = 100.0f;
@@ -454,16 +507,46 @@ bool GSplatImporter::ImportAthzCloud(const FString& Filename, UGSplatImportData&
 	Splats.Empty();
 	Splats.bPacked = true;
 	Splats.PackedFormat = 6;
-	Splats.SplatCount = Count;
+	Splats.SplatCount = Total;
 	Splats.bHasHighOrderSH = ImportData.bHasHighOrderSH && ImportData.bImportHighOrderSH;
 	Splats.PackedUnitsToCm = ImportData.ScaleFactor;
 	Splats.PackedBytes = MoveTemp(Bytes);
 	// The .athc flags the decoders read (normals bit 0, linear 1, emission 2, material 4, transfer 5).
 	const uint32 AthcFlags = (Normals ? 1u : 0u) | ((Flags & kFlagLinear) ? 2u : 0u) | (Emission ? 4u : 0u)
 		| (PbrWords > 0 ? 16u : 0u) | (bTransfer ? 32u : 0u);
-	Splats.PackedStreams = { TableAt, 1u, SHWords, Splats.bHasHighOrderSH ? RestPerColour : 0u,
-		uint32(Scratch), bTransfer ? TransferCount : 0u, AthcFlags, 0u };
-	Splats.PackedSpz = FIntVector(int32(HeadAt), int32(CpcaAt), 0);
+	Splats.PackedStreams = { TableAt, 1u + uint32(Levels.Num()), SHWords, Splats.bHasHighOrderSH ? RestPerColour : 0u,
+		uint32(Scratch), bTransfer ? TransferCount : 0u, AthcFlags, 0u, LodAt };
+	Splats.PackedSpz = FIntVector(int32(HeadAt), int32(CpcaAt), bCpca && bTransfer ? 1 + Levels.Num() : 0);
+	// The levels' words are written on the device (GSAthzLodCS): the cut's
+	// octree is the file's, the finest level's groups after the coarser ones.
+	if (Levels.Num() > 0)
+	{
+		const FLevel* Finest = &Levels[0];
+		int32 FinestIndex = 0;
+		for (int32 l = 0; l < Levels.Num(); l++)
+		{
+			if (Levels[l].Level > Finest->Level)
+			{
+				Finest = &Levels[l];
+				FinestIndex = l;
+			}
+		}
+		Splats.LodLevels = uint32(Levels.Num());
+		Splats.LodFinestLevel = Finest->Level;
+		Splats.LodFinestBase = LevelFirst[FinestIndex];
+		// Each level's run, by level number (the morph's parents).
+		Splats.LodLevelRuns.Init(0u, FGaussianSplatData::kLodLevelRuns * 2);
+		for (int32 l = 0; l < Levels.Num(); l++)
+		{
+			if (Levels[l].Level < uint32(FGaussianSplatData::kLodLevelRuns))
+			{
+				Splats.LodLevelRuns[int32(Levels[l].Level) * 2] = LevelFirst[l];
+				Splats.LodLevelRuns[int32(Levels[l].Level) * 2 + 1] = Levels[l].Groups;
+			}
+		}
+		Splats.LodBoundsLo = FVector3f(BoundsLo[0], BoundsLo[1], BoundsLo[2]);
+		Splats.LodExtent = Extent;
+	}
 	const uint32 Direct = (TransferCount == 9 || TransferCount == 36 || TransferCount == 84) ? 9u
 		: (TransferCount == 16 || TransferCount == 64 || TransferCount == 112) ? 16u : 0u;
 	if (bTransfer && Direct > 0)
@@ -485,11 +568,10 @@ bool GSplatImporter::ImportAthzCloud(const FString& Filename, UGSplatImportData&
 	Box += FVector(SwizzleVector(BoundsMax[0], BoundsMax[1], BoundsMax[2], Swizzle) * ImportData.ScaleFactor);
 	Splats.SetBounds(FBoxSphereBounds(Box));
 
-	UE_LOG(LogGSplatEditor, Display, TEXT("%s: %u gaussians, .athz version %u, %d merged levels decoded as their parents, %u pages, transfer %s, curvature %s, CRCs checked."),
-		*Filename, Count, Version, Levels.Num(), LeafFirstPage + LeafPages,
+	UE_LOG(LogGSplatImport, Display, TEXT("%s: %u gaussians, .athz version %u, %d merged levels (%u groups) cut each frame by r.Gaussians.Athenea.LodPixels, %u pages, transfer %s, curvature %s, CRCs checked."),
+		*Filename, Count, Version, Levels.Num(), Groups, LeafFirstPage + LeafPages,
 		bTransfer ? *FString::Printf(TEXT("of %u values%s"), TransferCount, bCpca ? *FString::Printf(TEXT(" as CPCA codes (%u clusters)"), CpcaClusters) : TEXT("")) : TEXT("none"),
 		bCurvature && bTransfer ? TEXT("read") : TEXT("none"));
 	return true;
 }
 
-#endif // WITH_EDITOR

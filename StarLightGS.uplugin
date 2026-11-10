@@ -1,7 +1,7 @@
 {
   "FileVersion": 3,
-  "Version": 2,
-  "VersionName": "1.1",
+  "Version": 3,
+  "VersionName": "1.2",
   "Modules": [
     {
       "Name": "GaussiansRenderer",
@@ -20,7 +20,7 @@
     },
     {
       "Name": "AtheneaCodecs",
-      "Type": "Editor",
+      "Type": "Runtime",
       "LoadingPhase": "Default"
     }
   ],

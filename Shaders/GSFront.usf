@@ -1,0 +1,78 @@
+// Copyright (c) 2026 jesus luque.
+// athenea: the splats drawn front to back (r.Gaussians.Athenea.FrontToBack).
+// Back to front, every gaussian of every layer is blended, the ones behind a
+// wall as the wall's own. Front to back -- into a buffer of their own, each
+// under what is already there -- a pixel that has reached full opacity takes
+// nothing more: the sorted splats go in batches, each twice the one before,
+// and after each a pass over the screen brings the depth of the opaque pixels
+// to the near plane, so the depth test drops what later batches would have
+// drawn behind them before it is shaded. The buffer goes over the scene last.
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/VelocityCommon.ush"
+
+// The batches: the sorted splats' count (the raster's indirect arguments),
+// and for each batch its draw arguments and its first splat.
+Buffer<uint> FrontCount;
+RWBuffer<uint> OutFrontArgs;
+RWBuffer<uint> OutFrontBatches;
+uint FrontBatchCount;
+
+[numthreads(1, 1, 1)]
+void GSFrontBatchesCS()
+{
+	const uint Count = FrontCount[1];
+	const uint Units = (1u << FrontBatchCount) - 1u;
+	uint Base = 0u;
+	for (uint i = 0u; i < FrontBatchCount; i++)
+	{
+		// Batch i ends at Count (2^(i+1) - 1) / (2^n - 1).
+		const float Share = float((1u << (i + 1u)) - 1u) / float(Units);
+		const uint End = i + 1u == FrontBatchCount ? Count : clamp(uint(float(Count) * Share), Base, Count);
+		OutFrontArgs[i * 4u] = 4u;
+		OutFrontArgs[i * 4u + 1u] = End - Base;
+		OutFrontArgs[i * 4u + 2u] = 0u;
+		OutFrontArgs[i * 4u + 3u] = 0u;
+		OutFrontBatches[i] = Base;
+		Base = End;
+	}
+}
+
+Texture2D<float4> FrontColor;
+float FrontOpaque;
+
+// A pixel as opaque as a frame can show: nothing behind it is drawn.
+void GSFrontSaturatePS(float4 SvPosition : SV_POSITION, out float OutDepth : SV_Depth)
+{
+	if (FrontColor.Load(int3(SvPosition.xy, 0)).a < FrontOpaque)
+	{
+		discard;
+	}
+	OutDepth = NearDepthValue;
+}
+
+// The splats' buffer (premultiplied) over the scene.
+float4 GSFrontCompositePS(float4 SvPosition : SV_POSITION) : SV_Target0
+{
+	return FrontColor.Load(int3(SvPosition.xy, 0));
+}
+
+// The nearest showing splat's depth, where there is one, made the velocity the
+// scene keeps: where the point at that depth was on the screen a frame ago.
+Texture2D<float> FrontNearest;
+
+float4 GSFrontVelocityPS(float4 SvPosition : SV_POSITION) : SV_Target0
+{
+	const float DeviceZ = FrontNearest.Load(int3(SvPosition.xy, 0));
+	if (DeviceZ <= 0.0f)
+	{
+		discard;
+	}
+	float2 ClipPos = (((SvPosition.xy - PrimaryView.ViewRectMin.xy) * PrimaryView.ViewSizeAndInvSize.zw * 2.0f) - 1.0f) * float2(1.0f, -1.0f);
+	const float4 World = mul(float4(ClipPos, DeviceZ, 1.0f), PrimaryView.ClipToTranslatedWorld);
+	const float3 PrevTranslatedWorld = World.xyz / World.w + DFSubtractDemote(PrimaryView.PrevPreViewTranslation, PrimaryView.PreViewTranslation);
+	float4 PrevClip = mul(float4(PrevTranslatedWorld, 1.0f), PrimaryView.PrevTranslatedWorldToClip);
+	PrevClip.xyz /= PrevClip.w;
+	ClipPos -= PrimaryView.TemporalAAJitter.xy;
+	PrevClip.xy -= PrimaryView.TemporalAAJitter.zw;
+	return EncodeVelocityToTexture(float3(ClipPos - PrevClip.xy, DeviceZ - PrevClip.z));
+}

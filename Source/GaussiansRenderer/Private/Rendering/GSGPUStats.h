@@ -14,6 +14,8 @@ public:
 	{
 		Stat_LitSplatsRendered = 0,
 		Stat_UnlitSplatsRendered,
+		// athenea: the view's splat budget factor on LodPixels, as float bits
+		Stat_LodBudgetScale,
 
 		Stat_Count
 	};

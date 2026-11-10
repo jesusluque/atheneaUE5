@@ -216,6 +216,13 @@ struct GAUSSIANSRENDERER_API FGaussianSplatData
 	uint32 LodFinestLevel = 0;
 	UPROPERTY()
 	uint32 LodFinestBase = 0;
+	// Each merged level's groups, by level number: their first index and
+	// their count, a pair a level (the morph finds a group's parent in the
+	// level above, GSLod.ush). Empty: read from LodWords when the resource is
+	// made (an asset saved before the morph).
+	UPROPERTY()
+	TArray<uint32> LodLevelRuns;
+	static constexpr int32 kLodLevelRuns = 12;
 	UPROPERTY()
 	FVector3f LodBoundsLo = FVector3f::ZeroVector;
 	UPROPERTY()

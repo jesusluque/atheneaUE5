@@ -27,7 +27,24 @@ RWStructuredBuffer<float3> OutPositions;
 RWStructuredBuffer<float3> OutScales;
 RWStructuredBuffer<float4> OutOrientations;
 RWStructuredBuffer<float4> OutSHAndOpacities;
-RWStructuredBuffer<float> OutHighOrderSH;
+// athenea: the rest coefficients as halves, two a word, 46 a splat (45 and a
+// pad: no word holds two splats', so a thread writes its splat's words alone);
+// a cloud with none has a buffer of one word, and the writes past it are left
+// out (GSStoreSH).
+RWStructuredBuffer<uint> OutHighOrderSH;
+
+void GSStoreSH(uint h, float v)
+{
+	uint Words, Stride;
+	OutHighOrderSH.GetDimensions(Words, Stride);
+	const uint w = h >> 1;
+	if (w >= Words || Words <= 1u)
+	{
+		return;
+	}
+	const uint Bits = f32tof16(v) & 0xFFFFu;
+	OutHighOrderSH[w] = (h & 1u) != 0u ? ((OutHighOrderSH[w] & 0xFFFFu) | (Bits << 16)) : ((OutHighOrderSH[w] & 0xFFFF0000u) | Bits);
+}
 
 static const float kSqrtHalf = 0.70710678f;
 
@@ -99,12 +116,12 @@ void GSDecodeAtheneaCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	// Rest coefficient k of channel c where f_rest puts it: c * 15 + k. The
 	// bands the file does not hold are zero.
 	const uint ShRow = i * SHWords;
-	const uint Base = i * 45u;
+	const uint Base = i * 46u;
 	for (uint k = 0; k < 15u; ++k)
 	{
 		for (uint c = 0; c < 3u; ++c)
 		{
-			OutHighOrderSH[Base + c * 15u + k] = k < RestPerColour ? HalfAt(ShRow, k * 3u + c) : 0.0f;
+			GSStoreSH(Base + c * 15u + k, k < RestPerColour ? HalfAt(ShRow, k * 3u + c) : 0.0f);
 		}
 	}
 }
@@ -155,10 +172,10 @@ void GSDecodeSplatCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	const float4 C = float4(Rgba & 0xFFu, (Rgba >> 8) & 0xFFu, (Rgba >> 16) & 0xFFu, Rgba >> 24) / 255.0f;
 	const float4 Wxyz = (float4(Rot & 0xFFu, (Rot >> 8) & 0xFFu, (Rot >> 16) & 0xFFu, Rot >> 24) - 128.0f) / 128.0f;
 	WriteSplat(i, P, S, float4(Wxyz.yzw, Wxyz.x), C.rgb, C.a);
-	const uint Base = i * 45u;
+	const uint Base = i * 46u;
 	for (uint k = 0; k < 45u; ++k)
 	{
-		OutHighOrderSH[Base + k] = 0.0f;
+		GSStoreSH(Base + k, 0.0f);
 	}
 }
 
@@ -226,14 +243,14 @@ void GSDecodeSpzCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 		Q = float4(Xyz, sqrt(max(0.0f, 1.0f - dot(Xyz, Xyz))));
 	}
 	WriteSplat(i, P, S, Q, 0.5f + 0.28209479177387814f * Dc, Opacity);
-	const uint Base = i * 45u;
+	const uint Base = i * 46u;
 	for (uint k = 0; k < 15u; ++k)
 	{
 		for (uint ch = 0; ch < 3u; ++ch)
 		{
-			OutHighOrderSH[Base + ch * 15u + k] = k < SpzRest
+			GSStoreSH(Base + ch * 15u + k, k < SpzRest
 				? (float(ByteAt(Streams1.y + (i * SpzRest + k) * 3u + ch)) - 128.0f) / 128.0f
-				: 0.0f;
+				: 0.0f);
 		}
 	}
 }
@@ -321,10 +338,10 @@ void GSDecodeSogCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 
 	// Higher harmonics through the palette: the label names an entry, a row
 	// holds 64 entries of Keep texels.
-	const uint Base = i * 45u;
+	const uint Base = i * 46u;
 	for (uint k = 0; k < 45u; ++k)
 	{
-		OutHighOrderSH[Base + k] = 0.0f;
+		GSStoreSH(Base + k, 0.0f);
 	}
 	if (Keep == 0u)
 	{
@@ -340,8 +357,7 @@ void GSDecodeSogCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 		for (uint colour = 0; colour < 3u; ++colour)
 		{
 			const uint Byte = Channel(t, colour);
-			OutHighOrderSH[Base + colour * 15u + basis] =
-				Version == 2u ? SogFloat(22u + 512u + Byte) : Unlerp(SogFloat(20u), SogFloat(21u), Byte);
+			GSStoreSH(Base + colour * 15u + basis, Version == 2u ? SogFloat(22u + 512u + Byte) : Unlerp(SogFloat(20u), SogFloat(21u), Byte));
 		}
 	}
 }
@@ -437,14 +453,14 @@ void GSDecodeGltfCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	const float Opacity = OpacityA.w != 0u ? GltfRead(OpacityA, i, 0.0f).x : Color.a;
 	const float3 Base = DcA.w != 0u ? 0.5f + 0.28209479177387814f * GltfRead(DcA, i, 0.0f).rgb : Color.rgb;
 	WriteSplat(i, P, S, Q, Base, Opacity);
-	const uint Out = i * 45u;
+	const uint Out = i * 46u;
 	for (uint k = 0; k < 15u; ++k)
 	{
 		const uint4 A = GltfAccessor(6u + k);
 		const float3 v = k < SpzRest ? GltfRead(A, i, 0.0f).rgb : 0.0f;
 		[unroll] for (uint ch = 0; ch < 3u; ++ch)
 		{
-			OutHighOrderSH[Out + ch * 15u + k] = v[ch];
+			GSStoreSH(Out + ch * 15u + k, v[ch]);
 		}
 	}
 }
@@ -705,7 +721,7 @@ void GSDecodeAthc3CS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	OutSHAndOpacities[i] = float4(HighHalf(Shape.z), LowHalf(Shape.w), HighHalf(Shape.w), Merged && (Streams2.y & 4u) == 0u ? 0.0f : P.w);
 
 	const uint Kept = Streams0.w;
-	const uint Base = i * 45u;
+	const uint Base = i * 46u;
 	for (uint k2 = 0; k2 < 15u; ++k2)
 	{
 		for (uint c = 0; c < 3u; ++c)
@@ -717,7 +733,7 @@ void GSDecodeAthc3CS(uint3 DispatchThreadId : SV_DispatchThreadID)
 				const uint Word = Athc3Word(b, 1u, n, e, Index / 2u);
 				v = (Index & 1u) == 0u ? LowHalf(Word) : HighHalf(Word);
 			}
-			OutHighOrderSH[Base + c * 15u + k2] = v;
+			GSStoreSH(Base + c * 15u + k2, v);
 		}
 	}
 }
@@ -1375,5 +1391,52 @@ void GSAthzCpcaCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	if ((j & 1u) != 0u)
 	{
 		Scratch.Store(AthzCpca(9u) + (e * transferWords + j / 2u) * 4u, pending);
+	}
+}
+
+// athenea: AN .ATHZ'S LEVELS OF DETAIL. Its merged levels are decoded into
+// the scratch as its splats are, and drawn after them as blocks of their own;
+// the culling pass cuts them as a .athc's (GSplatCulling.usf), from two words
+// a gaussian written here: a splat's finest-level group and kLodLeaf, a
+// group's octree cell and its level (kLodCoarsest on the coarsest). At
+// FractionalBits (GSplatAthzImporter.cpp): the rows, the gaussians, then a row
+// a block -- first element, elements, its second word, where its tails are in
+// the scratch.
+RWStructuredBuffer<uint> OutLodWords;
+
+[numthreads(64, 1, 1)]
+void GSAthzLodCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint e = Offset + DispatchThreadId.x;
+	const uint Rows = InBytes.Load(FractionalBits);
+	if (e >= InBytes.Load(FractionalBits + 4u))
+	{
+		return;
+	}
+	for (uint r = 0; r < Rows; ++r)
+	{
+		const uint4 Row = InBytes.Load4(FractionalBits + 8u + r * 16u);
+		if (e >= Row.x && e < Row.x + Row.y)
+		{
+			OutLodWords[e * 2u] = Scratch.Load(Row.w + (e - Row.x) * 4u);
+			OutLodWords[e * 2u + 1u] = Row.z;
+			return;
+		}
+	}
+}
+
+// athenea: a PLY's or a USD stage's rest coefficients, uploaded as floats (45
+// a splat, in InBytes), packed into halves on the device.
+[numthreads(64, 1, 1)]
+void GSPackSHCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint i = Offset + DispatchThreadId.x;
+	if (i >= Count)
+	{
+		return;
+	}
+	for (uint k = 0; k < 45u; ++k)
+	{
+		GSStoreSH(i * 46u + k, asfloat(InBytes.Load((i * 45u + k) * 4u)));
 	}
 }

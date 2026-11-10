@@ -1,0 +1,399 @@
+// Copyright (c) 2026 jesus luque.
+// athenea: the levels of detail's cut and morph, shared by the culling pass
+// (which gaussians are drawn) and the prepass (where they are drawn).
+#pragma once
+
+// athenea: a .athc's levels of detail cut this frame, as athenea's CutSelector
+// cuts them (shaders/athenea/lod/lod_cut.slang): a merged group is drawn where
+// its octree cell spans at most LodThreshold pixels at its nearest point to
+// the eye and its parent's cell more; a splat where its finest-level group's
+// cell spans more. LodEyeLocal is the eye in the primitive's local space (cm);
+// the cells are in the file's axes and units. LodThreshold 0 draws the splats.
+float3 LodEyeLocal;
+float LodPixelsPerUnit;
+float LodThreshold;
+
+// athenea: the view's splat budget (GSLodBudgetCS): [0] the factor the
+// threshold is raised by so the cut fits the frame's buffers, as float bits.
+#ifndef GS_LOD_BUDGET_SCALE
+Buffer<uint> LodBudget;
+#define GS_LOD_BUDGET_SCALE asfloat(LodBudget[0])
+#endif
+
+float LodThresholdNow()
+{
+	return LodThreshold * max(GS_LOD_BUDGET_SCALE, 1.0f);
+}
+
+// athenea: the cut staggered. A shared threshold switches a whole ring of
+// groups at once, and that ring slides over the scene as the eye moves. Each
+// group switches at its own threshold instead, T * LodDissolve^(h - 1/2) with h
+// hashed from its cell and level (a tree node from its index): the parent a
+// group defers to is asked with the parent's own, so the cut stays a cut -- no
+// gaussian drawn twice, none missing -- and its edge is spread over a band of
+// distances. 1 is athenea's cut.
+float LodDissolve;
+
+float LodHash(uint A, uint B)
+{
+	uint V = A * 747796405u + B * 2891336453u + 1u;
+	V = ((V >> ((V >> 28u) + 4u)) ^ V) * 277803737u;
+	V = (V >> 22u) ^ V;
+	return float(V) * (1.0f / 4294967296.0f);
+}
+
+float LodThresholdOf(uint A, uint B)
+{
+	const float K = max(LodDissolve, 1.0f);
+	return K <= 1.0f ? LodThresholdNow() : LodThresholdNow() * exp2(log2(K) * (LodHash(A, B) - 0.5f));
+}
+
+uint LodCompact(uint v)
+{
+	v &= 0x09249249u;
+	v = (v | (v >> 2)) & 0x030C30C3u;
+	v = (v | (v >> 4)) & 0x0300F00Fu;
+	v = (v | (v >> 8)) & 0x030000FFu;
+	v = (v | (v >> 16)) & 0x000003FFu;
+	return v;
+}
+
+// The pixels a level-`Level` cell spans at its nearest point to the eye.
+float LodCellPixels(uint Cell, uint Level, float3 Eye)
+{
+	const float Edge = GSResources.LodExtent / float(1u << Level);
+	const float3 Lo = GSResources.LodBoundsLo + float3(LodCompact(Cell >> 2), LodCompact(Cell >> 1), LodCompact(Cell)) * Edge;
+	const float3 Nearest = clamp(Eye, Lo, Lo + Edge);
+	return Edge * LodPixelsPerUnit / max(length(Nearest - Eye), 1e-6f);
+}
+
+bool LodSmall(uint Cell, uint Level, float3 Eye)
+{
+	return LodThreshold > 0.0f && LodCellPixels(Cell, Level, Eye) <= LodThresholdOf(Cell, Level);
+}
+
+// A tree node's width on screen, twice its widest deviation over its distance
+// (athenea's treeCutWidth); local centimetres.
+float LodTreeWidth(uint Node)
+{
+	const float3 S = GSScl(Node) * 100.0f;
+	const float Distance = max(length(GSPos(Node) - LodEyeLocal), 1.0e-3f);
+	return 2.0f * max(S.x, max(S.y, S.z)) / Distance * LodPixelsPerUnit;
+}
+
+// Against the threshold.
+bool LodTreeNarrow(uint Node)
+{
+	return LodThreshold > 0.0f && LodTreeWidth(Node) <= LodThresholdOf(Node, 0xFFFFFFFFu);
+}
+
+// Glass and sheets are never drawn merged (athenea's lodKeptApart): a TX
+// gaussian whose transmission passes a half, or a thin wall's with any. Read
+// from the surface the decode wrote (GS_SURFACE_*: what of the body passes,
+// plus 2 for a thin wall), so only a TX cloud has any.
+bool LodKept(uint i)
+{
+	if ((GSResources.ColorFlags & 4u) == 0u)
+	{
+		return false;
+	}
+	const float Pass = GSResources.TransferSurface[i * 20u + 19u];
+	const bool bThin = Pass >= 2.0f;
+	const float Transmission = bThin ? Pass - 2.0f : Pass;
+	return Transmission > 0.5f || (bThin && Transmission > 0.0f);
+}
+
+// The eye in the file's axes and units (FileAxis* are where the file's axes
+// point in local space, a signed permutation).
+float3 LodEyeFile()
+{
+	const float3 L = LodEyeLocal / GSResources.LodUnitsToCm;
+	return float3(dot(GSResources.FileAxisX, L), dot(GSResources.FileAxisY, L), dot(GSResources.FileAxisZ, L));
+}
+
+// athenea: a cell the view does not show is not drawn (LodFrustumOn, as
+// athenea's budgeted cut): its box, grown by an edge and a half for the gaussians
+// that reach past it, against the view's four side planes, given in the
+// primitive's local space (cm) and already a tenth wider than the image.
+uint LodFrustumOn;
+float4 LodFrustum[4];
+
+bool LodCellSeen(uint Cell, uint Level)
+{
+	if (LodFrustumOn == 0u)
+	{
+		return true;
+	}
+	const float Edge = GSResources.LodExtent / float(1u << Level);
+	const float3 Centre = GSResources.LodBoundsLo + (float3(LodCompact(Cell >> 2), LodCompact(Cell >> 1), LodCompact(Cell)) + 0.5f) * Edge;
+	for (uint k = 0u; k < 4u; k++)
+	{
+		// The plane in the file's axes and units.
+		const float3 N = float3(dot(LodFrustum[k].xyz, GSResources.FileAxisX), dot(LodFrustum[k].xyz, GSResources.FileAxisY), dot(LodFrustum[k].xyz, GSResources.FileAxisZ)) * GSResources.LodUnitsToCm;
+		if (dot(N, Centre) + LodFrustum[k].w + (abs(N.x) + abs(N.y) + abs(N.z)) * 2.0f * Edge < 0.0f)
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
+// athenea: the finest level's groups judged once (GSLodStateCS, as athenea's
+// lodCutFinest writes its state): 1 where a group's splats are drawn. A splat
+// then reads its group's word instead of judging the group's cell itself --
+// a hundred million splats did, every frame.
+uint LodGroupStateOn;
+Buffer<uint> LodGroupState;
+
+bool LodGroupSplats(uint Group, float3 Eye)
+{
+	const uint Cell = GSResources.LodWords[Group * 2];
+	return (LodKept(Group) || !LodSmall(Cell, GSResources.LodFinestLevel, Eye)) && LodCellSeen(Cell, GSResources.LodFinestLevel);
+}
+
+// athenea: THE SPLATS THINNED. The cut's last step is its largest: one merged
+// gaussian for the tens of splats of a finest-level group, and with the eye
+// moving the place where it happens shows as a line. Before it a group's
+// splats are thinned: while its cell spans r thresholds, r under LodThin, a
+// fraction of them is drawn, halving with each equal step of log r down to
+// LodThinLeast at the switch (a thirty-second: one or two splats of a group's
+// tens, so the merged gaussian that follows replaces little); which ones is
+// the splat's turn (LodThinTurn: the same every frame, and a splat once
+// dropped stays dropped farther away). Those drawn take the mass of those
+// dropped: a little by width (the fourth root of the inverse fraction, at
+// most one and a half), the rest by opacity, up to 1 and never past it: over
+// 1 a gaussian is the harder kernel, drawn without what a small one pays
+// back, so a thinned splat whose opacity crossed 1 as the fraction moved
+// jumped, and those jumps were the flicker of the band (eight times the
+// pixels popping of a cut that thins nothing).
+// In the band's last half -- under a fifth of the splats left -- they are
+// also drawn toward the group's merged gaussian (LodMorphOf), all the way at
+// the switch: what the group's last splat or two have become is what takes
+// their place, and a stray splat larger than its group shrinks into it
+// instead of growing (widened and hardened it stood as a shard across a far
+// meadow). Detail then goes a splat at a time. Up to 1: every splat.
+float LodThin;
+float LodThinLeast;
+
+// Which of a group's splats go first. Where the splats lie in their groups'
+// runs (GSResources.LodGroupRuns), a splat's turn is its place in the run by
+// the golden ratio: the fraction f of a group of n keeps f n of them, one more
+// or less, spread along the run, and the run's first splat is never dropped,
+// so no group is left with none. Anything else takes a hash of its index, and
+// a group keeps what chance says.
+uint LodGroupFirst(uint FinestGroup)
+{
+	return GSResources.LodGroupRuns != 0u ? GSResources.LodGroupStarts[FinestGroup] : 0u;
+}
+
+float LodThinTurn(uint SplatIndex, uint First)
+{
+	return GSResources.LodGroupRuns != 0u ? float((SplatIndex - First) * 0x9E3779B9u) * (1.0f / 4294967296.0f) : LodHash(SplatIndex, 0x9E3779B9u);
+}
+
+// The least fraction a group comes down to.
+float LodThinEnd()
+{
+	return clamp(LodThinLeast, 1.0f / 1024.0f, 1.0f);
+}
+
+float LodThinFraction(uint Group, float3 Eye)
+{
+	if (LodThin <= 1.0f || LodThreshold <= 0.0f || LodKept(Group))
+	{
+		return 1.0f;
+	}
+	const uint Cell = GSResources.LodWords[Group * 2];
+	const float R = LodCellPixels(Cell, GSResources.LodFinestLevel, Eye) / LodThresholdOf(Cell, GSResources.LodFinestLevel);
+	const float T = saturate(log(max(R, 1.0f)) / log(LodThin));
+	return T >= 1.0f ? 1.0f : exp2(log2(LodThinEnd()) * (1.0f - T));
+}
+
+bool LodThinKeeps(uint SplatIndex, uint First, float Fraction)
+{
+	return Fraction >= 1.0f || LodThinTurn(SplatIndex, First) < Fraction;
+}
+
+// A kept splat does not go out at once: over the last LodThinFadeBand of the
+// fraction before its turn it fades, so a band where the fraction moves does
+// not flicker with splats going on and off. What the fading ones lack of the
+// mass, the rest make up (LodThinFadeMass).
+static const float LodThinFadeBand = 0.3f;
+static const float LodThinFadeMass = 1.0f / (1.0f - 0.5f * LodThinFadeBand);
+
+float LodThinFade(uint SplatIndex, uint First, float Fraction)
+{
+	return Fraction >= 1.0f ? 1.0f : saturate((Fraction - LodThinTurn(SplatIndex, First)) / (LodThinFadeBand * Fraction));
+}
+
+// A drawn splat's thinning, asked once: the fraction of its group's splats it
+// stands for (1 for anything but a thinned splat), its group, how far toward
+// the group's merged gaussian it is drawn (the band's last half), and how
+// much of itself is left (LodThinFade).
+float LodThinOf(uint SplatIndex, out uint Group, out float Toward, out float Fade)
+{
+	Group = SplatIndex;
+	Toward = 0.0f;
+	Fade = 1.0f;
+	if (LodThin <= 1.0f || LodThreshold <= 0.0f || GSResources.LodLevels == 0u)
+	{
+		return 1.0f;
+	}
+	if (GSResources.LodWords[SplatIndex * 2 + 1] != 0x80000000u)
+	{
+		return 1.0f;
+	}
+	const uint FinestGroup = GSResources.LodWords[SplatIndex * 2];
+	const uint Finest = GSResources.LodFinestBase + FinestGroup;
+	if (LodKept(Finest))
+	{
+		return 1.0f;
+	}
+	const uint Cell = GSResources.LodWords[Finest * 2];
+	const float R = LodCellPixels(Cell, GSResources.LodFinestLevel, LodEyeFile()) / LodThresholdOf(Cell, GSResources.LodFinestLevel);
+	const float T = saturate(log(max(R, 1.0f)) / log(LodThin));
+	if (T >= 1.0f)
+	{
+		return 1.0f;
+	}
+	Group = Finest;
+	Toward = saturate(1.0f - 2.0f * T);
+	const float Fraction = exp2(log2(LodThinEnd()) * (1.0f - T));
+	Fade = LodThinFade(SplatIndex, LodGroupFirst(FinestGroup), Fraction);
+	return Fraction;
+}
+
+bool LodDrawn(uint SplatIndex)
+{
+	const float3 Eye = LodEyeFile();
+	const uint A = GSResources.LodWords[SplatIndex * 2];
+	const uint B = GSResources.LodWords[SplatIndex * 2 + 1];
+	if ((B & 0x20000000u) != 0)
+	{
+		// A paged tree's node (athenea's lod_tree_cut): it passes as a leaf or
+		// where it spans at most LodThreshold pixels; it is drawn where it
+		// passes and its parent does not.
+		const bool bLeaf = (B & 0x80000000u) != 0;
+		const bool bHere = bLeaf || LodTreeNarrow(SplatIndex);
+		return bHere && (A == 0xFFFFFFFFu || !LodTreeNarrow(A));
+	}
+	if ((B & 0x80000000u) != 0)
+	{
+		// A splat: drawn where its finest-level group's cell is not small, and
+		// always under a group kept apart (glass, a sheet).
+		if (LodGroupStateOn != 0u)
+		{
+			// The group's word: 0 where its splats are not drawn, else the fraction of them that is.
+			const uint State = LodGroupState[A];
+			return State != 0u && LodThinKeeps(SplatIndex, LodGroupFirst(A), asfloat(State));
+		}
+		return LodGroupSplats(GSResources.LodFinestBase + A, Eye) && LodThinKeeps(SplatIndex, LodGroupFirst(A), LodThinFraction(GSResources.LodFinestBase + A, Eye));
+	}
+	if (LodKept(SplatIndex))
+	{
+		return false;
+	}
+	const uint Level = B & 0xFFu;
+	const bool bHere = LodSmall(A, Level, Eye);
+	// The coarsest level the file keeps (bit 30) has no parent to defer to.
+	const bool bAbove = (B & 0x40000000u) == 0 && Level > 0 && LodSmall(A >> 3, Level - 1, Eye);
+	return bHere && !bAbove && LodCellSeen(A, Level);
+}
+
+
+
+// athenea: THE CUT MORPHED (athenea's lod_gather, LodParams::morph). A
+// gaussian drawn while its parent is not is drawn a fraction t of the way to
+// the parent, t = (LodMorph - r) / (LodMorph - 1) with r the parent's pixels
+// over the parent's own threshold (r > 1 while the child is drawn): t is 1
+// where the cut switches, so the parent replaces children that already stand
+// where it does. The parent: a splat's finest-level group, a group's the one
+// of the level above holding its cell (a level's groups are in cell order,
+// LodLevelRuns[level] its first and count), a tree node's its named parent.
+// LodMorph up to 1: none.
+float LodMorph;
+// The same for a splat toward its finest-level group alone (the larger of the
+// two is a splat's): the cut's last step is its largest, one gaussian for the
+// tens of splats under it, and the one a moving eye sees as a line.
+float LodMorphSplats;
+
+float LodMorphOf(uint SplatIndex, out uint Parent)
+{
+	Parent = SplatIndex;
+	if ((LodMorph <= 1.0f && LodMorphSplats <= 1.0f) || LodThreshold <= 0.0f || GSResources.LodLevels == 0u)
+	{
+		return 0.0f;
+	}
+	float Morph = LodMorph;
+	const uint A = GSResources.LodWords[SplatIndex * 2];
+	const uint B = GSResources.LodWords[SplatIndex * 2 + 1];
+	float R;
+	if ((B & 0x20000000u) != 0)
+	{
+		if (A == 0xFFFFFFFFu)
+		{
+			return 0.0f;
+		}
+		Parent = A;
+		R = LodTreeWidth(A) / LodThresholdOf(A, 0xFFFFFFFFu);
+	}
+	else
+	{
+		uint Cell, Level;
+		if ((B & 0x80000000u) != 0)
+		{
+			Parent = GSResources.LodFinestBase + A;
+			Cell = GSResources.LodWords[Parent * 2];
+			Level = GSResources.LodFinestLevel;
+			Morph = max(LodMorph, LodMorphSplats);
+			if (LodThin > 1.0f)
+			{
+				// Thinned splats: toward their group over the band's last half
+				// (LodMorph is then the merged levels').
+				if (LodKept(Parent))
+				{
+					Parent = SplatIndex;
+					return 0.0f;
+				}
+				const float Spans = LodCellPixels(Cell, Level, LodEyeFile()) / LodThresholdOf(Cell, Level);
+				return saturate(1.0f - 2.0f * saturate(log(max(Spans, 1.0f)) / log(LodThin)));
+			}
+		}
+		else
+		{
+			const uint Own = B & 0xFFu;
+			if ((B & 0x40000000u) != 0 || Own == 0u)
+			{
+				return 0.0f;
+			}
+			Cell = A >> 3;
+			Level = Own - 1u;
+			const uint4 Run = GSResources.LodLevelRuns[Level];
+			uint Lo = 0u, Hi = Run.y;
+			while (Lo < Hi)
+			{
+				const uint Middle = (Lo + Hi) / 2u;
+				if (GSResources.LodWords[(Run.x + Middle) * 2] < Cell)
+				{
+					Lo = Middle + 1u;
+				}
+				else
+				{
+					Hi = Middle;
+				}
+			}
+			if (Lo >= Run.y || GSResources.LodWords[(Run.x + Lo) * 2] != Cell)
+			{
+				return 0.0f;
+			}
+			Parent = Run.x + Lo;
+		}
+		if (LodKept(Parent))
+		{
+			Parent = SplatIndex;
+			return 0.0f;
+		}
+		R = LodCellPixels(Cell, Level, LodEyeFile()) / LodThresholdOf(Cell, Level);
+	}
+	return Morph > 1.0f ? saturate((Morph - R) / (Morph - 1.0f)) : 0.0f;
+}

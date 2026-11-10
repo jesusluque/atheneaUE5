@@ -48,8 +48,9 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Gaussian Splats|Sequence")
 	bool bSequencePlaying = true;
 
-	// Seconds into the sequence.
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Gaussian Splats|Sequence")
+	// Seconds into the sequence. Keyable in Sequencer (with bSequencePlaying
+	// off, the track decides the frame, as Movie Render Queue renders it).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Interp, Category = "Gaussian Splats|Sequence")
 	float SequenceTime = 0.0f;
 
 	// The sequence's frame at a time (seconds), drawn now.

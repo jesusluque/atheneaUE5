@@ -37,7 +37,10 @@ public class Gaussians : ModuleRules
 				"Niagara", 
 
 				"VectorVM", 
-				"Projects"
+				"Projects",
+
+				// athenea: the .athc and .athz importers read at runtime too
+				"AtheneaCodecs"
             }
 		);
 	}

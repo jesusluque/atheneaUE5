@@ -8,6 +8,7 @@
 #   ue_time.sh /Game/Level out.csv ["cvar value,cvar value"]
 #
 # UE_HOST     the ssh host of the Windows machine (default: windows)
+# UE_RESX, UE_RESY  the window's size (default 1280 x 720)
 # UE_ROOT     UE 5.8's folder there (default: C:\Program Files\Epic Games\UE_5.8)
 # UE_PROJECT  the .uproject there (default: %USERPROFILE%\athenea-unreal\TestProj\TestProj.uproject)
 set -e
@@ -19,7 +20,7 @@ CSVDIR='%LOCALAPPDATA%\UnrealEngine\5.8\Saved\Profiling\CSV'
 
 ssh $HOST 'nvidia-smi --query-gpu=utilization.gpu,clocks.sm,temperature.gpu --format=csv,noheader' | tr -d '\r' | sed 's/^/before: /'
 ssh $HOST "if exist \"$CSVDIR\" rmdir /s /q \"$CSVDIR\""
-ssh $HOST "\"$ROOT\\Engine\\Binaries\\Win64\\UnrealEditor.exe\" \"$PROJECT\" $LEVEL -game -RenderOffscreen -ResX=1280 -ResY=720 -windowed -unattended -nosplash -nosound -csvGpuStats -csvCaptureFrames=450 -ExecCmds=\"r.GPUStatsEnabled 1,t.MaxFPS 30,r.VSync 0$EXTRA\" > NUL 2>&1" &
+ssh $HOST "\"$ROOT\\Engine\\Binaries\\Win64\\UnrealEditor.exe\" \"$PROJECT\" $LEVEL -game -RenderOffscreen -ResX=${UE_RESX:-1280} -ResY=${UE_RESY:-720} -windowed -unattended -nosplash -nosound -csvGpuStats -csvCaptureFrames=450 -ExecCmds=\"r.GPUStatsEnabled 1,t.MaxFPS 30,r.VSync 0$EXTRA\" > NUL 2>&1" &
 
 # The profiler opens the file when the capture starts and writes it at the end
 # (and -csvExitOnCompletion does not end the process in 5.8.4): wait for bytes,

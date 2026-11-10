@@ -5,7 +5,7 @@
 # deferred pass, PNG, WARMUP warm-up frames; AA taa (the engine's TAA/TSR,
 # SAMPLES temporal samples) or none (no temporal AA nor motion blur, SAMPLES
 # spatial samples a frame), and taa-noblur / none-blur to tell the two apart.
-#   py setup_mrq.py LEVEL NAME [FRAMES] [WARMUP] [SAMPLES] [AA] --quit
+#   py setup_mrq.py LEVEL NAME [FRAMES] [WARMUP] [SAMPLES] [AA] [--sequence] --quit
 # Then render it from the command line (operations manual, Movie Render Queue):
 #   UnrealEditor-Cmd TestProj.uproject LEVEL -game -LevelSequence=/Game/Mrq/Seq_NAME
 #     -MoviePipelineConfig=/Game/Mrq/Cfg_NAME -RenderOffscreen -Unattended -NoTextureStreaming
@@ -49,6 +49,23 @@ for f in range(frames + 1):
     t = unreal.FrameNumber(f)
     for c, v in zip(channels[:6], [eye.x, eye.y, eye.z, rot.roll, rot.pitch, rot.yaw]):
         c.add_key(t, v)
+# --sequence: the splat actor's sequence of clouds driven by the shot, its
+# SequenceTime keyed from 0 to the shot's length (playback off in the level),
+# so each rendered frame shows the cloud of its own time.
+if "--sequence" in sys.argv:
+    comp = splat.get_editor_property("gaussian_splat_component")
+    comp.set_editor_property("sequence_playing", False)
+    actor_binding = seq.add_possessable(splat)
+    comp_binding = seq.add_possessable(comp)
+    comp_binding.set_parent(actor_binding)
+    track = comp_binding.add_track(unreal.MovieSceneFloatTrack)
+    track.set_property_name_and_path("SequenceTime", "SequenceTime")
+    time_section = track.add_section()
+    time_section.set_range(0, frames)
+    channel = time_section.get_all_channels()[0]
+    channel.add_key(unreal.FrameNumber(0), 0.0, interpolation=unreal.MovieSceneKeyInterpolation.LINEAR)
+    channel.add_key(unreal.FrameNumber(frames), frames / 24.0, interpolation=unreal.MovieSceneKeyInterpolation.LINEAR)
+    les.save_current_level()
 cuts = seq.add_track(unreal.MovieSceneCameraCutTrack)
 cut = cuts.add_section()
 cut.set_range(0, frames)

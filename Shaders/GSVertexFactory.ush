@@ -2,6 +2,7 @@
 #include "/Engine/Private/VertexFactoryCommon.ush"
 #include "/Engine/Private/Quaternion.ush"
 #include "/Engine/Generated/GeneratedUniformBuffers.ush"
+#include "GSSplatData.ush"
 
 #if SHADOW_DEPTH_SHADER
 #include "/Engine/Private/Nanite/NaniteDataDecode.ush"
@@ -156,9 +157,9 @@ ComputeSplatParameters(
     out float3 OutWorldNormal
 )
 {
-    float3x3 ScaleMatrix = VecToScaleMatrix(GSResources.Scales[SplatIndex]);
-    float3x3 RotationMatrix = mul(transpose(DFToFloat3x3(Primitive.LocalToWorld)), QuatToMatrix(GSResources.Orientations[SplatIndex]));
-    float3 MeanPosition = GSResources.Positions[SplatIndex];
+    float3x3 ScaleMatrix = VecToScaleMatrix(GSScl(SplatIndex));
+    float3x3 RotationMatrix = mul(transpose(DFToFloat3x3(Primitive.LocalToWorld)), QuatToMatrix(GSRot(SplatIndex)));
+    float3 MeanPosition = GSPos(SplatIndex);
 
 	// Calculate covariance matrix
     float3x3 T = mul(RotationMatrix, ScaleMatrix);
@@ -343,7 +344,10 @@ FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput In
     Intermediates.LocalPos = float4(Quad[Input.VertexId % 6], 0, 1);
 
     //cull very non opaque splats
-    if (GSResources.SHAndOpacities[SplatIndex].w < 0.9)
+    // athenea: a medium's gaussians (an optical depth, not an opacity) cast
+    // no opaque shadow; their shadow on the scene is athenea-research's
+    // proposal 108, not done.
+    if (GSShOp(SplatIndex).w < 0.9 || GSResources.VolumeOn != 0u)
     {
         Intermediates.WorldPosition = float4(0, 0, 0, 0);
         Intermediates.Conic = float3(0, 0, 0);
@@ -352,7 +356,7 @@ FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput In
         return Intermediates;
     }
 
-    Intermediates.Opacity = GSResources.SHAndOpacities[SplatIndex].w;
+    Intermediates.Opacity = GSShOp(SplatIndex).w;
 
 #if SHADOW_DEPTH_SHADER
 	uint PackedPageInfo = InstanceCulling_PageInfoBuffer[Intermediates.SceneData.InstanceIdLoadIndex];

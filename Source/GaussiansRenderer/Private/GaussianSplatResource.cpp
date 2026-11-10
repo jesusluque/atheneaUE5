@@ -1,4 +1,5 @@
 #include "GaussianSplatResource.h"
+#include "HAL/IConsoleManager.h"
 
 #include "GaussianData.h"
 #include "RenderingThread.h"
@@ -32,7 +33,7 @@ class FGSDecodeAtheneaCS : public FGlobalShader
 		SHADER_PARAMETER_UAV(RWStructuredBuffer<float3>, OutScales)
 		SHADER_PARAMETER_UAV(RWStructuredBuffer<float4>, OutOrientations)
 		SHADER_PARAMETER_UAV(RWStructuredBuffer<float4>, OutSHAndOpacities)
-		SHADER_PARAMETER_UAV(RWStructuredBuffer<float>, OutHighOrderSH)
+		SHADER_PARAMETER_UAV(RWStructuredBuffer<uint>, OutHighOrderSH)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
@@ -44,6 +45,12 @@ class FGSDecodeAtheneaCS : public FGlobalShader
 IMPLEMENT_GLOBAL_SHADER(FGSDecodeAtheneaCS, "/Plugin/StarLightGS/GSDecode.usf", "GSDecodeAtheneaCS", SF_Compute);
 
 // athenea: a file's own packing (.splat, .spz) decoded from its bytes.
+// athenea: when a .athc keeps its packed arrays resident (GSSplatData.ush).
+static TAutoConsoleVariable<int32> CVarGaussiansAtheneaPackedResident(
+	TEXT("r.Gaussians.Athenea.PackedResident"), 0,
+	TEXT("A .athc's packed arrays kept on the GPU in place of the decoded ones (32 bytes a splat in place of 56): 0 above 20 million splats, 1 always, -1 never. Read when a resource is made."),
+	ECVF_RenderThreadSafe);
+
 BEGIN_SHADER_PARAMETER_STRUCT(FGSDecodeFileParameters, )
 	SHADER_PARAMETER(uint32, Offset)
 	SHADER_PARAMETER(uint32, Count)
@@ -63,7 +70,9 @@ BEGIN_SHADER_PARAMETER_STRUCT(FGSDecodeFileParameters, )
 	SHADER_PARAMETER_UAV(RWStructuredBuffer<float3>, OutScales)
 	SHADER_PARAMETER_UAV(RWStructuredBuffer<float4>, OutOrientations)
 	SHADER_PARAMETER_UAV(RWStructuredBuffer<float4>, OutSHAndOpacities)
-	SHADER_PARAMETER_UAV(RWStructuredBuffer<float>, OutHighOrderSH)
+	SHADER_PARAMETER_UAV(RWStructuredBuffer<uint>, OutHighOrderSH)
+	// athenea: an .athz's levels' words, written from the decoded tails (GSAthzLodCS).
+	SHADER_PARAMETER_UAV(RWStructuredBuffer<uint>, OutLodWords)
 END_SHADER_PARAMETER_STRUCT()
 
 class FGSDecodeSplatCS : public FGlobalShader
@@ -187,6 +196,33 @@ class FGSAthzCpcaCS : public FGlobalShader
 	}
 };
 IMPLEMENT_GLOBAL_SHADER(FGSAthzCpcaCS, "/Plugin/StarLightGS/GSDecode.usf", "GSAthzCpcaCS", SF_Compute);
+
+// athenea: a PLY's or USD stage's rest coefficients packed into halves.
+class FGSPackSHCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FGSPackSHCS);
+	SHADER_USE_PARAMETER_STRUCT(FGSPackSHCS, FGlobalShader);
+	using FParameters = FGSDecodeFileParameters;
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+};
+IMPLEMENT_GLOBAL_SHADER(FGSPackSHCS, "/Plugin/StarLightGS/GSDecode.usf", "GSPackSHCS", SF_Compute);
+
+// athenea: an .athz's levels of detail, two words a gaussian from the tails
+// the decode left in the scratch (a splat's finest group, a group's cell).
+class FGSAthzLodCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FGSAthzLodCS);
+	SHADER_USE_PARAMETER_STRUCT(FGSAthzLodCS, FGlobalShader);
+	using FParameters = FGSDecodeFileParameters;
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+};
+IMPLEMENT_GLOBAL_SHADER(FGSAthzLodCS, "/Plugin/StarLightGS/GSDecode.usf", "GSAthzLodCS", SF_Compute);
 
 // athenea: a .athc v3 TX cloud's streams into the transfer's buffers.
 class FGSDecodeAthc3TxCS : public FGlobalShader
@@ -346,11 +382,28 @@ void FGaussianSplatResource::InitRHI(FRHICommandListBase& RHICmdList)
 		};
 
 		FUnorderedAccessViewRHIRef PositionsUAV, ScalesUAV, OrientationsUAV, SHAndOpacitiesUAV, HighOrderSHUAV;
-		PositionsBuffer = CreateDecoded(sizeof(FVector3f), Count, TEXT("GaussianSplatsPositions"), PositionsUAV);
-		ScalesBuffer = CreateDecoded(sizeof(FVector3f), Count, TEXT("GaussianSplatsScales"), ScalesUAV);
-		OrientationsBuffer = CreateDecoded(sizeof(FVector4f), Count, TEXT("GaussianSplatsOrientations"), OrientationsUAV);
-		SHAndOpacitiesBuffer = CreateDecoded(sizeof(FVector4f), Count, TEXT("GaussianSplatsSHAndOpacities"), SHAndOpacitiesUAV);
-		HighOrderSHBuffer = CreateDecoded(sizeof(float), Count * FGaussianSplatData::NumHighOrderSH, TEXT("GaussianSplatHighOrderSH"), HighOrderSHUAV);
+		// athenea: a .athc too large to decode keeps its packed arrays resident
+		// (32 bytes a splat in place of 56; GSSplatData.ush unpacks them where
+		// they are read). r.Gaussians.Athenea.PackedResident: 0 above 20
+		// million splats, 1 always, -1 never.
+		{
+			const int32 Mode = CVarGaussiansAtheneaPackedResident.GetValueOnAnyThread();
+			bPackedResident = bAthenea && SplatData.PackedPositions.Num() == int32(Count)
+				&& (Mode > 0 || (Mode == 0 && Count > 20000000u));
+		}
+		const uint32 Decoded = bPackedResident ? 1u : Count;
+		if (bPackedResident)
+		{
+			PackedPositionsBuffer = InPositions;
+			PackedShapeBuffer = InShape;
+		}
+		PositionsBuffer = CreateDecoded(sizeof(FVector3f), Decoded, TEXT("GaussianSplatsPositions"), PositionsUAV);
+		ScalesBuffer = CreateDecoded(sizeof(FVector3f), Decoded, TEXT("GaussianSplatsScales"), ScalesUAV);
+		OrientationsBuffer = CreateDecoded(sizeof(FVector4f), Decoded, TEXT("GaussianSplatsOrientations"), OrientationsUAV);
+		SHAndOpacitiesBuffer = CreateDecoded(sizeof(FVector4f), Decoded, TEXT("GaussianSplatsSHAndOpacities"), SHAndOpacitiesUAV);
+		// The rest coefficients as halves, 23 words a splat, only where the
+		// cloud draws any (a word otherwise, which the decoders write nothing to).
+		HighOrderSHBuffer = CreateDecoded(sizeof(uint32), SplatData.UseHighOrderSH() ? Count * 23u : 1u, TEXT("GaussianSplatHighOrderSH"), HighOrderSHUAV);
 
 		FRHICommandListImmediate& Immediate = FRHICommandListImmediate::Get();
 		TShaderMapRef<FGSDecodeAtheneaCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
@@ -371,6 +424,23 @@ void FGaussianSplatResource::InitRHI(FRHICommandListBase& RHICmdList)
 			ScratchBuffer = RHICmdList.CreateBuffer(ScratchDesc);
 			ScratchUAV = RHICmdList.CreateUnorderedAccessView(ScratchBuffer,
 				FRHIViewDesc::CreateBufferUAV().SetType(FRHIViewDesc::EBufferType::Raw));
+		}
+
+		// An .athz's levels' words, written by the device (GSAthzLodCS) where
+		// a .athc's come from the file.
+		FUnorderedAccessViewRHIRef AthzLodUAV;
+		if (!bAthenea && SplatData.PackedFormat == 6 && SplatData.LodLevels > 0 && S.Num() > 8)
+		{
+			const FRHIBufferCreateDesc LodDesc =
+				FRHIBufferCreateDesc::CreateStructured(TEXT("GaussianSplatLodWords"), Count * 2u * 4u, 4u)
+				.AddUsage(EBufferUsageFlags::ShaderResource | EBufferUsageFlags::UnorderedAccess)
+				.SetInitialState(ERHIAccess::UAVCompute);
+			FBufferRHIRef LodBuffer = RHICmdList.CreateBuffer(LodDesc);
+			AthzLodUAV = RHICmdList.CreateUnorderedAccessView(LodBuffer,
+				FRHIViewDesc::CreateBufferUAV().SetType(FRHIViewDesc::EBufferType::Structured).SetStride(4u));
+			LodWordsBuffer.Buffer = LodBuffer;
+			LodWordsBuffer.SRV = RHICmdList.CreateShaderResourceView(LodBuffer,
+				FRHIViewDesc::CreateBufferSRV().SetType(FRHIViewDesc::EBufferType::Structured).SetStride(4u));
 		}
 
 		// A dispatch holds at most 65535 groups of 64 along x.
@@ -420,18 +490,39 @@ void FGaussianSplatResource::InitRHI(FRHICommandListBase& RHICmdList)
 						FIntVector(FMath::DivideAndRoundUp(Pages * PageRuns, 8u), 1, 1));
 					Immediate.Transition(FRHITransitionInfo(ScratchUAV, ERHIAccess::UAVCompute, ERHIAccess::UAVCompute));
 				}
-				// A CPCA transfer: the splats' codes into their values.
+				// A CPCA transfer: the splats' codes into their values, then each
+				// level's (a head of 11 words each, PackedSpz.Z of them).
 				if (SplatData.PackedSpz.Y != 0)
 				{
-					for (uint32 First = 0; First < Count; First += Batch)
+					const uint32 Heads = FMath::Max(uint32(SplatData.PackedSpz.Z), 1u);
+					for (uint32 h = 0; h < Heads; h++)
 					{
-						FGSDecodeFileParameters CpcaParameters = Parameters;
-						CpcaParameters.Offset = First;
-						CpcaParameters.FractionalBits = uint32(SplatData.PackedSpz.Y);
-						FComputeShaderUtils::Dispatch(Immediate, TShaderMapRef<FGSAthzCpcaCS>(GetGlobalShaderMap(GMaxRHIFeatureLevel)), CpcaParameters,
-							FIntVector(FMath::DivideAndRoundUp(FMath::Min(Batch, Count - First), 64u), 1, 1));
+						const uint32 HeadBytes = uint32(SplatData.PackedSpz.Y) + h * 44u;
+						const uint32 N = Bytes[HeadBytes / 4];
+						for (uint32 First = 0; First < N; First += Batch)
+						{
+							FGSDecodeFileParameters CpcaParameters = Parameters;
+							CpcaParameters.Offset = First;
+							CpcaParameters.FractionalBits = HeadBytes;
+							FComputeShaderUtils::Dispatch(Immediate, TShaderMapRef<FGSAthzCpcaCS>(GetGlobalShaderMap(GMaxRHIFeatureLevel)), CpcaParameters,
+								FIntVector(FMath::DivideAndRoundUp(FMath::Min(Batch, N - First), 64u), 1, 1));
+						}
 					}
 					Immediate.Transition(FRHITransitionInfo(ScratchUAV, ERHIAccess::UAVCompute, ERHIAccess::UAVCompute));
+				}
+				// The levels' words from the decoded tails (PackedStreams[8]: the rows).
+				if (AthzLodUAV.IsValid())
+				{
+					FGSDecodeFileParameters LodParameters = Parameters;
+					LodParameters.FractionalBits = S[8];
+					LodParameters.OutLodWords = AthzLodUAV;
+					for (uint32 First = 0; First < Count; First += Batch)
+					{
+						LodParameters.Offset = First;
+						FComputeShaderUtils::Dispatch(Immediate, TShaderMapRef<FGSAthzLodCS>(GetGlobalShaderMap(GMaxRHIFeatureLevel)), LodParameters,
+							FIntVector(FMath::DivideAndRoundUp(FMath::Min(Batch, Count - First), 64u), 1, 1));
+					}
+					Immediate.Transition(FRHITransitionInfo(AthzLodUAV, ERHIAccess::UAVCompute, ERHIAccess::SRVMask));
 				}
 				Parameters.Offset = Offset;
 				Parameters.FractionalBits = uint32(SplatData.PackedSpz.X);
@@ -516,7 +607,10 @@ void FGaussianSplatResource::InitRHI(FRHICommandListBase& RHICmdList)
 			});
 		}
 
-		for (uint32 Offset = 0; Offset < Count && bAthenea; Offset += Batch)
+		// Resident packed arrays need no decode but their rest coefficients'
+		// (the other outputs are a word each, and writes past it are dropped).
+		const bool bDecodeAthenea = bAthenea && (!bPackedResident || SplatData.UseHighOrderSH());
+		for (uint32 Offset = 0; Offset < Count && bDecodeAthenea; Offset += Batch)
 		{
 			FGSDecodeAtheneaCS::FParameters Parameters;
 			Parameters.Offset = Offset;
@@ -552,7 +646,47 @@ void FGaussianSplatResource::InitRHI(FRHICommandListBase& RHICmdList)
 		ScalesBuffer = CreateBuffer(SplatData.Scales, TEXT("GaussianSplatsScales"));
 		OrientationsBuffer = CreateBuffer(SplatData.Orientations, TEXT("GaussianSplatsOrientations"));
 		SHAndOpacitiesBuffer = CreateBuffer(SplatData.ZeroOrderHarmonicsCoefficientsAndOpacities, TEXT("GaussianSplatsSHAndOpacities"));
-		HighOrderSHBuffer = CreateBuffer(SplatData.HighOrderHarmonicsCoefficients, TEXT("GaussianSplatHighOrderSH"), SplatData.UseHighOrderSH());
+		// The rest coefficients, uploaded as floats and packed into halves on
+		// the device (GSPackSHCS), as the decoders write them.
+		const uint32 Count = SplatData.SplatCount;
+		const bool bSH = SplatData.UseHighOrderSH() && SplatData.HighOrderHarmonicsCoefficients.Num() == int32(Count * FGaussianSplatData::NumHighOrderSH);
+		const FRHIBufferCreateDesc PackedDesc =
+			FRHIBufferCreateDesc::CreateStructured(TEXT("GaussianSplatHighOrderSH"), (bSH ? Count * 23u : 1u) * 4u, 4u)
+			.AddUsage(EBufferUsageFlags::ShaderResource | EBufferUsageFlags::UnorderedAccess)
+			.SetInitialState(ERHIAccess::UAVCompute);
+		FBufferRHIRef PackedSH = RHICmdList.CreateBuffer(PackedDesc);
+		HighOrderSHBuffer = FBufferResources{ PackedSH, RHICmdList.CreateShaderResourceView(PackedSH,
+			FRHIViewDesc::CreateBufferSRV().SetType(FRHIViewDesc::EBufferType::Structured).SetStride(4u)) };
+		if (bSH)
+		{
+			const uint32 Bytes = Count * FGaussianSplatData::NumHighOrderSH * 4u;
+			const FRHIBufferCreateDesc FloatsDesc =
+				FRHIBufferCreateDesc::CreateByteAddress(TEXT("GaussianSplatHighOrderSHFloats"), Bytes, 4)
+				.AddUsage(EBufferUsageFlags::ShaderResource)
+				.DetermineInitialState()
+				.SetInitActionInitializer();
+			FRHIBufferInitializer Initializer = RHICmdList.CreateBufferInitializer(FloatsDesc);
+			Initializer.WriteData(SplatData.HighOrderHarmonicsCoefficients.GetData(), Bytes);
+			FBufferRHIRef Floats = Initializer.Finalize();
+			FGSDecodeFileParameters Parameters;
+			Parameters.Count = Count;
+			Parameters.InBytes = RHICmdList.CreateShaderResourceView(Floats, FRHIViewDesc::CreateBufferSRV().SetType(FRHIViewDesc::EBufferType::Raw));
+			Parameters.OutHighOrderSH = RHICmdList.CreateUnorderedAccessView(PackedSH,
+				FRHIViewDesc::CreateBufferUAV().SetType(FRHIViewDesc::EBufferType::Structured).SetStride(4u));
+			FRHICommandListImmediate& Immediate = FRHICommandListImmediate::Get();
+			const uint32 Batch = 65535u * 64u;
+			for (uint32 First = 0; First < Count; First += Batch)
+			{
+				Parameters.Offset = First;
+				FComputeShaderUtils::Dispatch(Immediate, TShaderMapRef<FGSPackSHCS>(GetGlobalShaderMap(GMaxRHIFeatureLevel)), Parameters,
+					FIntVector(FMath::DivideAndRoundUp(FMath::Min(Batch, Count - First), 64u), 1, 1));
+			}
+			Immediate.Transition(FRHITransitionInfo(Parameters.OutHighOrderSH, ERHIAccess::UAVCompute, ERHIAccess::SRVMask));
+		}
+		else
+		{
+			FRHICommandListImmediate::Get().Transition(FRHITransitionInfo(PackedSH, ERHIAccess::UAVCompute, ERHIAccess::SRVMask));
+		}
 	}
 
 	// Will be a buffer with a single element if splat data does not use property
@@ -579,8 +713,60 @@ void FGaussianSplatResource::InitRHI(FRHICommandListBase& RHICmdList)
 		CurvatureBuffer = CreateBuffer(SplatData.TransferCurvature, TEXT("GaussianSplatCurvature"), !SplatData.TransferCurvature.IsEmpty());
 	}
 
-	LodLevels = SplatData.LodWords.Num() == int32(SplatData.SplatCount) * 2 ? SplatData.LodLevels : 0u;
-	LodWordsBuffer = CreateBuffer(SplatData.LodWords, TEXT("GaussianSplatLodWords"), LodLevels > 0);
+	if (LodWordsBuffer.SRV.IsValid())
+	{
+		// Written by the device from an .athz's decoded tails.
+		LodLevels = SplatData.LodLevels;
+	}
+	else
+	{
+		LodLevels = SplatData.LodWords.Num() == int32(SplatData.SplatCount) * 2 ? SplatData.LodLevels : 0u;
+		LodWordsBuffer = CreateBuffer(SplatData.LodWords, TEXT("GaussianSplatLodWords"), LodLevels > 0);
+	}
+	{
+		// athenea: where each finest-level group's splats begin. A .athc's splats
+		// are in Morton order, so a group's are one run and the runs are in the
+		// groups' order: the culling pass then walks the groups and writes a
+		// drawn group's run, not the splats (GSplatCullingGroupsCS). Read from
+		// the cut's words; anything else found there leaves the runs unused.
+		TArray<uint32> Starts;
+		bool bRuns = false;
+		LodSplatsEnd = 0;
+		if (LodLevels > 0 && SplatData.LodWords.Num() == int32(SplatData.SplatCount) * 2)
+		{
+			const uint32 Count = uint32(SplatData.SplatCount);
+			uint32 Previous = MAX_uint32;
+			uint32 i = 0;
+			bRuns = true;
+			for (; i < Count; i++)
+			{
+				const uint32 B = SplatData.LodWords[int32(i * 2 + 1)];
+				if (B != FGaussianSplatData::kLodLeaf)
+				{
+					break;
+				}
+				const uint32 A = SplatData.LodWords[int32(i * 2)];
+				if (A != Previous)
+				{
+					if (A != uint32(Starts.Num()))
+					{
+						bRuns = false;
+						break;
+					}
+					Starts.Add(i);
+					Previous = A;
+				}
+			}
+			LodSplatsEnd = i;
+			bRuns = bRuns && Starts.Num() > 0 && i < Count && (SplatData.LodWords[int32(i * 2 + 1)] & 0xA0000000u) == 0u;
+		}
+		if (!bRuns)
+		{
+			Starts.Empty();
+		}
+		LodGroupRuns = uint32(Starts.Num());
+		LodGroupStartsBuffer = CreateBuffer(Starts, TEXT("GaussianSplatLodGroupStarts"), bRuns);
+	}
 	bVolume = SplatData.bVolume && SplatData.Volume.Num() == int32(SplatData.SplatCount);
 	VolumeBuffer = CreateBuffer(SplatData.Volume, TEXT("GaussianSplatVolume"), bVolume);
 
@@ -617,10 +803,56 @@ void FGaussianSplatResource::InitRHI(FRHICommandListBase& RHICmdList)
 	Parameters.LodLevels = LodLevels;
 	Parameters.LodFinestLevel = SplatData.LodFinestLevel;
 	Parameters.LodFinestBase = SplatData.LodFinestBase;
+	{
+		// Each level's run of groups (the morph's parents): the data's, or
+		// read from the words -- a level's groups are one run.
+		uint32 First[FGaussianSplatData::kLodLevelRuns] = {};
+		uint32 Count[FGaussianSplatData::kLodLevelRuns] = {};
+		if (SplatData.LodLevelRuns.Num() == FGaussianSplatData::kLodLevelRuns * 2)
+		{
+			for (int32 l = 0; l < FGaussianSplatData::kLodLevelRuns; l++)
+			{
+				First[l] = SplatData.LodLevelRuns[l * 2];
+				Count[l] = SplatData.LodLevelRuns[l * 2 + 1];
+			}
+		}
+		else if (LodLevels > 0 && SplatData.LodWords.Num() == int32(SplatData.SplatCount) * 2)
+		{
+			for (uint32 i = 0; i < uint32(SplatData.SplatCount); i++)
+			{
+				const uint32 B = SplatData.LodWords[int32(i * 2 + 1)];
+				if ((B & (FGaussianSplatData::kLodLeaf | 0x20000000u)) == 0u && (B & 0xFFu) < uint32(FGaussianSplatData::kLodLevelRuns))
+				{
+					const uint32 l = B & 0xFFu;
+					First[l] = Count[l] == 0u ? i : First[l];
+					Count[l]++;
+				}
+			}
+		}
+		for (int32 l = 0; l < FGaussianSplatData::kLodLevelRuns; l++)
+		{
+			Parameters.LodLevelRuns[l] = FUintVector4(First[l], Count[l], 0u, 0u);
+		}
+		LodFinestGroups = (LodLevels > 0 && SplatData.LodFinestLevel < uint32(FGaussianSplatData::kLodLevelRuns)
+			&& First[SplatData.LodFinestLevel] == SplatData.LodFinestBase) ? Count[SplatData.LodFinestLevel] : 0u;
+	}
 	Parameters.LodExtent = SplatData.LodExtent;
 	Parameters.LodBoundsLo = SplatData.LodBoundsLo;
 	Parameters.LodUnitsToCm = SplatData.bPacked ? SplatData.PackedUnitsToCm : SplatData.FileUnitsToCm;
 	Parameters.LodWords = LodWordsBuffer.SRV;
+	Parameters.LodGroupStarts = LodGroupStartsBuffer.SRV;
+	Parameters.LodSplatsEnd = LodSplatsEnd;
+	Parameters.LodFinestGroups = LodFinestGroups;
+	Parameters.LodGroupRuns = GetLodGroupRuns();
+	if (!PackedPositionsBuffer.SRV.IsValid())
+	{
+		PackedPositionsBuffer = CreateBuffer(TArray<FVector4f>(), TEXT("GaussianSplatsPackedPositionsNone"));
+		PackedShapeBuffer = CreateBuffer(TArray<uint32>(), TEXT("GaussianSplatsPackedShapeNone"));
+	}
+	Parameters.PackedResident = bPackedResident ? 1u : 0u;
+	Parameters.PackedUnitsToCm = SplatData.PackedUnitsToCm;
+	Parameters.PackedPositions = PackedPositionsBuffer.SRV;
+	Parameters.PackedShape = PackedShapeBuffer.SRV;
 	Parameters.VolumeOn = bVolume ? 1u : 0u;
 	Parameters.VolumeDensityScale = SplatData.VolumeDensityScale;
 	Parameters.VolumeEmissionScale = SplatData.VolumeEmissionScale;
@@ -645,6 +877,9 @@ void FGaussianSplatResource::ReleaseRHI()
 	PackedCurvature.SafeRelease();
 	CurvatureBuffer.SafeRelease();
 	LodWordsBuffer.SafeRelease();
+	LodGroupStartsBuffer.SafeRelease();
+	PackedPositionsBuffer.SafeRelease();
+	PackedShapeBuffer.SafeRelease();
 	VolumeBuffer.SafeRelease();
 	TransferBuffer.SafeRelease();
 	TransferSurfaceBuffer.SafeRelease();

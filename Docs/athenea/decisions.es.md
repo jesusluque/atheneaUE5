@@ -22,6 +22,9 @@ usar el plugin está en `operations.es.md`; cómo está organizado el código, e
 11. [Transferencia, el cuerpo y el pulido](#11-transferencia-el-cuerpo-y-el-pulido)
 12. [.splat, .spz, .sog y glTF](#12-splat-spz-sog-y-gltf)
 13. [Lo que no está hecho](#13-lo-que-no-está-hecho)
+14. [Niveles de detalle](#14-niveles-de-detalle-9-nov)
+15. [Medios de gaussianas](#15-medios-de-gaussianas-9-nov)
+16. [Secuencias](#16-secuencias-9-nov)
 
 ## 1. El fork y dónde se ejecuta
 
@@ -581,11 +584,10 @@ splats.
   athenea), el ensanchamiento de un pliegue (su `bakeSpread`), la curvatura de
   un fichero v2, las luces analíticas, la transferencia zonal de las nubes con skinning, y una captura del cielo en
   tiempo real.
-- **Niveles y streaming de `.athc`.** Los niveles fusionados, el corte por
-  frame y el streaming de chunks; las normales, la emisión y los extras. En la
-  versión 3 la curvatura, el codebook de oclusión, una transferencia zonal, el
-  skin y el tier compacto; las fusiones de un árbol paginado se decodifican y
-  se ocultan, no se omiten.
+- **Streaming de `.athc`.** El streaming de chunks (los niveles se cortan
+  cada frame, §14, pero todos los chunks están en el asset); las normales, la
+  emisión y los extras. En la versión 3 los niveles fusionados de tipo 0, el
+  codebook de oclusión, una transferencia zonal, el skin y el tier compacto.
 - **Otros formatos.** `.athv` (vídeo HEVC), `.athl` (las capas de luz de la
   web), la capa K de un `.athz`; la extensión de sistema de coordenadas de un SPZ; la transformación de
   un nodo de glTF, más de una primitiva de gaussianas, los accessors sparse y
@@ -598,7 +600,8 @@ splats.
   transitorios dimensionados a `MaxSplats`, los 64 workgroups y los 32 bits
   del sort.
 - **Almacenamiento f16** para las rutas PLY y USD, y su conversión en la GPU.
-- **Tests automáticos** en el plugin.
+- **Tests automáticos** del render: los de los importadores ya están
+  (development §7); los fotogramas se siguen comparando a mano con athenea.
 
 ## El paquete que hace BuildPlugin (8 nov)
 
@@ -623,3 +626,274 @@ RHI (`RHIFwd.h`, `RHIResources.h`, `RHIFeatureLevel.h`), los del render graph
 `override` del proxy: sin declarar, se caían los tres métodos del contador de
 índices de la interfaz. Cada fichero incluye ahora lo que usa, y el paquete
 compila.
+
+## 14. Niveles de detalle (9 nov)
+
+**El corte.** Un `.athc` versión 1 o 2 guarda niveles fusionados: los grupos
+de cada nivel siguen a los splats en el asset con dos palabras por gaussiana
+(la celda del octree y el nivel de un grupo, el grupo más fino de un splat), y
+la pasada de culling decide por gaussiana como lo hace el `lod_cut.slang` de
+athenea: un grupo se dibuja si su celda abarca como mucho `LodPixels` píxeles
+en su punto más cercano al ojo y la de su padre no, un splat si la celda de su
+grupo más fino abarca más. El árbol paginado de un fichero versión 3 se corta
+como lo corta el `lod_tree_cut.slang` de athenea: el padre de cada nodo se
+nombra al importar a partir de las palabras `TREE` de las páginas, y un nodo
+se dibuja si es una hoja o es lo bastante estrecho en pantalla y su padre no.
+El corte es por primitivo y por vista: el buffer de índices que escribe es el
+del proxy, pero cada vista hace su culling y dibuja antes que la siguiente,
+así que dos scene captures de pawn.athc en los mismos frames, a una y a
+dieciséis veces la distancia de encuadre (LodPixels 8), coinciden cada una con
+la misma vista dibujada sola (RMS 3e-5 y 1,5e-8).
+
+**El kernel.** Un grupo fusionado lleva una opacidad de 5: el kernel más duro
+de Spark, que athenea dibuja como `1 − (1 − g)^A`. Dibujado como cinco veces
+una gaussiana, su alfa pasaba de uno en la mezcla premultiplicada, lo que
+aclaraba su borde y oscurecía los splats de detrás: un corte lejano salía como
+un enrejado. El pixel shader dibuja ahora la caída de athenea y el quad se
+ensancha 0,7 (D − 1) desviaciones; un surfel plano devuelve su dilatación por
+área (el `surfelPaid` de athenea).
+
+**Medido** (`r.Gaussians.Athenea.LogSplats`, los splats de una nube enviados
+al rasterizador; RMS de imagen frente al corte apagado, 768 px): pawn.athc
+(325.833 gaussianas, 8 niveles) a 1 px dibuja 121.241 a cuatro veces la
+distancia de encuadre (RMS 0,006) y 8.725 a dieciséis (0,005), 37 veces menos;
+la primera nube del cuerpo de la escena web del peón (árbol paginado, 891.383
+hojas) 279.890 y 10.394 (0,013; 0,011), 86 veces menos.
+
+**Un `.athz`.** Sus niveles fusionados solo se decodificaban como padres de
+los splats. Ahora se dibujan: cada nivel es un bloque tras los splats, leído
+de donde lo dejó el decodificado en el scratch, y la transferencia CPCA de un
+nivel se expande con una cabecera propia, así que una fusión se reilumina
+como un splat. Las palabras del corte no pueden venir aquí de la CPU (las
+colas van codificadas con rANS), así que una pasada las escribe en el
+dispositivo a partir de las colas decodificadas. pawntop.athz a 1 px: 17.243
+de 292.056 splats a dieciséis veces la distancia, RMS 0,0028.
+
+**Una escena web partida en ficheros.** El cuerpo de la escena web del peón
+son dos `.athc` cuyas hojas se completan entre sí; cada uno es un asset, y una
+importación desde un script guarda solo el primero salvo que se guarden
+también los demás, lo que hacía que el cuerpo pareciera roto.
+
+**El presupuesto de splats.** Los buffers del frame caben `MaxSplats` splats,
+y el prepass añade nube tras nube: pasado el final, las nubes dibujadas al
+final perdían sus splats. Un vuelo sobre el pueblo de 106 M de gaussianas
+(cuatro partes) perdía una parte entera durante tres segundos al cruzar el
+acantilado, y la recuperaba al bajar la vista. Cada vista guarda ahora cuatro
+palabras en el dispositivo: el prepass suma lo que quería antes del corte del
+final, y en el corte del frame siguiente un kernel de un hilo escala el umbral
+por la raíz cuadrada del exceso sobre el 85 % de la capacidad (los splats de un
+corte van como el inverso del cuadrado de su umbral), y lo relaja un 3 % por
+frame por debajo del 60 %. La CPU solo nombra el buffer de la vista. Medido en
+el mismo vuelo, `LodPixels` 2 y 12 M, en `-game` (`LogSplats`): ningún frame
+llegó al tope (como mucho 10,8 M); el factor llegó a 2,82 sobre el acantilado
+y se quedó en 1 en lo alto y sobre los tejados. El primer frame de una vista
+que se desborda aún pierde splats; una nube sin niveles de detalle no se
+puede hacer más gruesa y se sigue cortando.
+
+**La tasa de frames del vuelo** (1920 × 1080, RTX 3070 Laptop, frames por
+segundo de reloj contados sobre ráfagas completas, medianas de cada tramo):
+80 en lo alto sobre el mar, 18,7 cruzando el acantilado con todo el pueblo en
+vista (GPU unos 60 ms: raster 39, sort 5,7, prepass 5,5, culling 4,3), 31,9
+sobre los tejados. Con los quads de los splats tenues ajustados a su opacidad
+y el corte escalonado, el mismo vuelo: 77,7, 17,1 y 36,4. Con `MaxSplats` 6 M
+el frame de GPU del acantilado baja de 61 a 36 ms, con el pueblo lejano
+dibujado como fusiones gruesas y redondas. Sin ventana, `FrameTime` no es la
+duración del frame (operaciones §7.2).
+
+**De delante a atrás** (10 nov). De atrás a delante se mezcla cada gaussiana
+de cada capa, y el pixel shader escribía la profundidad de cada splat, así
+que ningún fragmento se descartaba antes de sombrearse.
+`r.Gaussians.Athenea.FrontToBack` N dibuja los splats sin iluminar del más
+cercano al más lejano en un buffer propio, cada uno bajo lo que ya hay, con el
+quad a la profundidad de su splat; los splats ordenados van en N lotes, cada
+uno el doble del anterior, y tras cada lote un pase sobre la pantalla cierra
+los píxeles que han llegado a 0,996 de opacidad. La imagen es la de atrás a
+delante: diferencia media 0,04/255 en los frames del vuelo, 0,01 % de píxeles
+por encima de 2/255. El mismo vuelo, frame de GPU, de atrás a delante frente
+a 8 lotes: 12,1 y 9,2 ms en lo alto sobre el mar, 45 y 30 cruzando el
+acantilado, 37 y de 21 a 24 sobre los tejados (de 22 a 33 y de 26 a 41-46
+frames por segundo). 12 y 16 lotes midieron como 8. Un segundo target para la
+velocidad cuesta unos 5 ms del frame del acantilado sea cual sea su formato
+(la profundidad más cercana en R32F, o la velocidad en RGBA16F), así que solo
+se escribe con un anti-aliasing temporal, lo único que la lee. 8 lotes es el
+valor por defecto; los tests de automatización del plugin pasan con él. No hecho: la
+ruta iluminada ya dibuja de delante a atrás, sin los lotes.
+
+**El corte por el frustum** (`LodFrustum`, 10 nov). El pase de culling
+cortaba los niveles y nada más, así que el prepass recorría cada gaussiana
+del corte, en pantalla o no. Ahora el corte deja fuera además las celdas que
+no alcanzan los cuatro planos laterales de la vista, como el corte con
+presupuesto de athenea. El vuelo con él, de delante a atrás: los mismos
+9,2 ms en lo alto, 28 frente a 30-32 sobre el acantilado, 20 frente a 25
+bajando, de 11,4 a 12,4 frente a 21-22 sobre los tejados (de 78 a 92 frames
+por segundo). Los frames son los del corte entero a nivel de calle (ningún
+píxel por encima de 2/255) y al 0,05 % sobre el acantilado; con la celda
+ampliada en una arista en vez de arista y media se perdían splats cercanos
+en el borde inferior del frame (del 0,35 al 0,5 %). Los pases de sombras del
+vertex factory dibujan la misma lista de índices, así que por defecto solo
+se corta así una nube que no proyecta sombra.
+
+**Los grupos juzgados una vez** (`LodGroupState`, 10 nov). El pase de
+culling costaba 4,3 ms en cualquier vista del pueblo: cada uno de los 106 M
+de splats leía la celda de su grupo del nivel más fino y la juzgaba, la misma
+respuesta para todos los splats de un grupo. Un pase sobre los grupos
+(`GSLodStateCS`, como `lodCutFinest` de athenea guarda su estado) escribe una
+palabra por grupo, y cada splat lee la de su grupo. El vuelo, con el corte
+por frustum: 7,9 frente a 9,2 ms en lo alto, 26,8 frente a 28 sobre el
+acantilado, 9,5 frente a 11,5 sobre los tejados (107 frames por segundo); los
+mismos frames.
+
+**El corte por sus grupos** (`LodGroupRuns`, 10 nov). Una parte del pueblo
+son 26,6 M de splats en 483 mil grupos del nivel más fino, y los splats de un
+`.athc` van en orden de Morton: los de un grupo son un tramo, y los tramos
+van en el orden de los grupos. Dónde empieza cada uno se lee una vez de las
+palabras del corte al crear el recurso (cualquier otra cosa que aparezca ahí
+deja los tramos sin usar), y donde ningún volumen de clipping recorta la nube
+el pase recorre solo los grupos (`GSplatCullingGroupsCS`): un grupo que se
+dibuja reserva sitio para su tramo con una suma atómica y lo escribe. El pase
+de culling: 4,3 ms por vista, 3 con los grupos juzgados una vez, menos de 1
+así. El vuelo con el corte por frustum: 6,1 ms en lo alto (165 frames por
+segundo), 24,5 sobre el acantilado, 8,5 sobre los tejados; los mismos frames
+(ningún píxel por encima de 2/255). No hecho: un `.athz`, cuyas palabras se
+escriben en el dispositivo, y un árbol paginado.
+
+**Los splats aclarados** (`LodThin`, 10 nov). Con el ojo en movimiento, el
+sitio donde los splats de una parte dejan paso a su nivel fusionado más fino
+se veía como una línea sobre el suelo, y el turno de cada grupo como un pop:
+el último paso del corte es el mayor, una gaussiana fusionada por unos 55
+splats en esta captura, y un umbral escalonado solo reparte dónde ocurre.
+Dibujar los splats hacia su grupo (`LodMorphSplats`) quitaba la línea y
+suavizaba el suelo cercano (un 28 % de la energía de bordes de un frame a 2,
+un 47 % a 4). Aclararlos no: mientras la celda de un grupo abarca menos de
+`LodThin` umbrales se dibuja una fracción de sus splats, que se reduce a la
+mitad con cada paso igual de log r hasta un treintaidosavo, elegida por un
+hash del splat. Los que se dibujan llevan la masa del resto. Toda por anchura
+extendía los splats largos de un prado lejano sobre el horizonte; por anchura
+y una opacidad por encima de 1 quedaban como esquirlas (athenea, a un
+treintaidosavo). Así que: un poco por anchura, el resto por opacidad hasta 1,
+y en la última mitad de la banda los supervivientes se dibujan hacia la
+gaussiana fusionada del grupo, que es lo que son en el cambio. Con una banda
+de 4, la bajada del vuelo: energía de bordes de un frame 24,6 frente a 19,9,
+21,3 frente a 17,6 sobre el acantilado, casas donde había fusiones por todo
+el pueblo, un 3 % más brillante. Además dibuja menos splats donde el límite
+era el presupuesto: la bajada del vuelo 9,5 frente a 27,6 ms, el acantilado
+12,8 frente a 26,7, 5 en lo alto; sobre los tejados 13,7 frente a 8,9 (el
+aclarado de un splat es una cosa más que pregunta el prepass). Un splat que
+se apagaba de un frame al siguiente hacía parpadear la banda: se desvanece en
+el último 30 % de la fracción antes de su turno. Y el factor del presupuesto,
+que subía a saltos y bajaba un 3 % por frame, movía de golpe la fracción de
+todos los grupos: ahora se mueve un 1 % por frame, hacia arriba por encima de
+nueve décimas de la capacidad y hacia abajo por debajo de tres cuartos, y solo
+se responde de una vez a un frame que pedía más de lo que cabe. Activo por
+defecto (4), con `LodMorph` 2 para los niveles fusionados.
+
+Lo que quedaba del parpadeo de la banda se midió con la vista quieta
+(`hold_sequence.py`) y el umbral barrido (`LodSweep` 1, sin presupuesto,
+`LodPixels` 3), de modo que un frame solo difiere del siguiente por lo que
+cambia el corte; la mitad de la segunda diferencia en el tiempo por debajo
+del cielo, píxeles por encima de 4/255. Aclarado, 0,78 %; sin aclarar,
+0,10 %. No era que un grupo llegara al cambio sin ningún splat o con tres:
+con la opacidad de la gaussiana fusionada repartida entre los supervivientes
+medía lo mismo, 0,80 %, y un grupo que acababa con exactamente un splat (una
+fracción hasta 0,3 / n) aclaraba la banda tan deprisa que las casas quedaban
+como manchas, 1,21 %. Era la opacidad: por encima de 1 una gaussiana es el
+kernel duro y se dibuja sin lo que una pequeña devuelve, y un splat aclarado
+de camino a una gaussiana fusionada de opacidad mayor que 1 lo cruzaba al
+moverse la fracción, cada cruce un salto. Un splat aclarado se queda ahora
+como mucho en 1 (o en la suya, si ya era mayor): 0,13 %, y desaparecen los
+borrones duros y oscuros que dejaba por la banda. Con ello el turno de un
+splat ya no es un hash sino su lugar en el run de su grupo por la razón áurea
+(`LodThinTurn`): un grupo conserva su fracción de splats con uno más o uno
+menos, repartidos a lo largo del run, y su primer splat nunca se quita, así
+que ningún grupo queda vacío antes del cambio. Donde los splats de una nube
+no están en los runs de sus grupos se mantiene el hash. athenea da los mismos
+turnos: sus `starts` son estos runs. El frame de GPU del vuelo con ello, antes
+y después (3070, 1080p): 6,6 y 6,8 ms en lo alto, 10,0 y 11,0 en la bajada,
+13,2 y 13,4 sobre el acantilado, 15,2 y 15,6 en su peor punto, 13,5 y 13,1 a
+pie de calle: un splat al que se pregunta su turno lee dónde empieza el run
+de su grupo.
+
+**El parpadeo del plano general** (10 nov). Visto entero desde lejos y sin
+anti-aliasing, el pueblo parpadea de frame a frame al moverse el ojo. La
+mitad de la segunda diferencia en el tiempo, |f(t) − (f(t−1) + f(t+1))/2|, en
+48 frames de los primeros segundos del vuelo, píxeles por encima de 4/255:
+1,69 % con `LodPixels` 2; 2,24 % barriendo además el umbral (`LodSweep` 1),
+así que tres cuartas partes no son los niveles cambiando sino aliasing de
+gaussianas sub-píxel. Lo que lo calma, con la energía de bordes de un frame al
+lado (22,9 tal cual): `LodPixels` 3, 1,21 % y 23,0; `LodPixels` 4, 0,92 % y
+20,8; `Dilation` 0,6, 1,31 % y 20,8; `Dilation` 1,0, 1,03 % y 18,9; el TSR
+del motor, 0,61 % y 18,2. `LodPixels` 3 es lo que no cuesta nada, y dibuja
+menos splats: 9,3 frente a 17,6 ms bajando, 18,5 frente a 22,5 sobre los
+tejados, el acantilado igual (los 8 M del presupuesto en ambos casos).
+
+**El corte con morph** (`LodMorph`, 10 nov). El `--lod-morph` de athenea, la
+misma aritmética en el prepass: una gaussiana a una fracción del camino hacia
+su grupo padre cuando el padre se acerca a su umbral. En el pueblo no bajó el
+parpadeo de arriba (de 2,26 a 2,42 % con barrido, a 1,15 y 1,5) y una banda
+de 1,5 quitó un 15 % de la energía de bordes de un frame sobre el
+acantilado. Con los splats aclarados es solo de los niveles fusionados (2 por
+defecto). El padre de un grupo se busca por su celda
+en el nivel de arriba, con el tramo de grupos de cada nivel leído una vez de
+las palabras del corte al crear el recurso.
+
+## 15. Medios de gaussianas (9 nov)
+
+Un ParticleField marcado con `primvars:athenea:splat:volume`
+(`athenea vdb2splat`) es un medio: por gaussiana una sigma y una temperatura,
+su albedo en el término constante del color, y las constantes del medio leídas
+de los primvars del stage (`densityScale`, `albedo`, `volume:emission`,
+`volume:emissionScale`, `volume:temperatureScale`,
+`volume:temperatureOffset`). Cada gaussiana se dibuja con el alfa
+1 − exp(−τ g): τ = densityScale σ √(2π) / √(rᵀ Σ⁻¹ r), su profundidad óptica a
+lo largo del rayo por su centro, a partir de la covarianza de la propia
+proyección, y g la gaussiana en imagen; llega al pixel shader como una
+opacidad negativa. Su color es el de athenea: el albedo por la luz que
+dispersa y (1 − albedo) por el brillo, el brillo el cuerpo negro de athenea
+(Planck contra el ajuste CIE 1931, a luminancia σ_SB T⁴ / π · 10⁻⁶), calculado
+por gaussiana en el prepass.
+
+**Su sombra sobre sí mismo.** athenea lee su cloud shadow map en el centro de
+cada gaussiana. Aquí, cada frame, la extinción del medio va a una rejilla de
+64³ sobre los límites del primitivo (punto fijo, atómicas, una gaussiana hasta
+tres desviaciones muestreada con a lo sumo nueve pasos por eje), y desde cada
+centro se avanza hacia la luz direccional de UE y hacia cinco direcciones del
+cielo de arriba; la luz dispersada toma las cuatro octavas de athenea
+(Wrenninge). Medido con `ue_time.sh` en la explosión en el aire de EmberGen
+reproduciéndose a 24 fps (20.000 gaussianas, 1280 × 720, medianas de 300
+frames): la sombra 0,94 ms, el raster 4,3 ms, el frame de GPU 11,2 ms con ella
+y 11,9 ms sin ella (lo mismo dentro de la dispersión entre ejecuciones).
+
+**Frente a athenea.** El frame 40 de la bola de fuego tiene la misma forma que
+el raster de athenea; el brillo cambia con la iluminación (el cielo de estudio
+de UE frente al domo tenue y la luz principal de athenea), y no hay fase
+anisótropa ni sombra entre el medio y otras nubes.
+
+## 15.1 Memoria de GPU por gaussiana (9 nov)
+
+Todo formato se decodifica en el dispositivo en los buffers que lee el
+rasterizador: posición, escala, rotación, color y opacidad (56 bytes por
+gaussiana) y los 45 coeficientes de resto. Eran 45 floats (180 bytes) para
+cada gaussiana, reservados incluso para una nube sin ninguno. Ahora son
+halves, dos por palabra y 46 por gaussiana (un relleno, para que ninguna
+palabra tenga coeficientes de dos gaussianas y un hilo escriba solo sus
+palabras), 92 bytes, reservados solo donde la nube dibuja alguno; los floats
+de un PLY o de un stage USD se empaquetan en el dispositivo (GSPackSHCS). Así
+la bicicleta (6,1 millones de gaussianas, sin coeficientes de resto) pasa de
+1,44 GB a 0,34 GB y el jardín (5,8 millones, grado 3) de 1,37 GB a 0,86 GB.
+Las imágenes son las mismas: RMS 3e-4 (PLY del jardín), 1,3e-6 (bonsái),
+1,2e-4 (el .athc del jardín) frente a los floats. Sigue por frame: los
+buffers transitorios del prepass a r.Gaussians.MaxSplats (unos 68 bytes por
+gaussiana visible).
+
+## 16. Secuencias (9 nov)
+
+Un medio de `vdb2splat` es un fichero por frame. Un componente guarda una
+lista de assets y cambia el que dibuja según pasa el tiempo (también en los
+viewports del editor); cada frame es su propio asset y su propio recurso de
+GPU, así que el cambio solo vuelve a crear el proxy. Setenta y dos frames de
+20.000 gaussianas son unos 90 MB de USD. Reproduciendo a 24 fps los 96 frames
+de la explosión en el aire en `-game` con un tope de 30 fps, el tiempo de
+frame en 300 frames es de 33,3 ms de mediana, 34,6 ms de p99 y 35,1 ms como
+máximo: los cambios no dejan parones.
+No está hecho el streaming de una secuencia desde disco en vez de tenerla
+entera.

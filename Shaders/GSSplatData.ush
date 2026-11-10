@@ -1,0 +1,84 @@
+// Copyright (c) 2026 jesus luque.
+//
+// A gaussian's position, scale, rotation and colour-and-opacity in local space,
+// as every pass reads them: from the decoded float buffers, or, where the
+// resource keeps athenea's packed arrays resident instead (PackedResident: a
+// .athc too large to decode, 32 bytes a gaussian in place of 56), unpacked
+// here as GSDecode.usf's GSDecodeAtheneaCS unpacks them -- positions float4
+// (xyz, opacity), shape four words (smallest-three rotation, log scale and the
+// constant colour as halves; athenea's common/packing.slang).
+
+#pragma once
+
+float GSPackedLowHalf(uint Word) { return f16tof32(Word & 0xFFFFu); }
+float GSPackedHighHalf(uint Word) { return f16tof32(Word >> 16); }
+
+float3 GSPackedToLocal(float3 V)
+{
+	return GSResources.FileAxisX * V.x + GSResources.FileAxisY * V.y + GSResources.FileAxisZ * V.z;
+}
+
+uint4 GSPackedShapeOf(uint i)
+{
+	const uint Row = i * 4u;
+	return uint4(GSResources.PackedShape[Row], GSResources.PackedShape[Row + 1u], GSResources.PackedShape[Row + 2u], GSResources.PackedShape[Row + 3u]);
+}
+
+float3 GSPos(uint i)
+{
+	if (GSResources.PackedResident != 0u)
+	{
+		return GSPackedToLocal(GSResources.PackedPositions[i].xyz) * GSResources.PackedUnitsToCm;
+	}
+	return GSResources.Positions[i];
+}
+
+float3 GSScl(uint i)
+{
+	if (GSResources.PackedResident != 0u)
+	{
+		const uint4 Shape = GSPackedShapeOf(i);
+		const float3 Scale = exp(float3(GSPackedLowHalf(Shape.y), GSPackedHighHalf(Shape.y), GSPackedLowHalf(Shape.z)));
+		return abs(GSPackedToLocal(Scale)) * (GSResources.PackedUnitsToCm / 100.0f);
+	}
+	return GSResources.Scales[i];
+}
+
+float4 GSRot(uint i)
+{
+	if (GSResources.PackedResident != 0u)
+	{
+		const uint Word = GSResources.PackedShape[i * 4u];
+		const uint Largest = Word & 3u;
+		float3 Small = float3(float((Word >> 22) & 1023u), float((Word >> 12) & 1023u), float((Word >> 2) & 1023u));
+		Small = (Small / 1023.0f * 2.0f - 1.0f) * 0.70710678f;
+		const float Rest = sqrt(max(0.0f, 1.0f - dot(Small, Small)));
+		float4 Q = 0;
+		uint Next = 0;
+		for (uint k = 0; k < 4u; ++k)
+		{
+			if (k == Largest)
+			{
+				Q[k] = Rest;
+			}
+			else
+			{
+				Q[k] = Small[Next];
+				Next += 1u;
+			}
+		}
+		const float Handed = dot(cross(GSResources.FileAxisX, GSResources.FileAxisY), GSResources.FileAxisZ);
+		return normalize(float4(GSPackedToLocal(Q.xyz), Handed > 0.0f ? -Q.w : Q.w));
+	}
+	return GSResources.Orientations[i];
+}
+
+float4 GSShOp(uint i)
+{
+	if (GSResources.PackedResident != 0u)
+	{
+		const uint4 Shape = GSPackedShapeOf(i);
+		return float4(GSPackedHighHalf(Shape.z), GSPackedLowHalf(Shape.w), GSPackedHighHalf(Shape.w), GSResources.PackedPositions[i].w);
+	}
+	return GSResources.SHAndOpacities[i];
+}

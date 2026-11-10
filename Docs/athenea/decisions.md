@@ -21,6 +21,9 @@ plugin is in `operations.md`; how the code is laid out, in `development.md`.
 11. [Transfer, the body and the polish](#11-transfer-the-body-and-the-polish)
 12. [.splat, .spz, .sog and glTF](#12-splat-spz-sog-and-gltf)
 13. [Not done](#13-not-done)
+14. [Levels of detail](#14-levels-of-detail-9-nov)
+15. [Media of gaussians](#15-media-of-gaussians-9-nov)
+16. [Sequences](#16-sequences-9-nov)
 
 ## 1. The fork and where it runs
 
@@ -538,10 +541,10 @@ are decoded only as the splats' parents.
   athenea's frame, a slope across a splat for the lobes that are not sharp (athenea's `slopeX`, `slopeY`), a fold's widening
   (its `bakeSpread`), a v2 file's curvature, analytic lights, the zonal transfer of skinned
   clouds, and a real-time sky capture.
-- **`.athc` levels and streaming.** The merged levels, the per-frame cut and
-  chunk streaming; the normals, emission and extras. In version 3 the
-  curvature, the occlusion codebook, a zonal transfer, the skin and the
-  compact tier; a paged tree's merges are decoded and hidden, not left out.
+- **`.athc` streaming.** Chunk streaming (the levels are cut every frame,
+  §14, but every chunk is in the asset); the normals, emission and extras. In
+  version 3 the merged levels of kind 0, the occlusion codebook, a zonal
+  transfer, the skin and the compact tier.
 - **Other formats.** `.athv` (HEVC video), `.athl` (the web's light layers),
   an `.athz`'s layer K;
   an SPZ's coordinate-system extension; a glTF node's transform, more than one
@@ -553,7 +556,8 @@ are decoded only as the splats' parents.
   metallic/roughness array, transient buffers sized to `MaxSplats`, the sort's
   64 workgroups and 32 bits.
 - **f16 storage** for the PLY and USD paths, and their conversion on the GPU.
-- **Automated tests** in the plugin.
+- **Automated tests** of the rendering: the importers' are in (development
+  §7); the frames are still compared by hand against athenea.
 
 ## The package BuildPlugin makes (8 Nov)
 
@@ -576,3 +580,255 @@ which the project's shared precompiled header had brought in: the RHI's
 `GaussianSplatInterface.h` the RHI types were the cause of the proxy's
 `override` errors: undeclared, the interface's three index count methods were
 dropped. Each file now includes what it uses, and the package builds.
+
+## 14. Levels of detail (9 Nov)
+
+**The cut.** A version 1 or 2 `.athc` keeps merged levels: each level's groups
+follow the splats in the asset with two words a gaussian (a group's octree
+cell and level, a splat's finest-level group), and the culling pass decides
+per gaussian as athenea's `lod_cut.slang` does: a group is drawn where its
+cell spans at most `LodPixels` pixels at its nearest point to the eye and its
+parent's does not, a splat where its finest group's cell spans more. A
+version 3 file's paged tree is cut as athenea's `lod_tree_cut.slang` cuts it:
+the parent of each node is named at the import from the pages' `TREE` words,
+and a node is drawn where it is a leaf or narrow enough on screen and its
+parent is not. The cut is per primitive and per view: the index buffer it
+writes is the proxy's, but each view culls and draws before the next, so two
+scene captures of pawn.athc in the same frames, at one and at sixteen times
+the framing distance (LodPixels 8), each match the same view drawn alone (RMS
+3e-5 and 1.5e-8).
+
+**The kernel.** A merged group carries an opacity of 5: Spark's harder kernel,
+which athenea draws as `1 − (1 − g)^A`. Drawn as five times a gaussian, its
+alpha passed one in the premultiplied blend, which brightened its rim and
+darkened the splats behind it: a far cut came out a lattice. The pixel shader
+now draws athenea's falloff and the quad is widened by 0.7 (D − 1)
+deviations; a flat surfel pays its dilation back by area (athenea's
+`surfelPaid`).
+
+**Measured** (`r.Gaussians.Athenea.LogSplats`, a cloud's splats sent to the
+rasteriser; image RMS against the cut off, 768 px): pawn.athc (325,833
+gaussians, 8 levels) at 1 px draws 121,241 at four times the framing distance
+(RMS 0.006) and 8,725 at sixteen (0.005), 37 times fewer; the first body cloud
+of the pawn web scene (paged tree, 891,383 leaves) 279,890 and 10,394
+(0.013, 0.011), 86 times fewer.
+
+**An `.athz`.** Its merged levels were decoded only as the splats' parents.
+They are now drawn: each level is a block after the splats, read from where
+the decode left it in the scratch, and a level's CPCA transfer is expanded by
+a head of its own, so a merge is relit as a splat is. The cut's words cannot
+come from the CPU here (the tails are rANS-coded), so a pass writes them on
+the device from the decoded tails. pawntop.athz at 1 px: 17,243 of 292,056
+splats at sixteen times the distance, RMS 0.0028.
+
+**A web scene split in files.** The pawn web scene's body is two `.athc`
+files whose leaves complete each other; each is an asset, and an import from a
+script saves only the first unless the rest are saved too, which made the body
+look torn.
+
+**The splat budget.** The frame's buffers hold `MaxSplats` splats, and the
+prepass appends cloud after cloud: past the end, the clouds drawn last lost
+their splats. A fly-in over the 106 M-gaussian town (four parts) lost a whole
+part for three seconds while crossing the cliff, and got it back as the view
+came down. Each view now keeps four words on the device: the prepass adds what
+it wanted before the end cut it, and at the next frame's cut a one-thread
+kernel scales the threshold by the square root of the excess over 85 % of the
+capacity (a cut's splats go as the inverse square of its threshold), easing
+back 3 % a frame below 60 %. The CPU only names the view's buffer. Measured on
+the same flight, `LodPixels` 2 and 12 M, in `-game` (`LogSplats`): no frame
+reached the cap (most 10.8 M); the factor peaked at 2.82 over the cliff and
+stayed 1 high up and over the roofs. The first frame of a view that
+overflows still drops splats; a cloud without levels of detail cannot be
+coarsened and is still cut short.
+
+**The flight's frame rate** (1920 × 1080, RTX 3070 Laptop, frames per
+wall-clock second counted over whole bursts, medians of each stretch): 80
+from high over the sea, 18.7 crossing the cliff with the whole town in view
+(GPU about 60 ms: raster 39, sort 5.7, prepass 5.5, culling 4.3), 31.9 over
+the roofs. With the faint splats' quads sized by their opacity and the cut
+staggered, the same flight: 77.7, 17.1 and 36.4. With `MaxSplats` 6 M the
+cliff's GPU frame falls from 61 to 36 ms, the far town drawn as coarse round
+merges. With no window, `FrameTime` is not the
+frame's duration (operations §7.2).
+
+**Front to back** (10 Nov). Back to front, every gaussian of every layer is
+blended, and the pixel shader wrote each splat's depth, so no fragment was
+dropped before it was shaded. `r.Gaussians.Athenea.FrontToBack` N draws the
+unlit splats nearest first into a buffer of their own, each under what is
+there, with the quad at its splat's depth; the sorted splats go in N batches,
+each twice the one before, and after each a pass over the screen closes the
+pixels that reached 0.996 of opacity. The image is the back-to-front one:
+mean difference 0.04/255 on the flight's frames, 0.01 % of pixels past 2/255.
+The same flight, GPU frame, back to front against 8 batches: 12.1 and 9.2 ms
+high over the sea, 45 and 30 crossing the cliff, 37 and 21 to 24 over the
+roofs (22 to 33 and 26 to 41-46 frames a second). 12 and 16 batches measured
+as 8. A second target for the velocity costs about 5 ms of the cliff's frame
+whatever its format (the nearest depth in R32F, or the velocity in RGBA16F),
+so it is written only under a temporal anti-aliasing, the one thing that
+reads it. 8 batches is the default; the plugin's automation tests pass with
+it. Not done: the relit path already draws front to back, without the
+batches.
+
+**The cut by the frustum** (`LodFrustum`, 10 Nov). The culling pass cut the
+levels and nothing else, so the prepass walked every gaussian of the cut,
+on screen or not. The cut now also leaves out the cells the view's four side
+planes do not reach, as athenea's budgeted cut does. The flight with it,
+front to back: the same 9.2 ms high up, 28 against 30 to 32 over the cliff,
+20 against 25 coming down, 11.4 to 12.4 against 21 to 22 over the roofs (78
+to 92 frames a second). The frames are the uncut ones at street level (no
+pixel past 2/255) and to 0.05 % over the cliff; with a cell grown by one
+edge instead of an edge and a half, near splats at the frame's lower edge
+were lost (0.35 to 0.5 %). The vertex factory's shadow passes draw the same
+index list, so by default only a cloud that casts no shadow is cut this way.
+
+**The groups judged once** (`LodGroupState`, 10 Nov). The culling pass
+cost 4.3 ms in every view of the town: each of 106 M splats read its
+finest-level group's cell and judged it, the same answer for every splat of
+a group. A pass over the groups (`GSLodStateCS`, as athenea's `lodCutFinest`
+keeps its state) writes a word a group, and a splat reads its group's. The
+flight, with the frustum cut: 7.9 against 9.2 ms high up, 26.8 against 28
+over the cliff, 9.5 against 11.5 over the roofs (107 frames a second); the
+same frames.
+
+**The cut by its groups** (`LodGroupRuns`, 10 Nov). A part of the town is
+26.6 M splats in 483 thousand finest-level groups, and a `.athc`'s splats
+lie in Morton order: a group's are one run, the runs in the groups' order.
+Where each begins is read once from the cut's words when the resource is
+made (anything else found there leaves the runs unused), and where no
+clipping volume culls the cloud the pass walks the groups alone
+(`GSplatCullingGroupsCS`): a drawn group takes room for its run with one
+atomic add and writes it. The culling pass: 4.3 ms a view, 3 with the groups
+judged once, under 1 so. The flight with the frustum cut: 6.1 ms high up
+(165 frames a second), 24.5 over the cliff, 8.5 over the roofs; the same
+frames (no pixel past 2/255). Not done: an `.athz`, whose words are written
+on the device, and a paged tree.
+
+**The splats thinned** (`LodThin`, 10 Nov). With the eye moving, the place
+where a part's splats give way to its finest merged level showed as a line
+across the ground, and each group's turn as a pop: the cut's last step is its
+largest, one merged gaussian for some 55 splats in this capture, and a
+staggered threshold only spreads where it happens. Drawing the splats toward
+their group (`LodMorphSplats`) removed the line and softened the near ground
+(28 % of a frame's edge energy at 2, 47 % at 4). Thinning them does not:
+while a group's cell spans under `LodThin` thresholds a fraction of its
+splats is drawn, halving with each equal step of log r down to a
+thirty-second, chosen by a hash of the splat. Those drawn carry the rest's
+mass. All of it by width smeared a far meadow's long splats over the
+horizon; by width and an opacity past 1 they stood as shards (athenea, at a
+thirty-second). So: a little by width, the rest by opacity up to 1, and over
+the band's last half the survivors are drawn toward the group's merged
+gaussian, which they are at the switch. At a band of 4, the descent of the
+flight: a frame's edge energy 24.6 against 19.9, 21.3 against 17.6 over the
+cliff, houses where merges stood across the town, 3 % brighter. It also
+draws fewer splats where the budget was the limit: the flight's descent 9.5
+against 27.6 ms, the cliff 12.8 against 26.7, 5 high up; over the roofs 13.7
+against 8.9 (a splat's thinning is one more thing the prepass asks). A splat
+going out one frame to the next made the band flicker: it fades over the last
+30 % of the fraction before its turn. And the budget's factor, which rose by
+whole steps and eased back 3 % a frame, moved every group's fraction at once:
+it now moves 1 % a frame, up over nine tenths of the capacity and down under
+three quarters, and only a frame that wanted more than there is room for is
+answered at once. On by default (4), with `LodMorph` 2 for the merged levels.
+
+What was left of the band's flicker was measured with the view held still
+(`hold_sequence.py`) and the threshold swept (`LodSweep` 1, no budget,
+`LodPixels` 3), so that a frame differs from the next only by what the cut
+switches; half the second difference in time below the sky, pixels past
+4/255. Thinned, 0.78 %; with no thinning, 0.10 %. A group left with no splat
+or with three at the switch was not it: the survivors given the merged
+gaussian's opacity split among them measured the same, 0.80 %, and a group
+ending with exactly one splat (a fraction down to 0.3 / n) thinned the band
+so fast that houses stood as blobs, 1.21 %. It was the opacity: over 1 a
+gaussian is the harder kernel and is drawn without what a small one pays
+back, and a thinned splat on its way to a merged gaussian of opacity over 1
+crossed it as the fraction moved, each crossing a jump. A thinned splat now
+stays at 1 at most (or at its own, if that was over): 0.13 %, and the dark
+hard blots it left across the band are gone. With it a splat's turn is no
+longer a hash but its place in its group's run by the golden ratio
+(`LodThinTurn`): a group keeps its fraction of splats to one more or less,
+spread along the run, and its first splat is never dropped, so no group
+stands empty before the switch. Where a cloud's splats are not in their
+groups' runs the hash stays. athenea takes the same turns: its `starts` are
+these runs. The flight's GPU frame with it, before and after (3070, 1080p):
+6.6 and 6.8 ms high up, 10.0 and 11.0 on the descent, 13.2 and 13.4 over the
+cliff, 15.2 and 15.6 at its worst, 13.5 and 13.1 at street level -- a splat
+asked for its turn reads where its group's run begins.
+
+**The wide view's shimmer** (10 Nov). Seen whole from afar with no
+anti-aliasing, the town flickers from frame to frame as the eye moves. Half
+the second difference in time, |f(t) − (f(t−1) + f(t+1))/2|, over 48 frames
+of the flight's first seconds, pixels past 4/255: 1.69 % at `LodPixels` 2;
+2.24 % with the threshold swept as well (`LodSweep` 1), so three quarters of
+it is not the levels switching but sub-pixel gaussians aliasing. What calms
+it, with the edge energy of a frame beside (22.9 as it is): `LodPixels` 3,
+1.21 % and 23.0; `LodPixels` 4, 0.92 % and 20.8; `Dilation` 0.6, 1.31 % and
+20.8; `Dilation` 1.0, 1.03 % and 18.9; the engine's TSR, 0.61 % and 18.2.
+`LodPixels` 3 is the one that costs nothing, and it draws fewer splats: 9.3
+against 17.6 ms coming down, 18.5 against 22.5 over the roofs, the cliff the
+same (the budget's 8 M either way).
+
+**The cut morphed** (`LodMorph`, 10 Nov). athenea's `--lod-morph`, the same
+arithmetic in the prepass: a gaussian a fraction of the way to its parent
+group as the parent nears its threshold. On the town it did not lower the
+flicker above (2.26 to 2.42 % swept, at 1.15 and 1.5) and a band of 1.5 took
+15 % of a frame's edge energy over the cliff. With the splats thinned it is
+the merged levels' alone (2 by default). A group's parent
+is found by its cell in the level above, each level's run of groups read once
+from the cut's words when the resource is made.
+
+## 15. Media of gaussians (9 Nov)
+
+A ParticleField marked `primvars:athenea:splat:volume` (`athenea vdb2splat`)
+is a medium: per gaussian a sigma and a temperature, its albedo in the colour's
+constant term, and the medium's constants read from the stage's primvars
+(`densityScale`, `albedo`, `volume:emission`, `volume:emissionScale`,
+`volume:temperatureScale`, `volume:temperatureOffset`). Each gaussian is drawn
+with the alpha 1 − exp(−τ g): τ = densityScale σ √(2π) / √(rᵀ Σ⁻¹ r), its
+optical depth along the ray through its centre, from the projection's own
+covariance, and g the image gaussian; it is carried to the pixel shader as a
+negative opacity. Its colour is athenea's: albedo times the light it scatters
+and (1 − albedo) times the glow, the glow athenea's black body (Planck against
+the CIE 1931 fit, at luminance σ_SB T⁴ / π · 10⁻⁶), computed per gaussian in
+the prepass.
+
+**Its shadow on itself.** athenea reads its cloud shadow map at each
+gaussian's centre. Here each frame the medium's extinction goes into a 64³
+grid over the primitive's bounds (fixed point, atomics, a gaussian out to
+three deviations sampled with at most nine steps an axis), and each centre
+marches to UE's directional light and to five directions of the sky above; the
+scattered light takes athenea's four octaves (Wrenninge). Measured with
+`ue_time.sh` on the EmberGen mid-air explosion playing at 24 fps (20,000
+gaussians, 1280 × 720, medians of 300 frames): the shadow 0.94 ms, the raster
+4.3 ms, the GPU frame 11.2 ms with it and 11.9 ms without (the same within the
+runs' spread).
+
+**Against athenea.** The fireball's frame 40 has the same shape as athenea's
+raster of it; the brightness differs with the lighting (UE's studio sky
+against athenea's dim dome and key), and there is no anisotropic phase or
+shadow between the medium and other clouds.
+
+## 15.1 GPU memory a gaussian (9 Nov)
+
+Every format is decoded on the device into the buffers the rasteriser reads:
+position, scale, rotation, colour and opacity (56 bytes a gaussian) and the
+45 rest coefficients. Those were 45 floats (180 bytes) for every gaussian,
+allocated even for a cloud with none. They are now halves, two a word and 46
+a gaussian (a pad, so that no word holds two gaussians' and a thread writes
+its own words alone), 92 bytes, allocated only where the cloud draws any; a
+PLY's or a USD stage's floats are packed on the device (GSPackSHCS). So the
+bicycle (6.1 million gaussians, no rest coefficients) goes from 1.44 GB to
+0.34 GB and the garden (5.8 million, degree 3) from 1.37 GB to 0.86 GB. The
+pictures are the same: RMS 3e-4 (garden PLY), 1.3e-6 (bonsai), 1.2e-4 (the
+garden's .athc) against the floats. Still per frame: the prepass's transient
+buffers at r.Gaussians.MaxSplats (about 68 bytes a visible gaussian).
+
+## 16. Sequences (9 Nov)
+
+A medium from `vdb2splat` is a file a frame. A component holds a list of
+assets and switches the one it draws as time passes (in the editor's
+viewports too); each frame is its own asset and its own GPU resource, so the
+switch re-creates only the proxy. Seventy-two frames of 20,000 gaussians are
+about 90 MB of USD. Playing the 96-frame mid-air explosion at 24 fps in
+`-game` under a 30 fps cap, the frame time over 300 frames is 33.3 ms median,
+34.6 ms p99 and 35.1 ms at most: the switches leave no stall. Streaming a sequence
+from disk, rather than holding it whole, is not done.

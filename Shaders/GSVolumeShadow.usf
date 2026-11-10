@@ -21,6 +21,7 @@
 #include "/Engine/Private/Common.ush"
 #include "/Engine/Private/Quaternion.ush"
 #include "/Engine/Generated/GeneratedUniformBuffers.ush"
+#include "GSSplatData.ush"
 
 #define GS_GRID 64u
 #define GS_FIXED 4096.0f
@@ -45,9 +46,9 @@ void GSVolumeDepositCS(uint3 Id : SV_DispatchThreadID)
 	{
 		return;
 	}
-	const float3 P = GSResources.Positions[i];
-	const float3 S = max(GSResources.Scales[i] * 100.0f, 1.0e-3f);
-	const float3x3 R = QuatToMatrix(GSResources.Orientations[i]);
+	const float3 P = GSPos(i);
+	const float3 S = max(GSScl(i) * 100.0f, 1.0e-3f);
+	const float3x3 R = QuatToMatrix(GSRot(i));
 	const float Sigma = GSResources.VolumeDensityScale * GSResources.Volume[i].x;
 	if (!(Sigma > 0.0f))
 	{
@@ -112,7 +113,7 @@ void GSVolumeShadowCS(uint3 Id : SV_DispatchThreadID)
 		OutShadow[i] = float2(1.0f, 1.0f);
 		return;
 	}
-	const float3 P = GSResources.Positions[i];
+	const float3 P = GSPos(i);
 	// UE's directional light (View.DirectionalLightDirection points at it).
 	const bool bLight = any(View.DirectionalLightColor.rgb > 0.0f);
 	const float Sun = bLight ? exp(-GSOpticalDepth(P, GSToLocal(View.DirectionalLightDirection.xyz))) : 1.0f;

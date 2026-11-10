@@ -10,6 +10,7 @@
 #include "/Engine/Private/Nanite/NaniteHZBCull.ush"
 
 #include "Shared/GaussiansDefinitions.h"
+#include "GSSplatData.ush"
 #include "GSColor.ush"
 
 #ifndef ENABLE_RELIGHTING
@@ -74,6 +75,16 @@ Buffer<uint> SplatIndexBuffer;
 Buffer<uint> SplatIndexCounter;
 
 RWBuffer<uint> Counter;
+// athenea: the view's splat budget (GSplatCulling.usf, GSLodBudgetCS): [1] the
+// splats this frame wanted, [2] the capacity when the clouds hold more.
+RWBuffer<uint> LodBudgetOut;
+uint LodBudgetCap;
+float MipDilation;
+
+// The cut and its morph, the budget's factor read through the buffer this
+// pass writes (one view of a buffer a pass).
+#define GS_LOD_BUDGET_SCALE asfloat(LodBudgetOut[0])
+#include "GSLod.ush"
 
 RWBuffer<float2> OutSSPositions;
 RWBuffer<float4> OutSSScale;
@@ -95,6 +106,10 @@ RWBuffer<uint> OutGaussianIDX;
 
 // Capacity of buffers holding gaussian properties
 uint BufferCapacity;
+// athenea: 1 sizes a faint splat's quad by its opacity
+uint TightQuads;
+// athenea: 1 pays the 0.3 px spread back from a gaussian's opacity
+uint MipPay;
 
 float SplatScaleMultiplier;
 float SplatOpacityThreshold;
@@ -207,14 +222,62 @@ void GSPrepass(uint3 DispatchThreadId : SV_DispatchThreadID, uint3 GroupId : SV_
 	GroupMemoryBarrierWithGroupSync();
 
 	//Terminate if we are outside the bounds of our input data
-	if (SplatIndex < GSResources.SplatCount && GSResources.SHAndOpacities[SplatIndex].a > SplatOpacityThreshold)
+	if (SplatIndex < GSResources.SplatCount && GSShOp(SplatIndex).a > SplatOpacityThreshold)
     {
-	    float3 LocalPosition = GSResources.Positions[SplatIndex];
+	    float3 LocalPosition = GSPos(SplatIndex);
+		// athenea: the cut morphed (GSLod.ush, athenea's lod_gather): the
+		// gaussian a fraction MorphT of the way to its parent -- position,
+		// log-scales, rotation (nlerp, sign aligned) and colour -- its opacity
+		// keeping its mass, opacity times its two-axis area, which is what its
+		// parent was merged with: at 1 the children stack as the parent.
+		// The splats thinned (GSLod.ush): one drawn carries those dropped.
+		uint ThinGroup;
+		float ThinToward;
+		float ThinFade;
+		const float ThinFraction = LodThinOf(SplatIndex, ThinGroup, ThinToward, ThinFade);
+		const float ThinMore = ThinFraction < 1.0f ? LodThinFadeMass / ThinFraction : 1.0f;
+		const float ThinWider = min(sqrt(sqrt(ThinMore)), 1.5f);
+		float3 MorphScale = GSScl(SplatIndex);
+		float4 MorphRotation = GSRot(SplatIndex);
+		float MorphOpacity = GSShOp(SplatIndex).a;
+		// A thinned splat by itself: wider, and as opaque as the rest of the mass asks, up to 1.
+		const float ThinPlain = ThinFraction < 1.0f ? min(MorphOpacity * ThinMore / (ThinWider * ThinWider), max(MorphOpacity, 1.0f)) : MorphOpacity;
+		// A thinned splat goes toward its group by the thinning's own measure;
+		// anything else by the morph's (GSLod.ush), asked only then.
+		uint MorphParent = ThinGroup;
+		float MorphT = ThinToward;
+		if (ThinFraction >= 1.0f && (LodMorph > 1.0f || LodMorphSplats > 1.0f))
+		{
+			MorphT = LodMorphOf(SplatIndex, MorphParent);
+		}
+		if (MorphT > 0.0f)
+		{
+			const float3 Own = max(MorphScale, 1.0e-9f);
+			const float3 To = max(GSScl(MorphParent), 1.0e-9f);
+			const float OwnArea = max(max(Own.x * Own.y, Own.y * Own.z), Own.x * Own.z);
+			// A scale of zero both have stays zero (a surfel to a surfel).
+			const float3 Flat = float3(MorphScale.x == 0.0f, MorphScale.y == 0.0f, MorphScale.z == 0.0f) * float3(GSScl(MorphParent) == 0.0f);
+			MorphScale = exp(lerp(log(Own * ThinWider), log(To), MorphT)) * (1.0f - Flat);
+			const float Area = max(max(MorphScale.x * MorphScale.y, MorphScale.y * MorphScale.z), MorphScale.x * MorphScale.z);
+			float4 ToRotation = GSRot(MorphParent);
+			ToRotation = dot(MorphRotation, ToRotation) < 0.0f ? -ToRotation : ToRotation;
+			MorphRotation = normalize(lerp(MorphRotation, ToRotation, MorphT));
+			LocalPosition = lerp(LocalPosition, GSPos(MorphParent), MorphT);
+			MorphOpacity = min(MorphOpacity * ThinMore * OwnArea / max(Area, 1.0e-30f), max(ThinPlain, GSShOp(MorphParent).a));
+		}
+		else
+		{
+			MorphScale *= ThinWider;
+			MorphOpacity = ThinPlain;
+		}
+		// A thinned splat never past opacity 1 (unless it was): over 1 is the
+		// harder kernel, and crossing it as the fraction moves is a jump.
+		MorphOpacity = ThinFraction < 1.0f ? min(MorphOpacity, max(GSShOp(SplatIndex).a, 1.0f)) * ThinFade : MorphOpacity;
 	    float4 TranslatedWorldPosition = DFTransformLocalToTranslatedWorld(LocalPosition, MakeDFMatrix4x3(Primitive.PositionHigh, Primitive.LocalToRelativeWorld), PrimaryView.PreViewTranslation);
 		float4 PrevTranslatedWorldPosition = DFTransformLocalToTranslatedWorld(LocalPosition, MakeDFMatrix4x3(Primitive.PositionHigh, Primitive.PreviousLocalToRelativeWorld), PrimaryView.PrevPreViewTranslation);
 
-		float3x3 ScaleMatrix = VecToScaleMatrix(GSResources.Scales[SplatIndex] * Primitive.NonUniformScale.xyz * Primitive.NonUniformScale.xyz * SplatScaleMultiplier);
-		float3x3 RotationMatrix = mul((float3x3) Primitive.RelativeWorldToLocal, QuatToMatrix(GSResources.Orientations[SplatIndex]));
+		float3x3 ScaleMatrix = VecToScaleMatrix(MorphScale * Primitive.NonUniformScale.xyz * Primitive.NonUniformScale.xyz * SplatScaleMultiplier);
+		float3x3 RotationMatrix = mul((float3x3) Primitive.RelativeWorldToLocal, QuatToMatrix(MorphRotation));
 
 		// Calculate covariance matrix
 		float3x3 T = mul(RotationMatrix, ScaleMatrix);
@@ -296,10 +359,12 @@ void GSPrepass(uint3 DispatchThreadId : SV_DispatchThreadID, uint3 GroupId : SV_
 			// without this it came out an opaque line, and a far cut's merges a
 			// lattice of them. A gaussian with three scales is drawn as before.
 			float SurfelPaid = 1.0f;
+			bool bSurfel = false;
 			{
-				const float3 S = GSResources.Scales[SplatIndex];
+				const float3 S = MorphScale;
 				if (min(min(S.x, S.y), S.z) == 0.0f)
 				{
+					bSurfel = true;
 					const float A0 = Covariance2D[0][0], C0 = Covariance2D[1][1], B0 = Covariance2D[0][1];
 					const float Half = 0.5f * (A0 + C0);
 					const float Split = sqrt(max(0.25f * (A0 - C0) * (A0 - C0) + B0 * B0, 0.0f));
@@ -310,13 +375,24 @@ void GSPrepass(uint3 DispatchThreadId : SV_DispatchThreadID, uint3 GroupId : SV_
 				}
 			}
 
-            float X = Covariance2D[0][0] + 0.3f;
-            float Y = Covariance2D[1][1] + 0.3f;
+            // athenea: the screen's low-pass, pixels squared (0.3, the 3DGS
+            // reference's; wider calms a far cloud's sub-pixel gaussians, its
+            // spread paid back from their opacity below).
+            float X = Covariance2D[0][0] + MipDilation;
+            float Y = Covariance2D[1][1] + MipDilation;
 			float Covariance = Covariance2D[0][1];
 
 		    // Determine conic for the splat
 			float Determinant = X * Y - Covariance * Covariance;
 			float3 Conic = float3(Y, Covariance, X) / Determinant;
+			// athenea: what the 0.3 px spread adds to a gaussian is paid back from
+			// its opacity (Mip-Splatting's compensation, athenea's paidOpacity):
+			// the root of the determinants' ratio. Without it a far gaussian a
+			// fraction of a pixel wide drew as a third of a pixel at its full
+			// opacity, and a capture's leaves came out twice as bright as its
+			// merges (which, over 1, are drawn as they are).
+			const float DetBefore = Covariance2D[0][0] * Covariance2D[1][1] - Covariance * Covariance;
+			const float MipPaid = MipPay != 0u ? sqrt(max(DetBefore, 0.0f) / max(Determinant, 1.0e-20f)) : 1.0f;
 
 		    // Finally calculate the bounds of a screenspace quad that will be rasterized for this splat
 			float Mid = (X + Y);
@@ -331,9 +407,13 @@ void GSPrepass(uint3 DispatchThreadId : SV_DispatchThreadID, uint3 GroupId : SV_
 				// athenea: the harder kernel's flat top reaches past three sigmas;
 				// its quad is widened by 0.7 (D - 1) sigma, as Spark and athenea's
 				// falloffCutoff widen the cut (D held to 5).
-				const float Hard = GSResources.SHAndOpacities[SplatIndex].a;
+				const float Hard = MorphOpacity;
+				// athenea: a gaussian of opacity a adds nothing a frame keeps past
+				// g a = 1/255, sqrt(2 ln 255a) sigmas out: a faint splat's quad
+				// shrinks to that (TightQuads), a third of the area at a = 0.05.
+				const float Faint = TightQuads != 0u && Hard <= 1.0f ? sqrt(2.0f * log(max(255.0f * Hard, 1.0f))) : 3.0f;
 				const float Sigmas = GSResources.VolumeOn != 0u ? 3.5f
-					: Hard > 1.0f ? 3.0f + 0.7f * (min(Hard, 5.0f) - 1.0f) : 3.0f;
+					: Hard > 1.0f ? 3.0f + 0.7f * (min(Hard, 5.0f) - 1.0f) : min(3.0f, Faint);
 				float2 MajorAxis = min(Sigmas * sqrt(Lambda1), 1024.0f) * DiagonalVector;
 				float2 MinorAxis = min(Sigmas * sqrt(Lambda2), 1024.0f) * float2(DiagonalVector.y, -DiagonalVector.x);
 				
@@ -380,7 +460,7 @@ void GSPrepass(uint3 DispatchThreadId : SV_DispatchThreadID, uint3 GroupId : SV_
 					GSSharpOn = false;
 					if (SharpOut == 1u && GSResources.HasCurvature != 0u && (GSResources.ColorFlags & GS_COLOR_TRANSFER) != 0u)
 					{
-						const float3x3 LocalAxes = QuatToMatrix(GSResources.Orientations[SplatIndex]);
+						const float3x3 LocalAxes = QuatToMatrix(MorphRotation);
 						const float3 uL = mul(LocalAxes, GSResources.FileAxisX);
 						const float3 vL = mul(LocalAxes, GSResources.FileAxisY);
 						const float3 uF = float3(dot(uL, GSResources.FileAxisX), dot(uL, GSResources.FileAxisY), dot(uL, GSResources.FileAxisZ));
@@ -414,7 +494,23 @@ void GSPrepass(uint3 DispatchThreadId : SV_DispatchThreadID, uint3 GroupId : SV_
 						}
 					}
 					GS_ColorOpacity[Index] = GSSplatColor(SplatIndex, LocalView, !ENABLE_RELIGHTING);
-					GS_ColorOpacity[Index].a *= SurfelPaid;
+					if (MorphT > 0.0f)
+					{
+						GS_ColorOpacity[Index].rgb = lerp(GS_ColorOpacity[Index].rgb, GSSplatColor(MorphParent, LocalView, !ENABLE_RELIGHTING).rgb, MorphT);
+						GS_ColorOpacity[Index].a = MorphOpacity;
+					}
+					else if (ThinFraction < 1.0f)
+					{
+						GS_ColorOpacity[Index].a = MorphOpacity;
+					}
+					// An opacity over 1 is the harder kernel, drawn as it is: no
+					// payback (athenea's splat_project, alphaOwn).
+					GS_ColorOpacity[Index].a *= GS_ColorOpacity[Index].a > 1.0f ? 1.0f : SurfelPaid;
+					if (!bSurfel && GS_ColorOpacity[Index].a <= 1.0f)
+					{
+						const float Spread = MipPaid * GS_ColorOpacity[Index].a;
+						GS_ColorOpacity[Index].a = Spread >= 1.0f / 255.0f ? Spread + (1.0f - MipPaid) * (1.0f / 255.0f) : Spread;
+					}
 					if (GSResources.VolumeOn != 0u)
 					{
 						// athenea: A MEDIUM'S GAUSSIAN (athenea's splat_volume): its
@@ -492,6 +588,8 @@ void GSPrepass(uint3 DispatchThreadId : SV_DispatchThreadID, uint3 GroupId : SV_
 	// Allocate space in global buffer
 	if (GroupIndex == 0 && GS_NumSplats > 0)
 	{
+		InterlockedAdd(LodBudgetOut[1], GS_NumSplats);
+		InterlockedMax(LodBudgetOut[2], LodBudgetCap);
 		InterlockedAdd(Counter[1], GS_NumSplats, GS_OutBufferStartIndex);
 		if (GS_OutBufferStartIndex >= BufferCapacity)
 		{
@@ -555,6 +653,17 @@ Buffer<uint2> VS_SSVelocity;
 
 Buffer<uint> VS_GaussianIDX;
 
+// athenea: front to back (GSFront.usf): the batch drawn and each batch's
+// first sorted splat; the quad at its splat's depth, for the depth test to
+// drop it before it is shaded.
+#ifndef GS_FRONT_TO_BACK
+#define GS_FRONT_TO_BACK 0
+#endif
+#if GS_FRONT_TO_BACK
+Buffer<uint> FrontBatches;
+uint FrontBatch;
+#endif
+
 // athenea: the sharp lobes the prepass handed over, and what the pixel shader
 // reads them with: the residual sky (GSColor.ush's SkyResidual) and the sun in
 // the world, (direction, half angle) and (irradiance).
@@ -598,6 +707,9 @@ static float2 Quad[4] =
 
 FOutVertex GSSplatting_VS(uint GlobalVertexId : SV_VertexID, uint InstanceID : SV_InstanceID )
 {
+#if GS_FRONT_TO_BACK
+	InstanceID += FrontBatches[FrontBatch];
+#endif
     uint Index = VS_GaussianIDX[InstanceID];
 
     FOutVertex Output;
@@ -621,6 +733,9 @@ FOutVertex GSSplatting_VS(uint GlobalVertexId : SV_VertexID, uint InstanceID : S
 	float SceneDepth = inverse_order_preserving_float_map(VS_Depth[InstanceID]);
 	// Multiply by 100 to convert to centimetres
 	Output.DeviceZ = ConvertToDeviceZ(100.0f * SceneDepth);
+#if GS_FRONT_TO_BACK
+	Output.Position.z = Output.DeviceZ;
+#endif
 
 #if ENABLE_RELIGHTING
 	Output.MR = UnpackMetallicRoughness(VS_MetallicRoughness[Index]);
@@ -645,7 +760,9 @@ struct FRTOut
 #else
     float4 Velocity : SV_Target1;
 #endif
+#if !GS_FRONT_TO_BACK
 	float DeviceZ : SV_Depth;
+#endif
 };
  
 // The residual sky along a world direction at a lobe's roughness, at the mip
@@ -740,12 +857,21 @@ FRTOut GSSplatting_PS(FOutVertex Input)
 
 	float3 Velocity = float3(ClipPos - PrevClipPos.xy, Input.DeviceZ - PrevClipPos.z);
 
+#if GS_FRONT_TO_BACK
+	// Front to back the nearest splat that shows gives the pixel its
+	// velocity: its depth is kept (the blend takes the nearest), and the
+	// velocity made from it once, over the screen (GSFront.usf).
+	Output.Velocity = Alpha > 0.02f ? float4(Input.DeviceZ, 0.0f, 0.0f, 0.0f) : float4(0.0f, 0.0f, 0.0f, 0.0f);
+#else
 	Output.Velocity = EncodeVelocityToTexture(Velocity);
+#endif
 
 	// For unlit splats, only used to test against scene depth and not written to depth buffer
 #endif
 
+#if !GS_FRONT_TO_BACK
 	Output.DeviceZ = Input.DeviceZ;
+#endif
 
     return Output;
 }

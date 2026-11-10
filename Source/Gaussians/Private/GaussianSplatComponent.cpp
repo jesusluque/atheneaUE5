@@ -16,6 +16,11 @@ UGaussianSplatComponent::UGaussianSplatComponent()
 
 	ClippingTags.AddTag(UGameplayTagsManager::Get().RequestGameplayTag("StarLightGS.ClippingVolumes.Default", false));
 
+	// Splats cast into UE's shadow maps by default (the proxy's shadow pass,
+	// r.Gaussians.Shadows); a primitive component casts none unless told.
+	CastShadow = true;
+	bCastDynamicShadow = true;
+
 	// A sequence plays in the editor's viewports as in the game.
 	PrimaryComponentTick.bCanEverTick = true;
 	PrimaryComponentTick.bStartWithTickEnabled = true;

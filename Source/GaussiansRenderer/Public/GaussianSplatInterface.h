@@ -37,5 +37,8 @@ public:
 	virtual bool SupportsRelighting() const = 0;
 
 	virtual float GetScaleMultiplier() const = 0;
+	// athenea: whether the cloud casts shadows: its culled index list is what the
+	// shadow passes draw too, so a cut by the view's frustum is theirs as well.
+	virtual bool CastsSplatShadow() const = 0;
 	virtual bool HasAnyClippingTags(const struct FGameplayTagContainer& Tags, bool bExactMatch) const = 0;
 };

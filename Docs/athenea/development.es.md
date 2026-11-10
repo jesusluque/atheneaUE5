@@ -47,7 +47,18 @@ Los shaders están en `Shaders/`, mapeados a `/Plugin/StarLightGS/`.
 4. **Raster** (`GSSplatting_VS/PS`): un único draw indirecto instanciado de
    quads. La ruta sin iluminar mezcla "over" en SceneColor antes del
    post-proceso; la ruta iluminada acumula de delante a atrás en cuatro
-   targets RGBA16F que un pase de composición escribe en el GBuffer de UE.
+   targets RGBA16F que un pase de composición escribe en el GBuffer de UE. Con
+   `r.Gaussians.Athenea.FrontToBack` la ruta sin iluminar también dibuja de
+   delante a atrás (`GSFront.usf`): el sort ascendente, los quads a la
+   profundidad de su splat (sin `SV_Depth`, así el test de profundidad va
+   antes del shader), por lotes en `Gaussians.Front` con una copia de la
+   profundidad de la escena; entre lotes `GSFrontSaturatePS` lleva la
+   profundidad de los píxeles opacos al plano cercano; `GSFrontCompositePS`
+   pone el buffer sobre SceneColor y `GSFrontVelocityPS` hace la velocidad
+   de la escena con la profundidad más cercana.
+
+El corte de los niveles de detalle y su morph están en `GSLod.ush`, que
+incluyen el pase de culling (qué gaussianas) y el prepass (dónde se dibujan).
 5. **Sombras**: el vertex factory (`GSVertexFactory.ush`) dibuja los splats en
    virtual shadow maps, opacos por encima de 0,9.
 
@@ -223,8 +234,24 @@ guarda.
 
 ## 7. Cómo se comprueba un cambio
 
-Todavía no hay tests automáticos en el plugin. Un cambio se comprueba en una
-máquina Windows contra athenea:
+Los importadores tienen tests de automatización
+(`Source/GaussiansEditor/Private/Tests/`, `Athenea.Import.*`): cada fichero de
+prueba lo lee su importador y se comprueba lo que la importación hizo con él
+-- todo formato se lee, tiene gaussianas y límites; los 8 niveles de
+`pawn.athc` y sus palabras; el árbol paginado de una escena web, una raíz y
+sus 349.076 fusiones; los 7 niveles de un `.athz`, sus grupos tras sus
+splats; el medio y las constantes de un frame de `vdb2splat`
+(un frame frío sin temperatura lee 0); la transferencia de una nube TX. No
+necesitan GPU (el decodificado se hace al crear un recurso) y toman los
+ficheros de prueba de `ATHENEA_UE_TEST_FILES` (por defecto `~/athenea-unreal`),
+saltándose el que no esté:
+
+```
+UnrealEditor-Cmd.exe <proyecto> -nullrhi -unattended -ExecCmds="Automation RunTests Athenea; Quit"
+```
+
+Más allá de ellos, un cambio se comprueba en una máquina Windows contra
+athenea:
 
 1. **Build**: `RunUAT BuildPlugin` (operations §2), sin ningún aviso nuevo.
 2. **Importación**: un commandlet (`UnrealEditor-Cmd ... -run=pythonscript

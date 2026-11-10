@@ -48,6 +48,7 @@ void FGaussianSplatData::CopyFrom(const FGaussianSplatData* Other)
 	LodLevels = Other->LodLevels;
 	LodFinestLevel = Other->LodFinestLevel;
 	LodFinestBase = Other->LodFinestBase;
+	LodLevelRuns = Other->LodLevelRuns;
 	LodBoundsLo = Other->LodBoundsLo;
 	LodExtent = Other->LodExtent;
 	Volume = Other->Volume;
@@ -100,6 +101,7 @@ void FGaussianSplatData::Empty()
 	LodLevels = 0;
 	LodFinestLevel = 0;
 	LodFinestBase = 0;
+	LodLevelRuns.Empty();
 	LodBoundsLo = FVector3f::ZeroVector;
 	LodExtent = 0.0f;
 	Volume.Empty();

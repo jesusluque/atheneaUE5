@@ -1,5 +1,9 @@
 #pragma once
 
+// The .athc and .athz cloud importers and the swizzle are the runtime
+// module's (GSplatRuntimeImport.h): a packaged game reads them too.
+#include "GSplatRuntimeImport.h"
+
 class UGSplatImportData;
 class UGSplatAsset;
 struct FGaussianSplatData;
@@ -22,10 +26,6 @@ namespace GSplatImporter
 	bool StageHasSplats(const FString& Filename);
 	bool ImportUsd(const FString& Filename, UGSplatImportData& ImportData, FGaussianSplatData& Splats);
 
-	// athenea: a .athc's finest level, packed (GSplatAthcImporter.cpp).
-	bool IsAthcFile(const FString& Filename);
-	bool ImportAthc(const FString& Filename, UGSplatImportData& ImportData, FGaussianSplatData& Splats);
-
 	// athenea: .splat and .spz kept as their bytes (GSplatFileImporter.cpp).
 	bool IsSplatFile(const FString& Filename);
 	bool ImportSplatFile(const FString& Filename, UGSplatImportData& ImportData, FGaussianSplatData& Splats);
@@ -42,7 +42,6 @@ namespace GSplatImporter
 	bool IsAthzFile(const FString& Filename);
 	bool IsAthzScene(const FString& Filename);
 	bool ImportAthzScene(const FString& Filename, UObject* InParent, FName InName, EObjectFlags Flags, UGSplatAsset& First);
-	bool ImportAthzCloud(const FString& Filename, UGSplatImportData& ImportData, FGaussianSplatData& Splats);
 
 	// athenea: glTF with KHR_gaussian_splatting, .glb or .gltf (GSplatGltfImporter.cpp).
 	bool IsGltfFile(const FString& Filename);
@@ -50,9 +49,3 @@ namespace GSplatImporter
 	bool ImportGltf(const FString& Filename, UGSplatImportData& ImportData, FGaussianSplatData& Splats);
 };
 
-enum class EGSplatSwizzleAxis : uint8;
-
-// The file's axes taken into UE's, shared by the PLY and USD importers.
-FVector3f SwizzleVector(float InX, float InY, float InZ, const TArray<EGSplatSwizzleAxis>& Swizzle);
-FVector3f SwizzleVectorAbs(float InX, float InY, float InZ, const TArray<EGSplatSwizzleAxis>& Swizzle);
-FVector4f SwizzleQuaternion(float InX, float InY, float InZ, float InW, const TArray<EGSplatSwizzleAxis>& Swizzle);

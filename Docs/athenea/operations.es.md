@@ -75,6 +75,10 @@ mediante **Import**, o desde Python con un `AssetImportTask`. Cada uno crea un
 
 ### 4.1 Lo que da cada formato
 
+![Los ficheros de prueba en UE 5.8: arriba nubes horneadas (biker .spz y .glb, cat .spz, dwarf .splat, sh3 .ply y .sog, el peón como .ply, close .spz, pawn .athc y .usdc); abajo nubes reiluminadas (TX) bajo el cielo de estudio (el cuerpo de la escena web del peón, su cabeza de vidrio, paint y dragon USD, el close .athz y .spz del Corvette)](images/formats.jpg)
+
+*Los ficheros de prueba en UE 5.8: nubes horneadas arriba, reiluminadas (TX) abajo.*
+
 | Formato | Extensiones | Diálogo | Ejes y unidades | Espacio de color | Armónicos | Se guarda como |
 |---|---|---|---|---|---|---|
 | PLY 3DGS | `.ply` | sí, salvo en modo desatendido | el swizzle y la escala del diálogo; un PLY de athenea los indica en su comentario (4.2) | la opción de gamma del diálogo; un PLY de athenea lo indica | `f_rest_0..44`, grado 3 | arrays float |
@@ -165,6 +169,10 @@ ajustes del asset (*Gaussians | Volume*), que se pueden cambiar tras importar.
 
 ### 4.4 Ficheros `.athc`
 
+![pawn.athc a una, cuatro y dieciséis veces la distancia de encuadre (filas): niveles apagados, a 1 px (por defecto) y a 8 px (columnas); las filas lejanas ampliadas](images/lod_athc.jpg)
+
+*Los niveles de detalle de pawn.athc: a 1 px, 121.241 splats a cuatro veces la distancia y 8.725 a dieciséis, frente a 325.833.*
+
 Lo que se lee: la cabecera, la tabla de chunks, y de cada chunk las posiciones
 (float4: xyz en metros, opacidad lineal), las cuatro palabras de forma y las
 palabras de armónicos, copiadas sin cambios en el asset. Se leen las versiones
@@ -231,7 +239,26 @@ niveles se recorta en cada frame, tenga o no volúmenes de recorte.
 | Variable de consola | Por defecto | Qué hace |
 |---|---|---|
 | `r.Gaussians.Athenea.LodPixels` | `1` | los píxeles que puede abarcar una celda fusionada antes de que se dibujen sus hijos en su lugar; `0` dibuja todos los splats y ningún grupo fusionado, como antes de leer los niveles |
-| `r.Gaussians.Athenea.LogSplats` | `0` | `1` escribe en el log los splats que cada frame manda al rasterizador (`athenea: splats drawn N lit, M unlit`), con un frame o dos de retraso: con lo que se comprueba el corte |
+| `r.Gaussians.Athenea.TightQuads` | `1` | un splat de opacidad a se dibuja hasta √(2 ln 255a) desviaciones, donde baja de 1/255, en vez de tres (un kernel más duro y un medio mantienen las suyas); `0` dibuja cada quad hasta tres |
+| `r.Gaussians.Athenea.LodDissolve` | `2` | cada grupo fusionado pasa a sus hijos con su propio umbral, `LodPixels` por esto elevado a h − ½ (h un hash de su celda y nivel, el de un nodo de árbol de su índice), así que el borde del corte se reparte en una banda de distancias en vez de deslizarse por la escena como un solo anillo; ninguna gaussiana se dibuja dos veces ni falta, y el detalle medio es el de `LodPixels`. `1` es el corte de athenea |
+| `r.Gaussians.Athenea.LodBudget` | `1` | `1` sube `LodPixels` en una vista mientras sus frames piden más splats de los que caben en `r.Gaussians.MaxSplats` (§4.5.4); `0` mantiene el umbral fijado y deja fuera el exceso |
+| `r.Gaussians.Athenea.LodMorph` | `2` | por encima de 1, una gaussiana se dibuja hacia su grupo padre mientras al padre le falta menos de este número de umbrales propios para dibujarse, del todo en uno (el `--lod-morph` de athenea): posición, escalas, rotación y color, con la opacidad conservando su masa. Con `LodThin` activo (por defecto) es solo de los niveles fusionados, que no suaviza; sin él, suaviza los splats que mueve. Hasta 1 no hay morph |
+| `r.Gaussians.Athenea.FrontToBack` | `8` | N (hasta 16) dibuja los splats sin iluminar de delante a atrás en un buffer propio, en N lotes cada uno el doble del anterior; tras cada lote, los píxeles ya opacos se cierran a lo que los lotes siguientes dibujarían detrás, y el buffer va sobre la escena. La imagen es la misma; 8 es lo más rápido medido. Con un anti-aliasing temporal se escribe también la velocidad del splat visible más cercano. `0` dibuja de atrás a delante |
+| `r.Gaussians.Athenea.LodFrustum` | `2` | el corte de una vista deja fuera las celdas del octree que su frustum no alcanza (una décima más ancho que la imagen, cada celda ampliada en arista y media), así el prepass recorre lo que la vista muestra. Los pases de sombras dibujan la misma lista: `2` lo hace en las nubes que no proyectan sombra, `1` en todas (cuyas sombras las proyecta entonces solo lo que la vista muestra), `0` en ninguna |
+| `r.Gaussians.Athenea.LodGroupState` | `1` | cada grupo del nivel más fino se juzga una vez por vista y sus splats leen el resultado; `0` hace que cada splat juzgue la celda de su grupo (el mismo corte, de 1,5 a 2 ms más lento en una nube de 106 M) |
+| `r.Gaussians.Athenea.LodGroupRuns` | `1` | un `.athc` (versiones 1 y 2) se corta recorriendo sus grupos: un grupo fusionado que se dibuja escribe su propio índice, y un grupo del nivel más fino cuyos splats se dibujan escribe el tramo de ellos (los splats van en el orden de sus grupos). Se usa donde solo los niveles recortan la nube (sin volumen de clipping); `0` recorre cada splat |
+| `r.Gaussians.Athenea.LodThin` | `4` | por encima de 1, los splats de un grupo del nivel más fino se aclaran antes de que el grupo se dibuje en su lugar (el `--lod-thin` de athenea): mientras su celda abarca menos de este número de umbrales se dibuja una fracción de ellos, que se reduce a la mitad con cada paso igual del logaritmo; cuáles, lo decide el lugar del splat en el run de su grupo, el mismo en cada frame, y el primer splat de un grupo nunca se quita. Los que se dibujan llevan la masa de los que no (algo más anchos, más opacos hasta 1 y nunca por encima) y, en la última mitad de la banda, se dibujan hacia la gaussiana fusionada del grupo, del todo en el cambio. Con él, `LodMorph` es solo de los niveles fusionados. Hasta 1: todos los splats |
+| `r.Gaussians.Athenea.LodThinLeast` | `0.03125` | la fracción de los splats de un grupo que `LodThin` deja donde el grupo ocupa su lugar |
+| `r.Gaussians.Athenea.LodMorphSplats` | `0` | `LodMorph` solo para los splats (hacia su grupo del nivel más fino); suaviza el suelo cercano, cosa que `LodThin` no hace |
+| `r.Gaussians.Athenea.Dilation` | `0.3` | el paso-bajo con que se ensancha la imagen de cada gaussiana, en píxeles al cuadrado (0,3 es el de la referencia de 3DGS y el de athenea); más ancho calma el parpadeo de una nube lejana y la suaviza |
+| `r.Gaussians.Athenea.LodSweep` | `0` | para medir: `LodPixels` se multiplica por 2 elevado a (esto × un diente de sierra del número de frame, de 0 a 1 en 128 frames), así una vista quieta solo cambia cuando los grupos cambian de nivel |
+| `r.Gaussians.Athenea.MipPaid` | `1` | `1` dibuja una gaussiana ensanchada por el paso-bajo con su opacidad por √(det antes / det después), como athenea (Mip-Splatting), de modo que una gaussiana de menos de un píxel conserva su energía y no más; `0` dibuja la ensanchada a opacidad completa |
+| `r.Gaussians.Relighting` | `true` | de upstream: el interruptor global de las nubes relit (splats iluminados escritos en el GBuffer); apagado, todas las nubes se dibujan unlit |
+| `r.Gaussians.AlphaCutoff` | `0.3` | de upstream: la cobertura, de 0 a 1, a partir de la cual un píxel de splat iluminado se compone en el GBuffer |
+| `r.Gaussians.OpacityThreshold` | `0` | de upstream: solo se dibujan los splats más opacos que esto |
+| `r.Gaussians.Debug.CullEveryFrame` | `false` | de upstream, para depurar: el culling contra los volúmenes de recorte se ejecuta en cada frame, no solo cuando algo se ha movido |
+| `r.Gaussians.Debug.DisableViewExtension` | `false` | de upstream, para depurar: la view extension no dibuja nada en la vista principal |
+| `r.Gaussians.Athenea.LogSplats` | `0` | `1` escribe en el log los splats que cada frame manda al rasterizador (`athenea: splats drawn N lit, M unlit, LodPixels xF`), con un frame o dos de retraso: con lo que se comprueba el corte |
 
 Un grupo fusionado se dibuja con el kernel que le da athenea: una opacidad D
 mayor que 1 es el kernel más duro de Spark, 1 − (1 − g)^A con
@@ -263,9 +290,16 @@ demás se guardan con *Save All* del editor (o con
 `EditorLoadingAndSavingUtils.save_dirty_packages`), o vuelven vacíos en la
 siguiente sesión.
 
+El vidrio y las láminas se mantienen aparte, como los mantiene athenea
+(`lodKeptApart`): en una nube TX, un grupo cuya transmisión pasa de la mitad,
+o el de una pared fina con alguna, nunca se dibuja, y los splats bajo él
+siempre. Una nube que es toda vidrio se dibuja por tanto entera a cualquier
+distancia (el dragón de vidrio y la cabeza de vidrio del peón: 82.892 y
+292.056 splats a dieciséis veces la distancia de encuadre), mientras que una
+pieza TX opaca se sigue simplificando (close.athz: 1.197 de 404.092).
+
 Lo que falta de los niveles: el streaming (todos los chunks están en el asset;
-no se carga nada según lo pida el corte), separar vidrio y láminas (athenea
-nunca dibuja fusionados sus grupos; aquí sí), los niveles fusionados de un
+no se carga nada según lo pida el corte), los niveles fusionados de un
 fichero versión 3 (bloques de tipo 0, frente a un árbol paginado) y las
 guardas del árbol paginado (la fracción relajada de athenea para una fusión
 que cruza un borde de color).
@@ -354,6 +388,17 @@ la palabra anterior). Se lee:
   niveles (`athzCpcaUnpack` de athenea). La curvatura (tres floats por splat,
   en la capa G) se lee con la transferencia, así que un cristal macizo se
   dibuja como lente (§4.4).
+- sus niveles de detalle: cada nivel fusionado se dibuja también, como un
+  bloque propio tras los splats, con su transferencia CPCA expandida como la
+  de ellos, y se corta cada frame como los niveles de un `.athc` (§4.4,
+  `r.Gaussians.Athenea.LodPixels`); las dos palabras por gaussiana que lee el
+  corte se escriben en el dispositivo a partir de las colas decodificadas (el
+  grupo más fino de un splat, la celda del octree de un grupo). pawntop.athz
+  (292.056 splats, 7 niveles de 85.972 grupos) a 1 px dibuja 17.243 a
+  dieciséis veces la distancia de encuadre, RMS de imagen 0,0028 frente al
+  corte apagado.
+
+  ![pawntop.athz de cerca, y a dieciséis veces la distancia con los niveles apagados y a 1 px](images/lod_athz.jpg)
 
 Antes de decodificar nada se comprueban el CRC-32 de la cabecera (sobre sus
 primeros 60 bytes) y el de cada página (sobre los bytes de sus capas, en el
@@ -367,6 +412,10 @@ menos, 8 ejes por bloque, 112 valores, los bytes en el fichero) se rechaza
 (`a CPCA transfer whose basis does not add up`).
 
 ### 4.5.2 El `.athz` de una escena web
+
+![La escena web del peón de athenea en UE: su cuerpo (dos .athc que se completan) y su cabeza de vidrio, reiluminados por el cielo de estudio](images/pawn_web_scene.jpg)
+
+*Las tres nubes de una escena web colocadas juntas.*
 
 La web publica una escena como un zip `.athz`: un `scene.json` (versión 2:
 unidades, eje arriba, objetos con sus ficheros y transformaciones, cámaras,
@@ -387,6 +436,54 @@ aplica, y no se crea ningún nivel: un nivel coloca los actores, un sky light y
 una cámara (`setup_scene.py`, development §6). El `.athz` propio de athenea,
 la nube paginada cuya cabecera es `ATHZ`, se distingue por sus primeros
 bytes.
+
+### 4.5.3 Carga en tiempo de ejecución
+
+Un `.athc` (versiones 1 a 3, con sus niveles de detalle) o una nube `.athz`
+paginada se pueden cargar desde disco mientras corre el juego, en una build
+empaquetada igual que en el editor:
+`UGSplatRuntimeLibrary::LoadGaussianSplatFile(Path)` (Blueprint: *Load
+Gaussian Splat File*) lo lee con el mismo importador que usa el editor y
+devuelve un asset transitorio nuevo, o ninguno si el fichero no se lee (el
+log dice por qué); `SetGaussianSplatAsset` se lo da a un componente de splats.
+Su recurso de GPU se crea cuando el componente lo dibuja por primera vez. El
+`.athc` de la bicicleta (6,1 millones de gaussianas, 275 MB) se carga en
+0,1 s en la máquina de pruebas. Los demás formatos (PLY, SPZ, SOG, glTF, USD,
+el `.athz` de una escena web) se importan en el editor; para esto, los
+importadores de `.athc` y `.athz` y los códecs que necesitan son de los
+módulos de runtime.
+
+### 4.5.4 Escenas muy grandes
+
+Un `.athc` de más de 20 millones de splats mantiene en la GPU los arrays
+empaquetados de athenea en lugar de los decodificados (32 bytes por splat en
+vez de 56; cada pasada desempaqueta lo que lee, `GSSplatData.ush`);
+`r.Gaussians.Athenea.PackedResident` lo fuerza activado (1) o desactivado
+(-1), y se lee al crear un recurso. athenea escribe un `.athc` de como mucho
+4 GiB de registros, así que una captura mayor se corta en partes de registros
+consecutivos, cada una convertida por separado y colocadas juntas
+(`Tools/athenea/parts_level.py`). `r.Gaussians.MaxSplats` (por defecto 5
+millones) acota los splats dibujados en un frame, no la escena. Por encima,
+los splats de las nubes dibujadas al final se quedaban fuera, así que faltaban
+partes enteras de una escena grande hasta que la vista pedía menos. Ahora el
+corte mantiene el frame dentro: `r.Gaussians.Athenea.LodBudget` (1 por
+defecto) sube `LodPixels` en una vista cuyo último frame pidió más del 85 % de
+los buffers, por la raíz cuadrada del exceso (los splats que manda un corte
+van como el inverso del cuadrado de su umbral), y lo vuelve a bajar un 3 % por
+frame, hasta el valor fijado, cuando un frame pide menos del 60 %. El factor
+vive en el dispositivo, uno por vista; solo cuenta cuando las nubes tienen más
+que `MaxSplats`, y solo actúa en nubes con niveles de detalle. El primer frame
+o dos de una vista que se desborda aún dejan splats fuera. `LogSplats`
+escribe el factor (`LodPixels xF`).
+
+Medido en un pueblo real de 106 millones de gaussianas (una captura
+con dron, cuatro partes `.athc` de 26,6 millones): se carga
+y se dibuja en una RTX 3070 Laptop (8 GB); a 1920 × 1080 desde una vista
+oblicua sobre todo el pueblo, `LodPixels` 2 y `MaxSplats` 12 millones, el
+frame de GPU es de 34,9 ms (culling 7,4, prepass 5,5, sort 2,5, raster 18,2;
+medianas de 300 frames). A 1 px el corte se queda con casi todos los splats
+vistos desde arriba: un `.athc` tiene como mucho 10 niveles, cuyas celdas más
+finas sobre 3,9 km miden 3,8 m, más de un píxel desde 1,8 km.
 
 ### 4.6 Mensajes
 
@@ -498,6 +595,24 @@ Se muestran en el asset bajo **Gaussians**:
   entero de GPU 11,2 ms con la sombra y 11,9 ms sin ella, lo mismo dentro de
   la dispersión entre ejecuciones.
 
+![La explosión en el aire de EmberGen sobre el puente de San Giuseppe y la bola de fuego de Blender sobre un cielo nublado, cada una una secuencia de 20.000 gaussianas volumétricas por frame, iluminadas por el HDRI de detrás](images/explosions.jpg)
+
+*Medios de gaussianas como secuencias, renderizados fuera de pantalla en UE 5.8.*
+
+![El frame 40 de la bola de fuego: el raster de athenea (izquierda, un domo tenue y una luz principal) y UE (derecha, el cielo de estudio y una luz principal), la misma nube](images/medium_vs_athenea.jpg)
+
+*Un medio frente al raster de athenea del mismo frame; el brillo sigue a la iluminación de cada uno.*
+
+**Sombras.** Un actor de splats proyecta en los mapas de sombra de UE
+(incluidos los virtual shadow maps) por defecto: el *Cast Shadow* de su
+componente está activado, y `r.Gaussians.Shadows` (por defecto 1) apaga el de
+todas las nubes. Cada gaussiana de opacidad 0,9 o más se dibuja opaca en la
+pasada de sombra, así que la sombra es dura y las partes blandas de una nube
+(humo, pelo, bordes) no proyectan; un medio de gaussianas no proyecta. Los
+splats reciben las sombras de UE solo cuando están reiluminados (la ruta de
+upstream). Las sombras translúcidas son la propuesta 108 de
+athenea-research, sin hacer.
+
 ### 6.0 Secuencias
 
 Un componente reproduce una lista de assets como secuencia (*Gaussian Splats |
@@ -506,7 +621,12 @@ Sequence*): `SequenceFrames`, un asset por frame (los frames de un medio de
 defecto 24); `bSequenceLoop` (por defecto activo; si no, se queda en el último
 frame); `bSequencePlaying` y `SequenceTime` (segundos), que también se
 reproducen en los viewports del editor. `SetSequenceTime` muestra el frame de
-un instante, desde Blueprints o Python. Cada frame es su propio asset en la
+un instante, desde Blueprints o Python. `SequenceTime` se puede animar en
+Sequencer: con `bSequencePlaying` desactivado, una pista sobre él elige el
+frame, que es como Movie Render Queue renderiza una secuencia frame a frame
+(`setup_mrq.py ... --sequence` hace un plano así: los 72 frames de la bola de
+fuego renderizados desde la línea de comandos en 36 s).
+Cada frame es su propio asset en la
 GPU; el componente cambia cuál dibuja. `Tools/athenea/setup_sequence.py`
 importa una carpeta de frames en uno, y `capture_sequence.py` renderiza
 frames suyos (§7.1).
@@ -633,6 +753,15 @@ UnrealEditor.exe <Project>.uproject /Game/Level -game -RenderOffscreen -ResX=128
   termina desde fuera una vez escrito el CSV.
 - La GPU debe estar libre: en una máquina compartida, comprobar `nvidia-smi`
   (y WSL, cuyos procesos no lista) antes de medir.
+- Sin ventana no hay present que marque el paso del game thread: en cuanto el
+  frame de GPU es largo (decenas de ms), encola unos treinta frames de 2-5 ms y
+  luego espera cerca de un segundo por ellos. `FrameTime` deja entonces de ser
+  la duración del frame, y `GPUTime` solo se refresca cada pocos frames. La
+  tasa de frames se cuenta sobre ráfagas completas (una tanda de frames y la
+  espera que la cierra): una ventana fija de 2 s abarca una ráfaga o dos y lee
+  la mitad o toda la tasa. El coste de GPU por frame son las columnas
+  `GPU/Gaussians*`.
+- `-benchmark -fps=30` (pasos fijos) no lo evita.
 
 ### 7.3 Movie Render Queue
 
@@ -665,6 +794,52 @@ mismos frames salen nítidos. Hay que mantener frames de calentamiento (8 aquí)
 para que el cielo con el que se ilumina una nube TX esté proyectado antes de
 escribir el primer frame, y fijar la exposición como en 7.1, porque las dos
 configuraciones expusieron el mismo frame de forma distinta.
+
+### 7.4 Un vuelo con su tasa de frames
+
+`Tools/athenea/fly_sequence.py LEVEL NAME SECONDS RESX RESY EX/EY/EZ:TX/TY/TZ ...`
+guarda `LEVEL_fly`: el nivel con una atmósfera y un sol que no proyecta
+sombra, una secuencia (`/Game/Mrq/Seq_NAME`, 30 fps) cuya cine camera (60
+grados de ancho) sigue un camino Catmull-Rom por las poses (ojo : objetivo,
+centímetros), con entrada y salida suaves, un sequence actor que la reproduce
+al empezar el nivel, y una config de MRQ (`Cfg_NAME`: PNG a RESX x RESY, sin
+AA, sin motion blur, y las variables de consola dadas como `CVAR=VALUE;...`:
+`LodPixels` 2 y `MaxSplats` 12 M si no se dan). Las poses se separan
+con `/`, porque `-ExecCmds` parte en las comas; `capture_poses.py` renderiza
+antes imágenes de las poses candidatas.
+
+- **Medido.** `LEVEL_fly` en `-game` (7.2), en tiempo real: la secuencia
+  avanza con el paso del mundo, que UE limita a 0,4 s
+  (`MaxUndilatedFrameTime`), así que el tiempo de secuencia de un frame es la
+  suma de sus pasos limitados a 0,4 s desde el primer frame; la tasa de frames
+  en ese momento se cuenta como en 7.2.
+- **Dibujado.** La misma secuencia por MRQ (7.3), y después la tasa medida
+  dibujada sobre sus frames.
+
+**La imagen como la de athenea.** `LEVEL_fly` lleva un post-process volume
+sin límites: tone curve 0 (sin curva fílmica), sin viñeteado, expansión de
+gama ni corrección del azul, y la exposición tal cual (sesgo 0). Medido en el
+frame de la calle: media lineal 0,1584, 0,1789, 0,1235 frente a 0,1584,
+0,1788, 0,1232 de athenea en la misma vista. En tiempo real, no con un EXR
+lineal. Un PNG de MRQ se lee con su alfa sin asociar (`oiiotool --iconfig
+oiio:UnassociatedAlpha 1`): su alfa no es cobertura, y premultiplicar por él
+hace que un frame parezca hasta 1,8 veces más oscuro de lo que es.
+
+`mrq_variant.py NAME RESX RESY FIRST LAST [CVAR=VALUE;...]` hace una config de
+MRQ para unos frames de una secuencia existente con variables de consola
+propias, para separar qué los cambia. `mrq.AA=1` entre las variables los
+renderiza con el anti-aliasing temporal del motor (TSR) en vez de ninguno, y
+`mrq.Rate=N` a N frames por segundo en vez de los de la secuencia (un
+múltiplo es el mismo movimiento a cámara lenta). `hold_sequence.py SOURCE NAME
+FRAME FRAMES` copia `Seq_SOURCE` en `Seq_NAME` con la cámara quieta donde está
+en FRAME, durante FRAMES frames: lo que cambia de un frame al siguiente es
+entonces cosa del renderer. `place_camera.py LEVEL EYE:TARGET` pone
+la BenchCamera de un nivel en una pose para medir en -game.
+
+`flip_level.py LEVEL` da la vuelta a las nubes de un nivel sobre X (una
+rotación, no un espejo) y las devuelve al rango de Z que tenían, para
+capturas cuyo arriba salió como -Z: una escena que solo se ve desde abajo, o
+follaje de cerca esté donde esté la cámara, lo es.
 
 ## 8. Unreal MCP (opcional)
 

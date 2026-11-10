@@ -44,7 +44,17 @@ Shaders are in `Shaders/`, mapped to `/Plugin/StarLightGS/`.
 4. **Raster** (`GSSplatting_VS/PS`): one indirect instanced draw of quads.
    The unlit path blends "over" into SceneColor before post-processing; the
    relit path accumulates front to back into four RGBA16F targets that a
-   composition pass writes into UE's GBuffer.
+   composition pass writes into UE's GBuffer. With
+   `r.Gaussians.Athenea.FrontToBack` the unlit path draws front to back too
+   (`GSFront.usf`): the sort ascending, the quads at their splat's depth
+   (no `SV_Depth`, so the depth test comes before the shader), in batches
+   into `Gaussians.Front` with a copy of the scene's depth; between batches
+   `GSFrontSaturatePS` brings the depth of the opaque pixels to the near
+   plane; `GSFrontCompositePS` puts the buffer over SceneColor and
+   `GSFrontVelocityPS` makes the scene's velocity from the nearest depth.
+
+The levels of detail's cut and its morph are `GSLod.ush`, included by the
+culling pass (which gaussians) and the prepass (where they are drawn).
 5. **Shadows**: the vertex factory (`GSVertexFactory.ush`) draws the splats
    into virtual shadow maps, opaque above 0.9.
 
@@ -205,8 +215,22 @@ arithmetic there is the bounds, which neither format stores.
 
 ## 7. How a change is checked
 
-There are no automated tests in the plugin yet. A change is checked on a
-Windows machine against athenea:
+The importers have automation tests (`Source/GaussiansEditor/Private/Tests/`,
+`Athenea.Import.*`): each test file is read by its importer and what the
+import made of it is checked -- every format reads, holds gaussians and has
+bounds; `pawn.athc`'s 8 levels and their words; a web scene's paged tree, one
+root and its 349,076 merges; an `.athz`'s 7 levels, its groups after its
+splats; a `vdb2splat` frame's medium and constants (a
+cold frame with no temperature reads 0); a TX cloud's transfer. They need no
+GPU (the decode runs when a resource is made) and take the test files from
+`ATHENEA_UE_TEST_FILES` (default `~/athenea-unreal`), skipping one that is not
+there:
+
+```
+UnrealEditor-Cmd.exe <project> -nullrhi -unattended -ExecCmds="Automation RunTests Athenea; Quit"
+```
+
+Past them, a change is checked on a Windows machine against athenea:
 
 1. **Build**: `RunUAT BuildPlugin` (operations §2), with no new warning.
 2. **Import**: a commandlet (`UnrealEditor-Cmd ... -run=pythonscript

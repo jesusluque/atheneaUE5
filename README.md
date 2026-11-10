@@ -17,6 +17,16 @@ What this fork adds:
   out-of-bounds append, no pre-exposure, a shadow bound, plugin content not
   packaged, and others).
 - **GPU stats** for each stage of a splat frame.
+- **Levels of detail** for `.athc` and paged `.athz` clouds, cut every frame
+  as athenea cuts them: a staggered threshold, a splat budget a view, the
+  cut by the view's frustum, and a group's splats thinned before the merged
+  level takes their place, so no line or pop shows where levels meet.
+- **Speed**: unlit splats drawn front to back in batches that stop where a
+  pixel is full. A town of 106 million gaussians, held to 8 million splats a
+  view, flies at 63 to 147 frames
+  a second at 1080p on an RTX 3070 Laptop.
+- **Media of gaussians** (fire and smoke from `athenea vdb2splat`) and
+  **sequences** of clouds played at a frame rate.
 
 Documentation, in English and Spanish, is in [`Docs/athenea`](Docs/athenea):
 [design](Docs/athenea/DESIGN.md), [operations](Docs/athenea/operations.md)

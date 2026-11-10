@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "SceneViewExtension.h"
+#include "RenderGraphResources.h"
 
 #include "GaussianSplatClipping.h"
 
@@ -18,6 +19,24 @@ DECLARE_DWORD_COUNTER_STAT_EXTERN(TEXT("Splats Rendered: Unlit"), STAT_SplatsRen
 class IGaussianSplatInterface;
 class FGSGPUStats;
 class FGSplatGBuffer;
+class FViewInfo;
+
+// athenea: a view's cut of a primitive's levels of detail (GSLod.ush): the
+// culling pass draws by it and the prepass morphs by it.
+struct FGSLodCut
+{
+	FVector3f EyeLocal = FVector3f::ZeroVector;
+	float PixelsPerUnit = 0.0f;
+	float Threshold = 0.0f;
+	float Dissolve = 1.0f;
+	float Morph = 0.0f;
+	float MorphSplats = 0.0f;
+	float Thin = 0.0f;
+	float ThinLeast = 0.03125f;
+	bool bFrustum = false;
+	FVector4f Frustum[4] = { FVector4f(0, 0, 0, 0), FVector4f(0, 0, 0, 0), FVector4f(0, 0, 0, 0), FVector4f(0, 0, 0, 0) };
+};
+FGSLodCut GSLodCutOf(const IGaussianSplatInterface& Proxy, const FViewInfo& ViewInfo);
 
 /**
  * 
@@ -50,7 +69,8 @@ private:
 		const FSceneView& InView, 
 		const FRenderTargetBindingSlots& RenderTargets, 
 		const TSet<IGaussianSplatInterface*>& Proxies,
-		const FGSGPUStats* GPUStats
+		const FGSGPUStats* GPUStats,
+		FRDGBufferRef LodBudget
 	);
 
 	// Composite splat buffer with GBuffer
@@ -69,8 +89,15 @@ private:
 		const FSceneView& InView,
 		const TSet<IGaussianSplatInterface*>& Proxies,
 		const TArray<FGSClippingVolumeProxy>& ClippingVolumes,
-		bool bForceEnable
+		bool bForceEnable,
+		FRDGBufferRef LodBudget
 	);
+
+	// athenea: a view's splat budget (GSplatCulling.usf, GSLodBudgetCS), kept
+	// from frame to frame on the device: the factor its cut's threshold is
+	// raised by so the splats fit the frame's buffers.
+	FRDGBufferRef GetLodBudget(FRDGBuilder& GraphBuilder, const FSceneView& InView);
+	TMap<uint32, TRefCountPtr<FRDGPooledBuffer>> LodBudgets;
 
 public:
 

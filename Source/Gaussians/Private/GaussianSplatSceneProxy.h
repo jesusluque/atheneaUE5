@@ -59,6 +59,7 @@ public:
 	virtual bool SupportsRelighting() const override;
 
 	virtual inline float GetScaleMultiplier() const override { return ScaleMultiplier; }
+	virtual inline bool CastsSplatShadow() const override { return CastsDynamicShadow() || CastsStaticShadow(); }
 	virtual bool HasAnyClippingTags(const FGameplayTagContainer& Tags, bool bExactMatch) const override;
 	//~ End IGaussianSplatInterface
 

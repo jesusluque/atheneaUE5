@@ -6,6 +6,7 @@
 // 3DGS writes them (red's fifteen, then green's, then blue's).
 
 #pragma once
+#include "GSSplatData.ush"
 
 #define GS_COLOR_HIGH_ORDER_SH 1u
 #define GS_COLOR_LINEARIZE     2u
@@ -466,7 +467,15 @@ float3 GSTransferredRadiance(uint SplatIndex, float3 Albedo, float3 d)
 
 // Degree 1 to 3 of the real harmonics in 3DGS's sign convention, at a unit
 // direction d, times the coefficients of one channel starting at Base.
-float GSHighOrderSH(StructuredBuffer<float> SH, uint Base, float3 d)
+// athenea: the coefficients are halves, two a word, 46 a splat (the 45 and a
+// pad, so that no word holds two splats'): coefficient h of the buffer.
+float GSLoadSH(StructuredBuffer<uint> SH, uint h)
+{
+	const uint w = SH[h >> 1];
+	return f16tof32((h & 1u) != 0u ? (w >> 16) : (w & 0xFFFFu));
+}
+
+float GSHighOrderSH(StructuredBuffer<uint> SH, uint Base, float3 d)
 {
 	const float C1 = 0.4886025119029199f;
 	const float C2[5] = { 1.0925484305920792f, -1.0925484305920792f, 0.31539156525252005f, -1.0925484305920792f, 0.5462742152960396f };
@@ -475,21 +484,21 @@ float GSHighOrderSH(StructuredBuffer<float> SH, uint Base, float3 d)
 	const float x = d.x, y = d.y, z = d.z;
 	const float xx = x * x, yy = y * y, zz = z * z;
 
-	float r = -C1 * y * SH[Base + 0] + C1 * z * SH[Base + 1] - C1 * x * SH[Base + 2];
+	float r = -C1 * y * GSLoadSH(SH, Base + 0u) + C1 * z * GSLoadSH(SH, Base + 1u) - C1 * x * GSLoadSH(SH, Base + 2u);
 
-	r += C2[0] * x * y * SH[Base + 3]
-	   + C2[1] * y * z * SH[Base + 4]
-	   + C2[2] * (2.0f * zz - xx - yy) * SH[Base + 5]
-	   + C2[3] * x * z * SH[Base + 6]
-	   + C2[4] * (xx - yy) * SH[Base + 7];
+	r += C2[0] * x * y * GSLoadSH(SH, Base + 3u)
+	   + C2[1] * y * z * GSLoadSH(SH, Base + 4u)
+	   + C2[2] * (2.0f * zz - xx - yy) * GSLoadSH(SH, Base + 5u)
+	   + C2[3] * x * z * GSLoadSH(SH, Base + 6u)
+	   + C2[4] * (xx - yy) * GSLoadSH(SH, Base + 7u);
 
-	r += C3[0] * y * (3.0f * xx - yy) * SH[Base + 8]
-	   + C3[1] * x * y * z * SH[Base + 9]
-	   + C3[2] * y * (4.0f * zz - xx - yy) * SH[Base + 10]
-	   + C3[3] * z * (2.0f * zz - 3.0f * xx - 3.0f * yy) * SH[Base + 11]
-	   + C3[4] * x * (4.0f * zz - xx - yy) * SH[Base + 12]
-	   + C3[5] * z * (xx - yy) * SH[Base + 13]
-	   + C3[6] * x * (xx - 3.0f * yy) * SH[Base + 14];
+	r += C3[0] * y * (3.0f * xx - yy) * GSLoadSH(SH, Base + 8u)
+	   + C3[1] * x * y * z * GSLoadSH(SH, Base + 9u)
+	   + C3[2] * y * (4.0f * zz - xx - yy) * GSLoadSH(SH, Base + 10u)
+	   + C3[3] * z * (2.0f * zz - 3.0f * xx - 3.0f * yy) * GSLoadSH(SH, Base + 11u)
+	   + C3[4] * x * (4.0f * zz - xx - yy) * GSLoadSH(SH, Base + 12u)
+	   + C3[5] * z * (xx - yy) * GSLoadSH(SH, Base + 13u)
+	   + C3[6] * x * (xx - 3.0f * yy) * GSLoadSH(SH, Base + 14u);
 
 	return r;
 }
@@ -498,7 +507,7 @@ float GSHighOrderSH(StructuredBuffer<float> SH, uint Base, float3 d)
 // space. It is taken into the file's frame before the harmonics are read.
 float4 GSSplatColor(uint SplatIndex, float3 LocalView, bool bViewDependent)
 {
-	float4 ColorOpacity = GSResources.SHAndOpacities[SplatIndex];
+	float4 ColorOpacity = GSShOp(SplatIndex);
 
 	if ((GSResources.ColorFlags & GS_COLOR_TRANSFER) != 0)
 	{
@@ -548,7 +557,7 @@ float4 GSSplatColor(uint SplatIndex, float3 LocalView, bool bViewDependent)
 	{
 		const float3 v = normalize(LocalView);
 		const float3 d = float3(dot(v, GSResources.FileAxisX), dot(v, GSResources.FileAxisY), dot(v, GSResources.FileAxisZ));
-		const uint Base = SplatIndex * 45u;
+		const uint Base = SplatIndex * 46u;
 		ColorOpacity.r += GSHighOrderSH(GSResources.HighOrderSH, Base + 0u, d);
 		ColorOpacity.g += GSHighOrderSH(GSResources.HighOrderSH, Base + 15u, d);
 		ColorOpacity.b += GSHighOrderSH(GSResources.HighOrderSH, Base + 30u, d);
