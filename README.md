@@ -1,47 +1,145 @@
-# atheneaUE5
+<h1 align="center">atheneaUE5</h1>
 
-athenea's gaussian clouds in Unreal Engine 5.8: a fork of
-[StarLightGS](https://github.com/CoSTAR-National-Lab/starlightgs) (MIT) by
-CoSTAR National Lab, whose README follows below.
+<p align="center">
+  <b>Gaussian splats in Unreal Engine 5.8, at the scale of a town.</b><br>
+  athenea's clouds, formats and levels of detail, built on <a href="https://github.com/CoSTAR-National-Lab/starlightgs">StarLightGS</a>.
+</p>
 
-What this fork adds:
+<p align="center">
+  <a href="https://github.com/jesusluque/atheneaUE5/releases/latest"><img alt="release" src="https://img.shields.io/github/v/release/jesusluque/atheneaUE5?label=release"></a>
+  <img alt="Unreal Engine 5.8" src="https://img.shields.io/badge/Unreal%20Engine-5.8-0E1128">
+  <img alt="Win64, DirectX 12" src="https://img.shields.io/badge/Win64-DirectX%2012%20%C2%B7%20SM6-0078D4">
+  <a href="LICENSE"><img alt="MIT" src="https://img.shields.io/badge/licence-MIT-green"></a>
+</p>
 
-- **View-dependent colour**: spherical harmonics of degree 1 to 3, imported
-  and evaluated along the view in the file's own frame (upstream reserves
-  them but draws the base colour only).
-- **athenea's formats**: USD `ParticleField3DGaussianSplat` stages (through
-  the OpenUSD UE bundles), athenea's chunked `.athc` (kept packed and decoded
-  on the GPU), and PLY files athenea flattened (their axes, units and colour
-  space read from the header comment).
-- **Fixes** to build and render with UE 5.8.4, and to upstream defects (an
-  out-of-bounds append, no pre-exposure, a shadow bound, plugin content not
-  packaged, and others).
-- **GPU stats** for each stage of a splat frame.
-- **Levels of detail** for `.athc` and paged `.athz` clouds, cut every frame
-  as athenea cuts them: a staggered threshold, a splat budget a view, the
-  cut by the view's frustum, and a group's splats thinned before the merged
-  level takes their place, so no line or pop shows where levels meet.
-- **Speed**: unlit splats drawn front to back in batches that stop where a
-  pixel is full. A town of 106 million gaussians, held to 8 million splats a
-  view, flies at 63 to 147 frames
-  a second at 1080p on an RTX 3070 Laptop.
-- **Media of gaussians** (fire and smoke from `athenea vdb2splat`) and
-  **sequences** of clouds played at a frame rate.
+<p align="center">
+  <img src="Docs/athenea/images/tutorial_level.jpg" alt="A town of 106 million gaussians in the Unreal editor" width="92%">
+</p>
+<p align="center"><i>A drone capture of a town, 106 million gaussians, in the Unreal editor: 63 to 147 frames a second at 1080p on an RTX 3070 Laptop.</i></p>
 
-Documentation, in English and Spanish, is in [`Docs/athenea`](Docs/athenea):
-[design](Docs/athenea/DESIGN.md), [operations](Docs/athenea/operations.md)
-(requirements, building, importing, rendering and timing without a window),
-[development](Docs/athenea/development.md) and
-[decisions](Docs/athenea/decisions.md) (every change against upstream, why,
-and what was measured). A [tutorial](Docs/athenea/tutorial-large-scene.md)
-takes a town of 106 million gaussians from the capture to a level that flies
-in real time. Test scripts are in [`Tools/athenea`](Tools/athenea).
+## Where it comes from
 
-Requirements: UE 5.8.4, Win64, DirectX 12 with shader model 6 only (see
-operations §3). Licence: MIT, upstream's and this fork's alike (`LICENSE`
-carries both copyright lines).
+atheneaUE5 is a fork of **[StarLightGS](https://github.com/CoSTAR-National-Lab/starlightgs)**,
+the gaussian splat renderer for Unreal Engine by **CoSTAR National Lab**
+(MIT). StarLightGS gives the foundation: splats drawn inside Unreal's own
+renderer, relit by its lights, casting and receiving shadows beside meshes,
+with no proxy geometry. Its README is kept [at the end of this page](#starlightgs-upstreams-readme).
+
+This fork brings to it what [athenea](https://github.com/jesusluque/athenea)
+draws: its file formats, its relightable (TX) clouds, its levels of detail
+and its media of gaussians, checked against athenea's own renderer, and
+ported to Unreal Engine 5.8.
+
+## What it adds
+
+<table>
+<tr>
+<td width="50%" valign="top">
+<img src="Docs/athenea/images/tutorial_street.jpg" alt="The town from a street">
+<h3>Levels of detail, and speed</h3>
+A <code>.athc</code>'s octree of merged gaussians is cut every frame for each view:
+a staggered threshold, a splat budget, the view's frustum, and a cell's
+gaussians thinned before the merged one takes their place, so no line or pop
+shows where levels meet. Unlit splats are drawn front to back and stop where
+a pixel is full.
+</td>
+<td width="50%" valign="top">
+<img src="Docs/athenea/images/relight.gif" alt="Relit clouds under a turning sky">
+<h3>Relightable clouds</h3>
+athenea's TX clouds carry a transfer for every gaussian: Unreal's sky and sun
+light them, with their own shadowing and reflections, as athenea draws them.
+Here the sky turns once round a fixed camera.
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+<img src="Docs/athenea/images/formats.jpg" alt="The formats the plugin reads">
+<h3>Every common splat format</h3>
+PLY, SPZ, <code>.splat</code>, SOG, glTF <code>KHR_gaussian_splatting</code>,
+USD ParticleFields, and athenea's <code>.athc</code> and <code>.athz</code>,
+each decoded on the GPU, with spherical harmonics up to degree 3 evaluated
+along the view.
+</td>
+<td width="50%" valign="top">
+<img src="Docs/athenea/images/explosions.jpg" alt="Fire and smoke as gaussians">
+<h3>Fire and smoke</h3>
+Media of gaussians from <code>athenea vdb2splat</code> (OpenVDB volumes): the
+optical depth of each pixel's ray, a black body for fire, and the medium's
+shadow on itself; played as sequences at a frame rate.
+</td>
+</tr>
+</table>
+
+## A town in real time
+
+The same flight, from above the town down to a street, at 1920 × 1080 on an
+RTX 3070 Laptop (8 GB), GPU time a frame:
+
+| Where | GPU frame | Frames a second |
+|---|---|---|
+| High above the whole town | 6.4 ms | 147 |
+| Coming down | 11.4 ms | 86 |
+| Over the cliff, the worst stretch | 13.4 to 15.6 ms | 63 to 69 |
+| At street level | 13.1 ms | 89 |
+
+**[Tutorial: a town of 106 million gaussians in Unreal Engine](Docs/athenea/tutorial-large-scene.md)**
+([castellano](Docs/athenea/tutorial-large-scene.es.md)) takes it from the
+capture to a level in the editor: converting to `.athc`, importing, placing
+the parts, and the console variables that make it fit.
+
+## Quick start
+
+1. Download the [latest release](https://github.com/jesusluque/atheneaUE5/releases/latest)
+   and unzip it into `<Project>/Plugins/StarLightGS`.
+2. Restrict the project to shader model 6 in `Config/DefaultEngine.ini`
+   ([operations §3](Docs/athenea/operations.md#3-installing-in-a-project)).
+3. Open the project, drop a splat file on the Content Browser, and drag the
+   asset into the level.
+
+## Formats
+
+| Format | Extensions | Levels of detail |
+|---|---|---|
+| 3DGS PLY | `.ply` | no |
+| USD ParticleField | `.usd` `.usda` `.usdc` | no |
+| athenea chunked cloud | `.athc` | yes |
+| athenea paged cloud and web scene | `.athz` | yes |
+| antimatter15 splat | `.splat` | no |
+| Niantic SPZ | `.spz` | no |
+| PlayCanvas SOG | `.sog` | no |
+| glTF `KHR_gaussian_splatting` | `.glb` `.gltf` | no |
+
+What each one gives, and where it is documented:
+[the tutorial's table](Docs/athenea/tutorial-large-scene.md#11-gaussian-file-types-the-plugin-reads).
+
+## Documentation
+
+In English and Spanish, in [`Docs/athenea`](Docs/athenea):
+
+| | English | Castellano |
+|---|---|---|
+| Using it: requirements, building, importing, console variables, rendering and timing | [operations](Docs/athenea/operations.md) | [operations](Docs/athenea/operations.es.md) |
+| A large capture, step by step | [tutorial](Docs/athenea/tutorial-large-scene.md) | [tutorial](Docs/athenea/tutorial-large-scene.es.md) |
+| Every change against StarLightGS, why, and what was measured | [decisions](Docs/athenea/decisions.md) | [decisions](Docs/athenea/decisions.es.md) |
+| How it is built, and its tools and tests | [development](Docs/athenea/development.md) | [development](Docs/athenea/development.es.md) |
+| The design | [design](Docs/athenea/DESIGN.md) | [design](Docs/athenea/DESIGN.es.md) |
+
+Test and capture scripts are in [`Tools/athenea`](Tools/athenea).
+
+## Requirements and licence
+
+Unreal Engine 5.8.4, Win64, DirectX 12 with shader model 6 only. Windows is
+the only platform built so far.
+
+MIT, StarLightGS's and this fork's alike: [`LICENSE`](LICENSE) carries both
+copyright lines.
 
 ---
+
+## StarLightGS (upstream's README)
+
+<details>
+<summary>The README of <a href="https://github.com/CoSTAR-National-Lab/starlightgs">StarLightGS</a> by CoSTAR National Lab, as this fork received it</summary>
 
 # StarLightGS
 
@@ -92,3 +190,5 @@ See the [Usage Guide](Docs/StarLightGS_Usage_Guide.md) for how to use all featur
 
 ## License
 This project is licensed under the MIT License - see the LICENSE file for details.
+
+</details>
