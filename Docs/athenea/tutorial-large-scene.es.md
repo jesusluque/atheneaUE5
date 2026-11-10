@@ -21,7 +21,7 @@ English: [tutorial-large-scene.md](tutorial-large-scene.md).
 
 ## 2. De la captura a los `.athc` (athenea)
 
-El plugin lee muchos formatos de gaussianas (sección 11), y una captura
+El plugin lee muchos formatos de gaussianas ([sección 11](#11-tipos-de-fichero-de-gaussianas-que-lee-el-plugin)), y una captura
 pequeña se puede soltar en el editor tal cual. Una captura de este tamaño
 tiene que ser un `.athc`: es el formato que lleva niveles de detalle y se
 queda empaquetado en la GPU.
@@ -47,7 +47,7 @@ o un stage USD con un `ParticleField3DGaussianSplat`
 | `--max-group-fraction` | `0.5` | por defecto | el máximo de celdas del nivel fusionado más fino, por gaussiana |
 | `--merged-opacity` | `5` | por defecto | la opacidad máxima de una gaussiana fusionada; por encima de 1 se dibuja con un kernel más duro, que conserva la masa de las gaussianas que cubrían su celda más de una vez |
 | `--degree` | `3` | por defecto | los armónicos esféricos que se conservan (0 a 3); esta captura lleva grado 0 |
-| `--rotate-x` | `0` | no se admite | un `.athc` guarda la nube como es; una captura que sale boca abajo se gira en su actor en el nivel (sección 5) |
+| `--rotate-x` | `0` | no se admite | un `.athc` guarda la nube como es; una captura que sale boca abajo se gira en su actor en el nivel ([sección 5](#5-colocar-las-partes-en-un-nivel)) |
 
 ### 2.3 La conversión
 

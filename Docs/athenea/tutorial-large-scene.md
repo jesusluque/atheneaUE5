@@ -20,7 +20,7 @@ Spanish: [tutorial-large-scene.es.md](tutorial-large-scene.es.md).
 
 ## 2. From the capture to `.athc` files (athenea)
 
-The plugin reads many gaussian formats (section 11), and a small capture can
+The plugin reads many gaussian formats ([section 11](#11-gaussian-file-types-the-plugin-reads)), and a small capture can
 be dropped on the editor as it comes. A capture of this size has to be a
 `.athc`: it is the format that carries levels of detail and stays packed on
 the GPU.
@@ -46,7 +46,7 @@ stage with a `ParticleField3DGaussianSplat`
 | `--max-group-fraction` | `0.5` | default | the most cells the finest merged level may hold, per gaussian |
 | `--merged-opacity` | `5` | default | the most a merged gaussian's opacity may be; over 1 it is drawn with a harder kernel, which keeps the mass of gaussians that covered their cell more than once |
 | `--degree` | `3` | default | the spherical harmonics kept (0 to 3); this capture carries degree 0 |
-| `--rotate-x` | `0` | not allowed | a `.athc` holds the cloud as it is; a capture that comes out upside down is turned on its actor in the level (section 5) |
+| `--rotate-x` | `0` | not allowed | a `.athc` holds the cloud as it is; a capture that comes out upside down is turned on its actor in the level ([section 5](#5-placing-the-parts-in-a-level)) |
 
 ### 2.3 The conversion
 
