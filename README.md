@@ -52,15 +52,7 @@ Here the sky turns once round a fixed camera.
 </td>
 </tr>
 <tr>
-<td width="50%" valign="top">
-<img src="Docs/athenea/images/formats.jpg" alt="The formats the plugin reads">
-<h3>Every common splat format</h3>
-PLY, SPZ, <code>.splat</code>, SOG, glTF <code>KHR_gaussian_splatting</code>,
-USD ParticleFields, and athenea's <code>.athc</code> and <code>.athz</code>,
-each decoded on the GPU, with spherical harmonics up to degree 3 evaluated
-along the view.
-</td>
-<td width="50%" valign="top">
+<td colspan="2" valign="top">
 <img src="Docs/athenea/images/explosions.jpg" alt="Fire and smoke as gaussians">
 <h3>Fire and smoke</h3>
 Media of gaussians from <code>athenea vdb2splat</code> (OpenVDB volumes): the
@@ -97,6 +89,9 @@ the parts, and the console variables that make it fit.
    asset into the level.
 
 ## Formats
+
+Every common splat format, each decoded on the GPU, with spherical harmonics
+up to degree 3 evaluated along the view.
 
 | Format | Extensions | Levels of detail |
 |---|---|---|
