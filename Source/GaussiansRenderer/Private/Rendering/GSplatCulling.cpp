@@ -208,6 +208,16 @@ FGSLodCut GSLodCutOf(const IGaussianSplatInterface& Proxy, const FViewInfo& View
 	const float Thin = CVarAtheneaLodThin.GetValueOnRenderThread();
 	Cut.Thin = Thin > 1.0f ? Thin : 0.0f;
 	Cut.ThinLeast = FMath::Clamp(CVarAtheneaLodThinLeast.GetValueOnRenderThread(), 1.0f / 1024.0f, 1.0f);
+	// A skinned cloud is posed splat by splat: its merged groups have no
+	// influences, so the cut draws its splats alone.
+	if (const FGaussianSplatResource* Resource = Proxy.GetResource_RenderThread(); Resource && Resource->IsSkinned())
+	{
+		Cut.Threshold = 0.0f;
+		Cut.Thin = 0.0f;
+		Cut.Morph = 0.0f;
+		Cut.MorphSplats = 0.0f;
+		Cut.Dissolve = 1.0f;
+	}
 	// The view's four side planes in the primitive's local space: a point p
 	// goes to view space as p * (LocalToWorld * View), +z forward; inside is
 	// |x| <= z tx and |y| <= z ty.

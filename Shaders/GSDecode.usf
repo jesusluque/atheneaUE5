@@ -752,6 +752,15 @@ RWStructuredBuffer<float> OutSurface;
 RWStructuredBuffer<uint> OutCells;
 RWStructuredBuffer<float> OutField;
 RWStructuredBuffer<float> OutCurvature;
+RWStructuredBuffer<float> OutEmission;
+
+// LIGHT IN ONE WORD (athenea's common/packing.slang, unpackRgb9e5): three
+// 9-bit mantissas under one 5-bit exponent, linear.
+float3 GSUnpackRgb9e5(uint Word)
+{
+	const float Step = exp2(float(int(Word >> 27) - 24));
+	return float3(float(Word & 511u), float((Word >> 9) & 511u), float((Word >> 18) & 511u)) * Step;
+}
 uint TxDirect;     // direct values a splat (9 or 16)
 uint TxField;      // 1: the field's 48 values follow the indirect ones
 uint TxCellWords;  // SHAD's words a splat, 0 for none
@@ -850,6 +859,12 @@ void GSDecodeAthc3TxCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	}
 	if ((Flags & 4u) != 0u)
 	{
+		// What it gives off: written where the importer asked for it
+		// (bPackedEmission), a single float otherwise, which drops the rest.
+		const float3 Glow = Material ? GSUnpackRgb9e5(Athc3Word(b, 3u, n, e, w)) : 0.0f;
+		OutEmission[i * 3u + 0u] = Glow.x;
+		OutEmission[i * 3u + 1u] = Glow.y;
+		OutEmission[i * 3u + 2u] = Glow.z;
 		w += 1u;
 	}
 	const uint MaterialWords = Material ? Athc3Desc(3u).y : 0u;
@@ -1423,6 +1438,57 @@ void GSAthzLodCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 			return;
 		}
 	}
+}
+
+// athenea: AN .ATHZ'S LAYER K. Each splat's four (joint, weight) pairs, as
+// the decode left them in the scratch (two floats a pair, eight words a
+// splat), packed as the skin reads them: joint | weight unorm16 << 16; and
+// its three gradient words (two halves each) copied as they are.
+uint InfluenceAt;
+uint GradientAt;
+RWStructuredBuffer<uint> OutInfluences;
+RWStructuredBuffer<uint> OutGradients;
+
+[numthreads(64, 1, 1)]
+void GSAthzSkinCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint i = Offset + DispatchThreadId.x;
+	if (i >= Count)
+	{
+		return;
+	}
+	[unroll] for (uint k = 0; k < 4u; ++k)
+	{
+		const float Joint = asfloat(Scratch.Load(InfluenceAt + (i * 8u + k * 2u) * 4u));
+		const float Weight = asfloat(Scratch.Load(InfluenceAt + (i * 8u + k * 2u + 1u) * 4u));
+		OutInfluences[i * 4u + k] = min(uint(max(Joint, 0.0f) + 0.5f), 0xFFFFu) | (uint(saturate(Weight) * 65535.0f + 0.5f) << 16);
+	}
+	if (GradientAt != 0u)
+	{
+		[unroll] for (uint k = 0; k < 3u; ++k)
+		{
+			OutGradients[i * 3u + k] = Scratch.Load(GradientAt + (i * 3u + k) * 4u);
+		}
+	}
+}
+
+// athenea: A .ATHC V3'S LEVELS OF DETAIL. Its merged levels are blocks after
+// its chunks (GSplatAthcImporter.cpp), and the culling pass cuts them from two
+// words a gaussian, as a v2 file's: CORE's tail (a splat's finest group, a
+// group's octree cell) and the word its block's row holds after its sections
+// (kLodLeaf, or the group's level with kLodCoarsest on the coarsest).
+[numthreads(64, 1, 1)]
+void GSAthc3LodCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint i = Offset + DispatchThreadId.x;
+	if (i >= Count)
+	{
+		return;
+	}
+	const uint b = Athc3BlockOf(i);
+	const uint2 Block = Athc3Block(b);
+	OutLodWords[i * 2u] = Athc3Word(b, 0u, Block.y, i - Block.x, 8u);
+	OutLodWords[i * 2u + 1u] = InBytes.Load(Athc3BlockAt(b) + (2u + ATHC3_SECTIONS * 3u) * 4u);
 }
 
 // athenea: a PLY's or a USD stage's rest coefficients, uploaded as floats (45

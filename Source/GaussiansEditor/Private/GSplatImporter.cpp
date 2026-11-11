@@ -262,6 +262,14 @@ bool GSplatImporter::ImportPly(const UGSplatImportData& ImportData, happly::PLYD
 
 	auto& normals = Splats.Normals;
 	auto& metallicRoughness = Splats.MetallicRoughness;
+	// athenea: the file's metallic and roughness are read only where the
+	// import asked for them (else the array was never sized: upstream wrote
+	// into it anyway) and where they came in one of the two types read.
+	const bool bReadMR = ImportData.bHasMetallicRoughness && ImportData.bImportMetallicRoughness
+		&& metallicRoughness.Num() == int32(vertices.count)
+		&& (bCompressedPBR ? metallic_uchar.size() == size_t(vertices.count) && roughness_uchar.size() == size_t(vertices.count)
+		                   : metallic_float.size() == size_t(vertices.count) && roughness_float.size() == size_t(vertices.count));
+	const bool bDefaultMR = !bReadMR && ImportData.bPopulateMRWithDefault && metallicRoughness.Num() == int32(vertices.count);
 
 	for (int i = 0; i < vertices.count; i++)
 	{
@@ -353,7 +361,7 @@ bool GSplatImporter::ImportPly(const UGSplatImportData& ImportData, happly::PLYD
 			normals[i].Normalize();
 		}
 
-		if (ImportData.bHasMetallicRoughness)
+		if (bReadMR)
 		{
 			if (bCompressedPBR)
 			{
@@ -366,7 +374,7 @@ bool GSplatImporter::ImportPly(const UGSplatImportData& ImportData, happly::PLYD
 				metallicRoughness[i].Y = roughness_float[i];
 			}
 		}
-		else if (ImportData.bPopulateMRWithDefault)
+		else if (bDefaultMR)
 		{
 			metallicRoughness[i].X = ImportData.MetallicDefaultValue;
 			metallicRoughness[i].Y = ImportData.RoughnessDefaultValue;

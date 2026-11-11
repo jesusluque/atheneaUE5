@@ -1,6 +1,7 @@
 #pragma once
 
 #include "RenderResource.h"
+#include "RenderGraphFwd.h"
 #include "ShaderParameterMacros.h"
 #include "UniformBuffer.h"
 #include "GaussianData.h"
@@ -44,6 +45,23 @@ BEGIN_UNIFORM_BUFFER_STRUCT(FGaussianSplatShaderResources, GAUSSIANSRENDERER_API
 	SHADER_PARAMETER_SRV(StructuredBuffer<float>, TransferField)
 	SHADER_PARAMETER(uint32, HasCurvature)
 	SHADER_PARAMETER_SRV(StructuredBuffer<float>, TransferCurvature)
+	SHADER_PARAMETER(uint32, TransferZonal)
+	SHADER_PARAMETER(uint32, Catcher)
+	SHADER_PARAMETER(uint32, LightCatcher)
+	SHADER_PARAMETER(float, ShadowCut)
+	SHADER_PARAMETER(float, ShadowClip)
+	SHADER_PARAMETER(float, ShadowPush)
+	SHADER_PARAMETER(uint32, HasCrypto)
+	SHADER_PARAMETER_SRV(StructuredBuffer<uint>, CryptoIds)
+	SHADER_PARAMETER(uint32, HasVisibility)
+	SHADER_PARAMETER_SRV(StructuredBuffer<float2>, Visibility)
+	SHADER_PARAMETER(uint32, HasEmission)
+	SHADER_PARAMETER_SRV(StructuredBuffer<float>, Emission)
+	SHADER_PARAMETER(uint32, HasHardness)
+	SHADER_PARAMETER_SRV(StructuredBuffer<float>, Hardness)
+	SHADER_PARAMETER(uint32, LightLayerCount)
+	SHADER_PARAMETER(uint32, LightLayerSplats)
+	SHADER_PARAMETER_SRV(StructuredBuffer<uint>, LightLayers)
 	SHADER_PARAMETER(float, FileUnitsToCm)
 	SHADER_PARAMETER(float, GlassIor)
 
@@ -68,6 +86,7 @@ BEGIN_UNIFORM_BUFFER_STRUCT(FGaussianSplatShaderResources, GAUSSIANSRENDERER_API
 	SHADER_PARAMETER(uint32, VolumeOn)
 	SHADER_PARAMETER(float, VolumeDensityScale)
 	SHADER_PARAMETER(float, VolumeEmissionScale)
+	SHADER_PARAMETER(float, VolumeAnisotropy)
 	SHADER_PARAMETER(float, VolumeTemperatureScale)
 	SHADER_PARAMETER(float, VolumeTemperatureOffset)
 	SHADER_PARAMETER(FVector3f, VolumeAlbedo)
@@ -131,11 +150,25 @@ public:
 	uint32 GetLodGroupRuns() const { return LodGroupRuns == LodFinestGroups ? LodGroupRuns : 0u; }
 	uint32 GetLodSplatsEnd() const { return LodSplatsEnd; }
 	bool IsVolume() const { return bVolume; }
+	// athenea: whether some of its gaussians are surfels (a scale of zero: a
+	// .athc's merged levels, a flat conversion), drawn from the pixel's ray.
+	bool HasSurfels() const { return bSurfels || LodLevels > 0; }
 	// Checks from CPU copy of splat data if this resource supports relighting
 	bool SupportsRelighting() const { return SplatData.SupportsRelighting(); }
 	// athenea: whether the colour is an albedo a transfer lights
 	bool HasTransfer() const { return SplatData.bHasTransfer; }
 	bool HasCurvature() const { return SplatData.bHasTransfer && (!SplatData.TransferCurvature.IsEmpty() || (SplatData.bPacked && SplatData.bPackedCurvature)); }
+
+	// athenea: whether a skeleton carries the cloud, and its poses' span in seconds.
+	bool IsSkinned() const { return bSkinned; }
+	float GetSkinDuration() const { return SplatData.SkinTimes.IsEmpty() ? 0.0f : SplatData.SkinTimes.Last(); }
+	// The cloud posed at a time (seconds into its poses, blended between the
+	// two sampled poses around it) into the buffers every pass reads. A pose
+	// already drawn is not posed again. Several components sharing a skinned
+	// asset share its pose: the last one asked is drawn by all.
+	// LocalToWorld and SunToLight (world, w 1 where there is a sun) say where
+	// the sun is in the cloud's frame, for its parts' baked visibility.
+	void Skin_RenderThread(FRDGBuilder& GraphBuilder, float Seconds, const FMatrix& LocalToWorld, const FVector4f& SunToLight);
 
 private:
 	// CPU copy of data that this resource will copy to GPU
@@ -180,6 +213,32 @@ private:
 	FBufferResources PackedField;
 	FBufferResources PackedCurvature;
 	FBufferResources CurvatureBuffer;
+	FBufferResources PackedEmission;
+	FBufferResources EmissionBuffer;
+	FBufferResources HardnessBuffer;
+	bool bSurfels = false;
+	FBufferResources LightLayersBuffer;
+	FBufferResources CryptoBuffer;
+	// athenea: a skinned cloud's bind pose, influences and gradients, and the
+	// views its posed buffers are written through.
+	bool bSkinned = false;
+	float SkinShown = -1.0f;
+	FBufferResources SkinRestPositionsBuffer;
+	FBufferResources SkinRestRotationsBuffer;
+	FBufferResources SkinRestScalesBuffer;
+	FBufferResources SkinInfluencesBuffer;
+	FBufferResources SkinGradientsBuffer;
+	FUnorderedAccessViewRHIRef SkinPositionsUAV;
+	FUnorderedAccessViewRHIRef SkinScalesUAV;
+	FUnorderedAccessViewRHIRef SkinOrientationsUAV;
+	FBufferResources VisPartsBuffer;
+	FBufferResources VisPartOfBuffer;
+	FBufferResources VisTexelsBuffer;
+	FBufferResources VisAmbientBuffer;
+	FBufferResources VisibilityBuffer;
+	FUnorderedAccessViewRHIRef VisibilityUAV;
+	uint32 VisParts = 0;
+	FVector4f SkinSunShown = FVector4f(0, 0, 0, -1);
 	// athenea: a .athc's levels of detail, two words a gaussian.
 	FBufferResources LodWordsBuffer;
 	FBufferResources LodGroupStartsBuffer;

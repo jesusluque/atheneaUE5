@@ -3,16 +3,19 @@
 // A .athc, athenea's chunked container (modules/lod/src/Athc.cpp), as a packed
 // asset: the finest level, every chunk's positions, shape and harmonic words
 // copied as they are. The GPU decodes them when the resource is made
-// (GSDecode.usf). Merged levels, normals, emission and the extras are not read
-// yet.
+// (GSDecode.usf), with the merged levels after the splats, cut each frame
+// (GSplatCulling.usf). A TX cloud is read as format 5 (below), its material,
+// emission and transfer with it. Normals are not read: a TX cloud's surface
+// frame comes from its shape.
 //
 // Version 3 (sparkwebGPU's, for the web; docs/docs/athc-v3.md there) is the
 // same values in sections, each gzipped or not and stored as v2's words, as
-// byte planes or as byte planes of 16-bit differences. Its chunks' CORE and
-// SHRS sections are kept as stored (after the gunzip) with a table of blocks,
-// and the GPU reads them in any of the three (PackedFormat 5,
-// GSDecodeAthc3CS). The levels, the material, the transfer and the rest are
-// not read yet.
+// byte planes or as byte planes of 16-bit differences. Its blocks' sections
+// are kept as stored (after the gunzip) with a table of blocks, and the GPU
+// reads them in any of the three (PackedFormat 5, GSDecodeAthc3CS): the
+// chunks, then the merged levels (kind 0 blocks) after them as v2 lays them,
+// their LOD words written on the device from CORE's tails (GSAthc3LodCS); a
+// paged tree's pages; the material, the transfer, the skin.
 //
 //   page 0        header (104 bytes: FileHeader below)
 //   page 1..      level table, chunk table (offset, count, pad a chunk)
@@ -86,6 +89,7 @@ namespace GSplatAthc3
 	uint64 W64(const uint8* b) { return uint64(W32(b)) | (uint64(W32(b + 4)) << 32); }
 	float F32(const uint8* b) { const uint32 v = W32(b); float f; FMemory::Memcpy(&f, &v, 4); return f; }
 	constexpr uint32 Tag(const char* s) { return uint32(uint8(s[0])) | (uint32(uint8(s[1])) << 8) | (uint32(uint8(s[2])) << 16) | (uint32(uint8(s[3])) << 24); }
+	constexpr uint32 kKindLevel = 0;
 	constexpr uint32 kKindChunk = 1;
 	constexpr uint32 kKindPage = 2;
 	constexpr uint32 kSections = 9;
@@ -123,9 +127,11 @@ namespace GSplatAthc3
 		// The sections read, in the order GSDecode.usf names them; a TX cloud's
 		// material and transfer only where the transfer is one the plugin draws
 		// (9 or 16 direct values, with or without the indirect half and the
-		// field; not a zonal one).
+		// field; or a zonal one, 10 values, decoded into records of 9 with its
+		// values at the start, as GSColor.ush's GSZonalTransfer reads them).
 		static const char* kRead[kSections] = { "CORE", "SHRS", "TREE", "MATL", "SHAD", "TXDI", "TXIN", "TXFD", "CURV" };
-		const uint32 Direct = (TransferCount == 9 || TransferCount == 36 || TransferCount == 84) ? 9u
+		const bool bZonal = TransferCount == 10;
+		const uint32 Direct = (TransferCount == 9 || TransferCount == 10 || TransferCount == 36 || TransferCount == 84) ? 9u
 			: (TransferCount == 16 || TransferCount == 64 || TransferCount == 112) ? 16u : 0u;
 		const bool bTransfer = Direct > 0 && (Flags & kAthcTransfer) != 0;
 		TArray<uint8> Table;
@@ -162,6 +168,32 @@ namespace GSplatAthc3
 				Index[k] = INDEX_NONE;
 			}
 		}
+		// athenea: A SKINNED CLOUD (the web's SKIN section and ATSK skeleton,
+		// athc-v3.md): header words 144 and 148 its influences and gradient
+		// words a splat, 152 where the skeleton blob starts. SKIN is unpacked
+		// here, a word an influence (joint | weight unorm16 << 16) and the
+		// gradients' words, as plain words or byte planes.
+		const uint32 SkinInfluenceWords = W32(H + 144), SkinGradientWords = W32(H + 148);
+		const uint64 SkeletonAt = W32(H + 152);
+		int32 SkinIndex = INDEX_NONE;
+		uint32 SkinEncoding = 0, SkinCompression = 0;
+		for (uint32 s = 0; s < SectionCount && SkinInfluenceWords > 0 && SkeletonAt > 0; s++)
+		{
+			const uint8* E = &Table[s * 32];
+			if (W32(E) == Tag("SKIN") && W32(E + 16) == SkinInfluenceWords + SkinGradientWords)
+			{
+				SkinIndex = int32(s);
+				SkinEncoding = W32(E + 8);
+				SkinCompression = W32(E + 12);
+			}
+		}
+		if (SkinIndex != INDEX_NONE && (SkinEncoding > 1 || SkinCompression > 1))
+		{
+			UE_LOG(LogGSplatImport, Warning, TEXT("%s: its SKIN section is in encoding %u, compression %u, which this does not read: drawn in its bind pose."),
+				*Filename, SkinEncoding, SkinCompression);
+			SkinIndex = INDEX_NONE;
+		}
+		TArray<uint32> SkinInfluences, SkinGradients;
 		if (Index[0] == INDEX_NONE || Words[0] != 9)
 		{
 			return Fail(Index[0] == INDEX_NONE ? FString(TEXT("no CORE section."))
@@ -214,9 +246,40 @@ namespace GSplatAthc3
 		{
 			return Fail(TEXT("the block index is cut short."));
 		}
+		// The merged levels (kind 0 blocks, coarsest first) are read after the
+		// chunks, as v2 lays them, where the file has no paged tree and no
+		// skeleton (a skinned cloud is drawn from its splats alone).
+		TArray<uint32> Order;
+		uint32 FinestLevel = 0, CoarsestLevel = ~0u, LevelBlocks = 0;
+		{
+			bool bPaged = false;
+			for (uint32 b = 0; b < BlockCount; b++)
+			{
+				bPaged |= W32(&BlockIndexBytes[b * Entry]) == kKindPage;
+			}
+			for (uint32 b = 0; b < BlockCount; b++)
+			{
+				const uint32 Kind = W32(&BlockIndexBytes[b * Entry]);
+				if (Kind == kKindChunk || Kind == kKindPage)
+				{
+					Order.Add(b);
+				}
+			}
+			for (uint32 b = 0; b < BlockCount && !bPaged && SkinIndex == INDEX_NONE; b++)
+			{
+				const uint8* E = &BlockIndexBytes[b * Entry];
+				if (W32(E) == kKindLevel && W32(E + 12) > 0)
+				{
+					Order.Add(b);
+					FinestLevel = FMath::Max(FinestLevel, W32(E + 4));
+					CoarsestLevel = FMath::Min(CoarsestLevel, W32(E + 4));
+					LevelBlocks++;
+				}
+			}
+		}
 		TArray<uint32> Blocks;
 		TArray<uint8> Data;
-		uint32 Done = 0, Used = 0, Pages = 0, ScratchBytes = 0;
+		uint32 Done = 0, Used = 0, Pages = 0, ScratchBytes = 0, Groups = 0, FinestBase = ~0u;
 		// A paged tree's pages in order (the TREE words name them by it): each
 		// one's first splat and its TREE words, page then place|count<<16.
 		TArray<uint32> PageStart;
@@ -224,17 +287,23 @@ namespace GSplatAthc3
 		bool bTreeRead = true;
 		bool bCpca = false, bDelta = false;
 		TArray<uint8> Stored, Raw;
-		for (uint32 b = 0; b < BlockCount; b++)
+		for (const uint32 b : Order)
 		{
 			const uint8* E = &BlockIndexBytes[b * Entry];
 			// Chunks (kind 1) hold the finest splats; a paged file's pages (kind
-			// 2) hold its whole tree, merges and leaves, TREE telling them apart.
-			// A merged level (kind 0) is not read yet.
+			// 2) hold its whole tree, merges and leaves, TREE telling them apart;
+			// a merged level (kind 0) its groups, a cell code each in CORE's tail.
 			const uint32 Kind = W32(E);
+			const uint32 Level = W32(E + 4);
 			const uint32 n = W32(E + 12);
-			if ((Kind != kKindChunk && Kind != kKindPage) || n == 0)
+			if (n == 0)
 			{
 				continue;
+			}
+			if (Kind == kKindLevel)
+			{
+				FinestBase = Level == FinestLevel && FinestBase == ~0u ? Done : FinestBase;
+				Groups += n;
 			}
 			Blocks.Add(Done);
 			Blocks.Add(n);
@@ -317,14 +386,62 @@ namespace GSplatAthc3
 				}
 				Blocks.Append({ SectionAt, Encoding[k], ScratchAt });
 			}
-			Blocks.Append({ 0u, 0u, 0u });   // to 32 words (ATHC3_BLOCK_WORDS)
+			// To 32 words (ATHC3_BLOCK_WORDS): first the LOD word GSAthc3LodCS
+			// gives the block's elements beside their tails, a group's level
+			// (kLodCoarsest on the coarsest) or a splat's kLodLeaf.
+			Blocks.Append({ Kind == kKindLevel ? (Level | (Level == CoarsestLevel ? FGaussianSplatData::kLodCoarsest : 0u)) : FGaussianSplatData::kLodLeaf, 0u, 0u });
+			if (SkinIndex != INDEX_NONE && Kind == kKindChunk)
+			{
+				// The block's SKIN: its two arrays one after the other, each
+				// element's words in a row (encoding 0) or byte b of every
+				// element's word w together (encoding 1).
+				const uint8* Span = E + 32 + 16 * SkinIndex;
+				const uint32 StoredBytes = W32(Span + 8), RawBytes = W32(Span + 12);
+				const uint32 Wn = SkinInfluenceWords + SkinGradientWords;
+				Stored.SetNumUninitialized(StoredBytes);
+				if (RawBytes != n * Wn * 4 || !ReadAt(File, W64(Span), Stored.GetData(), StoredBytes))
+				{
+					return Fail(TEXT("a block's SKIN is cut short."));
+				}
+				const TArray<uint8>* Bytes = &Stored;
+				if (SkinCompression == 1)
+				{
+					Raw.Reset();
+					if (!AtheneaCodecs::Gunzip(Stored.GetData(), Stored.Num(), Raw) || Raw.Num() != int32(RawBytes))
+					{
+						return Fail(TEXT("a block's SKIN does not gunzip to its bytes."));
+					}
+					Bytes = &Raw;
+				}
+				const uint8* R = Bytes->GetData();
+				auto Word = [&](uint32 Base, uint32 Width, uint32 e, uint32 w)
+				{
+					if (SkinEncoding == 0)
+					{
+						return W32(R + Base + (e * Width + w) * 4);
+					}
+					const uint32 P = Base + (w * 4) * n + e;
+					return uint32(R[P]) | (uint32(R[P + n]) << 8) | (uint32(R[P + 2 * n]) << 16) | (uint32(R[P + 3 * n]) << 24);
+				};
+				for (uint32 e = 0; e < n; e++)
+				{
+					for (uint32 w = 0; w < SkinInfluenceWords; w++)
+					{
+						SkinInfluences.Add(Word(0, SkinInfluenceWords, e, w));
+					}
+					for (uint32 w = 0; w < SkinGradientWords; w++)
+					{
+						SkinGradients.Add(Word(n * SkinInfluenceWords * 4, SkinGradientWords, e, w));
+					}
+				}
+			}
 			Done += n;
 			Used++;
 			Pages += Kind == kKindPage ? 1 : 0;
 		}
-		if (Done != Count)
+		if (Done != Count + Groups)
 		{
-			return Fail(FString::Printf(TEXT("its chunks or pages hold %u splats where the header says %u."), Done, Count));
+			return Fail(FString::Printf(TEXT("its chunks or pages hold %u splats where the header says %u."), Done - Groups, Count));
 		}
 		if (Used > 65535 || uint64(Data.Num()) + uint64(ScratchBytes) > 0xFFFFFFFFull)
 		{
@@ -342,10 +459,12 @@ namespace GSplatAthc3
 		Data.Append(reinterpret_cast<const uint8*>(Desc.GetData()), Desc.Num() * sizeof(uint32));
 		Data.Append(reinterpret_cast<const uint8*>(Blocks.GetData()), Blocks.Num() * sizeof(uint32));
 
-		ImportData.Swizzle = { EGSplatSwizzleAxis::X, EGSplatSwizzleAxis::Z, EGSplatSwizzleAxis::Y };
+		ImportData.Swizzle = ImportData.bFileZUp
+		? TArray<EGSplatSwizzleAxis>{ EGSplatSwizzleAxis::X, EGSplatSwizzleAxis::Yn, EGSplatSwizzleAxis::Z }
+		: TArray<EGSplatSwizzleAxis>{ EGSplatSwizzleAxis::X, EGSplatSwizzleAxis::Z, EGSplatSwizzleAxis::Y };
 		ImportData.ScaleFactor = 100.0f;
 		ImportData.bApplyGammaCorrection = (Flags & kAthcLinear) == 0;
-		ImportData.NumSplats = int32(Count);
+		ImportData.NumSplats = int32(Done);
 		ImportData.bHasHighOrderSH = RestPerColour > 0 && Index[1] != INDEX_NONE;
 		ImportData.bHasNormals = false;
 		ImportData.bHasMetallicRoughness = false;
@@ -353,7 +472,81 @@ namespace GSplatAthc3
 		Splats.Empty();
 		Splats.bPacked = true;
 		Splats.PackedFormat = 5;
-		Splats.SplatCount = Count;
+		Splats.SplatCount = Done;
+		if (LevelBlocks > 0)
+		{
+			// The levels' LOD words are written by the device (GSAthc3LodCS).
+			Splats.LodLevels = LevelBlocks;
+			Splats.LodFinestLevel = FinestLevel;
+			Splats.LodFinestBase = FinestBase;
+			Splats.LodBoundsLo = FVector3f(F32(H + 64), F32(H + 68), F32(H + 72));
+			Splats.LodExtent = F32(H + 76);
+		}
+		// THE SKELETON (ATSK): joints, clips, the bind transform and each clip's
+		// transforms at its sample times, all USD rows (p' = p M); the first
+		// clip is what the cloud plays. C_j = X_j G for column vectors,
+		// C[r][c] = sum_k X[k][r] G[c][k], as the USD reader makes it.
+		if (SkinIndex != INDEX_NONE && SkinInfluences.Num() == int32(Count * SkinInfluenceWords))
+		{
+			uint8 Head[112];
+			if (ReadAt(File, SkeletonAt, Head, 112) && W32(Head) == Tag("ATSK") && W32(Head + 4) == 1)
+			{
+				const uint32 Bytes = W32(Head + 8), Joints = W32(Head + 12), Clips = W32(Head + 16);
+				TArray<uint8> Blob;
+				Blob.SetNumUninitialized(Bytes);
+				if (Joints > 0 && Clips > 0 && Bytes >= 112 && ReadAt(File, SkeletonAt, Blob.GetData(), Bytes))
+				{
+					const uint8* B = Blob.GetData();
+					float G[4][4];
+					for (int32 i = 0; i < 16; i++)
+					{
+						G[i / 4][i % 4] = F32(B + 32 + i * 4);
+					}
+					uint32 At = 112 + Align(W32(B + 96) + W32(B + 100), 4u);
+					const uint32 NameBytes = W32(B + At), Samples = W32(B + At + 4);
+					const float Rate = FMath::Max(F32(B + At + 8), 1.0e-6f);
+					At += 16 + Align(NameBytes, 4u);
+					if (Samples > 0 && uint64(At) + uint64(Samples) * 4 + uint64(Samples) * Joints * 64 <= Bytes)
+					{
+						const float Start = F32(B + At);
+						for (uint32 t = 0; t < Samples; t++)
+						{
+							Splats.SkinTimes.Add((F32(B + At + t * 4) - Start) / Rate);
+						}
+						const uint8* X0 = B + At + Samples * 4;
+						for (uint32 t = 0; t < Samples; t++)
+						{
+							for (uint32 j = 0; j < Joints; j++)
+							{
+								const uint8* X = X0 + (uint64(t) * Joints + j) * 64;
+								for (int32 r = 0; r < 3; r++)
+								{
+									float Row[4];
+									for (int32 c = 0; c < 4; c++)
+									{
+										Row[c] = 0.0f;
+										for (int32 k = 0; k < 4; k++)
+										{
+											Row[c] += F32(X + (k * 4 + r) * 4) * G[c][k];
+										}
+									}
+									Splats.SkinXforms.Add(FVector4f(Row[0], Row[1], Row[2], Row[3]));
+								}
+							}
+						}
+						Splats.SkinJoints = Joints;
+						Splats.SkinPerSplat = SkinInfluenceWords;
+						Splats.SkinInfluences = MoveTemp(SkinInfluences);
+						if (SkinGradientWords + 1 == SkinInfluenceWords && SkinGradients.Num() == int32(Count * SkinGradientWords))
+						{
+							Splats.SkinGradients = MoveTemp(SkinGradients);
+						}
+						UE_LOG(LogGSplatImport, Display, TEXT("%s: carried by %u joints, %u influences a gaussian, %u poses over %.2f s."),
+							*Filename, Joints, SkinInfluenceWords, Samples, Splats.SkinTimes.Last());
+					}
+				}
+			}
+		}
 		Splats.bHasHighOrderSH = ImportData.bHasHighOrderSH && ImportData.bImportHighOrderSH;
 		Splats.PackedUnitsToCm = ImportData.ScaleFactor;
 		Splats.PackedBytes = MoveTemp(Data);
@@ -367,6 +560,8 @@ namespace GSplatAthc3
 			Splats.CellWords = (Index[4] != INDEX_NONE && (ShadowWords == 8 || ShadowWords == 32)) ? ShadowWords : 0u;
 			Splats.bPackedTransferField = Direct == 16 && TransferCount == 112;
 			Splats.bPackedCurvature = Index[8] != INDEX_NONE && Words[8] == 2;
+			Splats.bPackedEmission = Index[3] != INDEX_NONE && (Flags & kAthcEmission) != 0;
+			Splats.bTransferZonal = bZonal;
 			Splats.FileUnitsToCm = 100.0f;
 		}
 		// A paged tree's cut, as athenea's lod_tree_cut makes it: each node's
@@ -439,10 +634,12 @@ namespace GSplatAthc3
 		const FString TransferText = bTransfer
 			? FString::Printf(TEXT("of %u values%s%s"), TransferCount, bCpca ? TEXT(", CPCA") : TEXT(""), Splats.CellWords ? TEXT(", cells") : TEXT(""))
 			: TransferCount > 0 ? FString::Printf(TEXT("of %u values not drawn (zonal or another layout)"), TransferCount) : FString(TEXT("none"));
-		UE_LOG(LogGSplatImport, Display, TEXT("%s: %u gaussians in %u blocks%s, .athc version 3 (CORE encoding %u), %u rest coefficients a colour, %s colour, transfer %s; the levels not read."),
+		UE_LOG(LogGSplatImport, Display, TEXT("%s: %u gaussians in %u blocks%s, .athc version 3 (CORE encoding %u), %u rest coefficients a colour, %s colour, transfer %s%s."),
 			*Filename, Count, Used, TreeNodes > 0 ? *FString::Printf(TEXT(" (a paged tree of %u merges, cut each frame by r.Gaussians.Athenea.LodPixels)"), TreeNodes)
 				: Pages > 0 ? TEXT(" (error-band pages: the merges drawn at no opacity, the leaves alone seen)") : TEXT(""),
-			Encoding[0], RestPerColour, (Flags & kAthcLinear) ? TEXT("linear") : TEXT("sRGB"), *TransferText);
+			Encoding[0], RestPerColour, (Flags & kAthcLinear) ? TEXT("linear") : TEXT("sRGB"), *TransferText,
+			LevelBlocks > 0 ? *FString::Printf(TEXT("; %u levels of detail (%u merged groups), cut each frame by r.Gaussians.Athenea.LodPixels"), LevelBlocks, Groups)
+				: SkinIndex != INDEX_NONE && W32(H + 24) > 0 ? TEXT("; the levels not read (a skinned cloud is drawn from its splats)") : TEXT(""));
 		return true;
 	}
 
@@ -581,7 +778,9 @@ namespace GSplatAthc3
 		Data.Append(reinterpret_cast<const uint8*>(Desc), sizeof(Desc));
 		Data.Append(reinterpret_cast<const uint8*>(Blocks.GetData()), Blocks.Num() * sizeof(uint32));
 
-		ImportData.Swizzle = { EGSplatSwizzleAxis::X, EGSplatSwizzleAxis::Z, EGSplatSwizzleAxis::Y };
+		ImportData.Swizzle = ImportData.bFileZUp
+		? TArray<EGSplatSwizzleAxis>{ EGSplatSwizzleAxis::X, EGSplatSwizzleAxis::Yn, EGSplatSwizzleAxis::Z }
+		: TArray<EGSplatSwizzleAxis>{ EGSplatSwizzleAxis::X, EGSplatSwizzleAxis::Z, EGSplatSwizzleAxis::Y };
 		ImportData.ScaleFactor = 100.0f;
 		ImportData.bApplyGammaCorrection = (H.Flags & kAthcLinear) == 0;
 		ImportData.NumSplats = int32(Done);
@@ -611,6 +810,7 @@ namespace GSplatAthc3
 		Splats.TransferDirectCount = Direct;
 		Splats.CellWords = (ShadowWords == 8 || ShadowWords == 32) ? ShadowWords : 0u;
 		Splats.bPackedTransferField = Direct == 16 && TransferCount == 112;
+		Splats.bPackedEmission = Emission != 0;
 		const TArray<EGSplatSwizzleAxis>& Swizzle = ImportData.Swizzle;
 		Splats.FileAxisX = SwizzleVector(1.0f, 0.0f, 0.0f, Swizzle);
 		Splats.FileAxisY = SwizzleVector(0.0f, 1.0f, 0.0f, Swizzle);
@@ -687,7 +887,9 @@ bool GSplatImporter::ImportAthc(const FString& Filename, UGSplatImportData& Impo
 
 	// athenea's clouds are y up, right-handed and in metres; UE takes them as
 	// (x, z, y) in centimetres, the PLY importer's mapping for a y-up file.
-	ImportData.Swizzle = { EGSplatSwizzleAxis::X, EGSplatSwizzleAxis::Z, EGSplatSwizzleAxis::Y };
+	ImportData.Swizzle = ImportData.bFileZUp
+		? TArray<EGSplatSwizzleAxis>{ EGSplatSwizzleAxis::X, EGSplatSwizzleAxis::Yn, EGSplatSwizzleAxis::Z }
+		: TArray<EGSplatSwizzleAxis>{ EGSplatSwizzleAxis::X, EGSplatSwizzleAxis::Z, EGSplatSwizzleAxis::Y };
 	ImportData.ScaleFactor = 100.0f;
 	ImportData.bApplyGammaCorrection = (H.Flags & kAthcLinear) == 0;
 	ImportData.NumSplats = int32(H.Count);

@@ -1,7 +1,9 @@
 # Copyright (c) 2026 jesus luque.
 # Imports splat files and builds a level for each, /Game/F_<name>, with an
-# actor of it:   py setup_files.py file1 file2[@scale] ... [--quit]  (files in ~/athenea-unreal;
-# @scale scales the actor, for a file in units other than metres)
+# actor of it:   py setup_files.py file1 file2[@scale][!relit] ... [--quit]  (files in ~/athenea-unreal;
+# @scale scales the actor, for a file in units other than metres; !relit
+# imports a PLY with its normals and metallic/roughness, read or filled with
+# 0 and 1, for the relit route under UE's lights)
 import unreal, os, sys
 
 home = os.path.join(os.path.expanduser("~"), "athenea-unreal")
@@ -21,6 +23,7 @@ if not unreal.EditorAssetLibrary.does_asset_exist("/Game/Tx/studio"):
     tools.import_asset_tasks([sky_task])
 sky = unreal.load_asset("/Game/Tx/studio")
 for arg in [a for a in sys.argv[1:] if not a.startswith("--")]:
+    arg, relit = (arg[:-6], True) if arg.endswith("!relit") else (arg, False)
     f, _, scale = arg.partition("@")
     name = os.path.splitext(f)[0].replace("-", "_") + "_" + os.path.splitext(f)[1][1:]
     task = unreal.AssetImportTask()
@@ -31,6 +34,12 @@ for arg in [a for a in sys.argv[1:] if not a.startswith("--")]:
     task.replace_existing = True
     task.save = True
     task.factory = unreal.GSplatFactory()
+    if relit:
+        options = unreal.GSplatImportData()
+        options.set_editor_property("import_normals", True)
+        options.set_editor_property("import_metallic_roughness", True)
+        options.set_editor_property("populate_mr_with_default", True)
+        task.options = options
     tools.import_asset_tasks([task])
     # A scene's other clouds are assets the import made beside the one it
     # returns, and only that one is saved with it: the rest are saved here.

@@ -139,15 +139,21 @@ void GSplatCompositionPS(
 	, out float OutDepth : SV_Depth
 )
 {
-	const float4 BaseColor = GSplatBaseColor.Sample(View.SharedBilinearClampedSampler, InUV).rgba;
+	float4 BaseColor = GSplatBaseColor.Sample(View.SharedBilinearClampedSampler, InUV).rgba;
 	if (BaseColor.a < AlphaThreshold)
 	{
 		discard;
 	}
 
+	// athenea: each target holds its values premultiplied by every splat's
+	// alpha and their sum in alpha: divided by it, a pixel two splats half
+	// cover reads their mean, not half of it (upstream's defect).
+	const float4 DMR = GSplatDepthMetallicRoughness.Sample(View.SharedBilinearClampedSampler, InUV);
+	const float4 Moved = GSplatVelocity.Sample(View.SharedBilinearClampedSampler, InUV);
+	BaseColor.rgb /= max(BaseColor.a, 1.0e-6f);
 	const float3 WorldSpaceNormal = normalize(GSplatNormal.Sample(View.SharedBilinearClampedSampler, InUV).rgb);
-	const float3 DepthMetallicRoughness = GSplatDepthMetallicRoughness.Sample(View.SharedBilinearClampedSampler, InUV).rgb;
-	const float3 ScreenSpaceVelocity = GSplatVelocity.Sample(View.SharedBilinearClampedSampler, InUV).rgb;
+	const float3 DepthMetallicRoughness = DMR.rgb / max(DMR.a, 1.0e-6f);
+	const float3 ScreenSpaceVelocity = Moved.rgb / max(Moved.a, 1.0e-6f);
 
 	const float DeviceZ = DepthMetallicRoughness.r;
 	const float Metallic = DepthMetallicRoughness.g;

@@ -34,6 +34,7 @@
 
 #include "GaussianData.h"
 #include "Misc/Crc.h"
+#include "Math/Float16.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 
@@ -64,7 +65,7 @@ namespace GSplatAthz
 		return v;
 	}
 	constexpr uint32 kFlagTransfer = 1, kFlagLinear = 8, kFlagEmission = 32;
-	constexpr uint32 kLayerG = 1, kLayerA = 2, kLayerT = 4;
+	constexpr uint32 kLayerG = 1, kLayerA = 2, kLayerT = 4, kLayerK = 8;
 	constexpr uint32 kNone = 0xFFFFFFFFu;
 	constexpr uint32 kLevelWords = 40;
 	// The Athc3 descriptors (GSDecode.usf): section order and block size.
@@ -122,6 +123,9 @@ bool GSplatImporter::ImportAthzCloud(const FString& Filename, UGSplatImportData&
 	const uint32 PbrWords = R.Get<uint32>(), LobesWords = R.Get<uint32>(), TransferCount = R.Get<uint32>();
 	const uint32 TransferWords = R.Get<uint32>(), ShadowWords = R.Get<uint32>();
 	uint32 CurvatureWords = 0, CodedTransferWords = 0, InfluenceWords = 0, GradientWords = 0;
+	uint32 SkinJoints = 0, SkinFrames = 0;
+	TArray<uint8> Temporal;
+	uint64 TemporalOffset = 0, TemporalBytes = 0;
 	uint32 CpcaClusters = 0, CpcaComponents = 0;
 	float CpcaLevels = 0.0f;
 	uint64 BasisOffset = 0, BasisBytes = 0;
@@ -136,7 +140,14 @@ bool GSplatImporter::ImportAthzCloud(const FString& Filename, UGSplatImportData&
 	{
 		InfluenceWords = R.Get<uint32>();
 		GradientWords = R.Get<uint32>();
-		R.Get<uint32>(); R.Get<uint32>(); R.Get<uint64>(); R.Get<uint64>();   // layer K
+		// Layer K: the joints and frames, and where the frames' block lies.
+		SkinJoints = R.Get<uint32>(); SkinFrames = R.Get<uint32>();
+		TemporalOffset = R.Get<uint64>(); TemporalBytes = R.Get<uint64>();
+		// The frames' block, kept before the file's bytes go to the device.
+		if (SkinFrames > 0 && TemporalOffset + TemporalBytes <= uint64(File.Num()))
+		{
+			Temporal.Append(File.GetData() + TemporalOffset, int32(TemporalBytes));
+		}
 	}
 	float BoundsLo[3], Extent, BoundsMin[3], BoundsMax[3];
 	for (float& v : BoundsLo) v = R.Get<float>();
@@ -209,7 +220,9 @@ bool GSplatImporter::ImportAthzCloud(const FString& Filename, UGSplatImportData&
 	// or as CPCA codes; and which carry a rANS plane, by kind.
 	const bool bTransfer = (Flags & kFlagTransfer) != 0 && TransferWords > 0;
 	const bool bCurvature = CurvatureWords == 3;
-	const uint32 Layers = kLayerG | kLayerA | (bTransfer ? kLayerT : 0u);
+	// Layer K (a skinned cloud's influences) is read where it is there.
+	const bool bLayerK = InfluenceWords == 8 && SkinFrames > 0 && (LayerMask & kLayerK) != 0;
+	const uint32 Layers = kLayerG | kLayerA | (bTransfer ? kLayerT : 0u) | (bLayerK ? kLayerK : 0u);
 	uint32 HasRans[2] = { 0, 0 };
 	for (uint32 k = 0; k < 2; k++)
 	{
@@ -382,6 +395,16 @@ bool GSplatImporter::ImportAthzCloud(const FString& Filename, UGSplatImportData&
 	{
 		Bound &= ~(1u << 10);
 	}
+	// Layer K's influences and gradients, where the cloud is skinned
+	// (GSAthzSkinCS lifts the splats' into the skin's buffers).
+	const bool bSkin = bLayerK && SkinJoints > 0
+		&& uint64(Temporal.Num()) == TemporalBytes
+		&& TemporalBytes == 64 + uint64(SkinFrames) * 8 + uint64(SkinFrames) * SkinJoints * 24;
+	if (bSkin)
+	{
+		Bound |= 1u << 11;
+		Bound |= GradientWords == 3 ? 1u << 12 : 0u;
+	}
 	const uint32 Head[27] = { Tables, TableLog, Planes, Layers, HasRans[0], HasRans[1], 8 + SHWords,
 		SHWords, Normals, Emission, PbrWords, LobesWords, CodedTransfer, ShadowWords, CurvatureWords, InfluenceWords, GradientWords,
 		RunGaussians, PageRuns, FreqAt, PlanesAt, PageListAt, SourceAt, LevelsAt, uint32(Levels.Num()) + 1, 0u, Bound };
@@ -496,7 +519,9 @@ bool GSplatImporter::ImportAthzCloud(const FString& Filename, UGSplatImportData&
 		Bytes.Append(reinterpret_cast<const uint8*>(Rows.GetData()), Rows.Num() * 4);
 	}
 
-	ImportData.Swizzle = { EGSplatSwizzleAxis::X, EGSplatSwizzleAxis::Z, EGSplatSwizzleAxis::Y };
+	ImportData.Swizzle = ImportData.bFileZUp
+		? TArray<EGSplatSwizzleAxis>{ EGSplatSwizzleAxis::X, EGSplatSwizzleAxis::Yn, EGSplatSwizzleAxis::Z }
+		: TArray<EGSplatSwizzleAxis>{ EGSplatSwizzleAxis::X, EGSplatSwizzleAxis::Z, EGSplatSwizzleAxis::Y };
 	ImportData.ScaleFactor = 100.0f;
 	ImportData.bApplyGammaCorrection = (Flags & kFlagLinear) == 0;
 	ImportData.NumSplats = int32(Count);
@@ -515,7 +540,11 @@ bool GSplatImporter::ImportAthzCloud(const FString& Filename, UGSplatImportData&
 	const uint32 AthcFlags = (Normals ? 1u : 0u) | ((Flags & kFlagLinear) ? 2u : 0u) | (Emission ? 4u : 0u)
 		| (PbrWords > 0 ? 16u : 0u) | (bTransfer ? 32u : 0u);
 	Splats.PackedStreams = { TableAt, 1u + uint32(Levels.Num()), SHWords, Splats.bHasHighOrderSH ? RestPerColour : 0u,
-		uint32(Scratch), bTransfer ? TransferCount : 0u, AthcFlags, 0u, LodAt };
+		uint32(Scratch), bTransfer ? TransferCount : 0u, AthcFlags, 0u, LodAt,
+		// [9], [10]: the splats' influences and gradients in the scratch (layer K).
+		bSkin ? FieldBases.Last()[11] : 0u, bSkin && GradientWords == 3 ? FieldBases.Last()[12] : 0u,
+		// [11]: the splats, the first elements (the levels' groups after them).
+		Count };
 	Splats.PackedSpz = FIntVector(int32(HeadAt), int32(CpcaAt), bCpca && bTransfer ? 1 + Levels.Num() : 0);
 	// The levels' words are written on the device (GSAthzLodCS): the cut's
 	// octree is the file's, the finest level's groups after the coarser ones.
@@ -547,7 +576,9 @@ bool GSplatImporter::ImportAthzCloud(const FString& Filename, UGSplatImportData&
 		Splats.LodBoundsLo = FVector3f(BoundsLo[0], BoundsLo[1], BoundsLo[2]);
 		Splats.LodExtent = Extent;
 	}
-	const uint32 Direct = (TransferCount == 9 || TransferCount == 36 || TransferCount == 84) ? 9u
+	// A zonal transfer (10 values: two lobes in the gaussian's frame) is read
+	// as the .athc's is, records of nine with its ten values at the start.
+	const uint32 Direct = (TransferCount == 9 || TransferCount == 10 || TransferCount == 36 || TransferCount == 84) ? 9u
 		: (TransferCount == 16 || TransferCount == 64 || TransferCount == 112) ? 16u : 0u;
 	if (bTransfer && Direct > 0)
 	{
@@ -557,6 +588,53 @@ bool GSplatImporter::ImportAthzCloud(const FString& Filename, UGSplatImportData&
 		Splats.bPackedTransferField = Direct == 16 && TransferCount == 112;
 		Splats.FileUnitsToCm = 100.0f;
 		Splats.bPackedCurvature = bCurvature;
+		Splats.bPackedEmission = Emission != 0;
+		Splats.bTransferZonal = TransferCount == 10;
+	}
+	// LAYER K: A SKINNED CLOUD (athenea's readAthzSkinned). The splats'
+	// four (joint, weight) pairs and their gradients are decoded with them
+	// and lifted on the device; the frames' block -- the geometry's bind
+	// transform (a USD row matrix), each frame's time code, and every joint's
+	// matrix in the skinner's layout (column vectors, its three rows in
+	// halves) -- is read here into the rows the USD reader makes: C = X G,
+	// C[r][c] = sum_k X[r][k] G[c][k]. The file keeps time codes and no rate:
+	// they are taken at 30 a second (SkinRate scales it).
+	if (bSkin)
+	{
+		const uint8* K = Temporal.GetData();
+		float G[4][4];
+		FMemory::Memcpy(G, K, 64);
+		TArray<double> Codes;
+		Codes.SetNumUninitialized(int32(SkinFrames));
+		FMemory::Memcpy(Codes.GetData(), K + 64, uint64(SkinFrames) * 8);
+		const uint16* H = reinterpret_cast<const uint16*>(K + 64 + uint64(SkinFrames) * 8);
+		Splats.SkinJoints = SkinJoints;
+		Splats.SkinPerSplat = 4;
+		Splats.bSkinFromDecode = true;
+		for (uint32 f = 0; f < SkinFrames; f++)
+		{
+			Splats.SkinTimes.Add(float((Codes[int32(f)] - Codes[0]) / 30.0));
+			for (uint32 j = 0; j < SkinJoints; j++)
+			{
+				const uint16* M = H + (uint64(f) * SkinJoints + j) * 12;
+				for (int32 r = 0; r < 3; r++)
+				{
+					float X[4];
+					for (int32 c = 0; c < 4; c++)
+					{
+						FFloat16 Half;
+						Half.Encoded = M[r * 4 + c];
+						X[c] = float(Half);
+					}
+					float Row[4];
+					for (int32 c = 0; c < 4; c++)
+					{
+						Row[c] = X[0] * G[c][0] + X[1] * G[c][1] + X[2] * G[c][2] + X[3] * G[c][3];
+					}
+					Splats.SkinXforms.Add(FVector4f(Row[0], Row[1], Row[2], Row[3]));
+				}
+			}
+		}
 	}
 	const TArray<EGSplatSwizzleAxis>& Swizzle = ImportData.Swizzle;
 	Splats.FileAxisX = SwizzleVector(1.0f, 0.0f, 0.0f, Swizzle);
@@ -572,6 +650,11 @@ bool GSplatImporter::ImportAthzCloud(const FString& Filename, UGSplatImportData&
 		*Filename, Count, Version, Levels.Num(), Groups, LeafFirstPage + LeafPages,
 		bTransfer ? *FString::Printf(TEXT("of %u values%s"), TransferCount, bCpca ? *FString::Printf(TEXT(" as CPCA codes (%u clusters)"), CpcaClusters) : TEXT("")) : TEXT("none"),
 		bCurvature && bTransfer ? TEXT("read") : TEXT("none"));
+	if (bSkin)
+	{
+		UE_LOG(LogGSplatImport, Display, TEXT("%s: layer K, carried by %u joints, 4 influences a gaussian%s, %u poses over %.2f s (time codes at 30 a second); its merged levels are not drawn."),
+			*Filename, SkinJoints, GradientWords == 3 ? TEXT(" with their gradients") : TEXT(""), SkinFrames, Splats.SkinTimes.Last());
+	}
 	return true;
 }
 

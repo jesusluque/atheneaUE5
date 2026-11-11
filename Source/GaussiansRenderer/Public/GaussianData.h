@@ -8,6 +8,55 @@
 /**
  * Represents parsed data for a single splat, loaded from a regular PLY file.
  */
+// athenea: A SPLAT EDIT (athenea's AtheneaSplatEditAPI, common/edit.slang),
+// rule for rule: the filters wherever the volume is (opacity below
+// MinOpacity, longest scale above MaxScale: gone), then a box of half extents
+// Size or a sphere of radius Size.X around Centre, in the cloud's local space
+// (centimetres, as the component draws it): Keep drops what is outside,
+// Remove what is inside, Grade nothing; what is inside and kept has its
+// opacity times Opacity (gone below 1/255) and its colour, in linear light,
+// times Tint x Brightness, then lerped from its Rec.709 luminance by
+// Saturation.
+UENUM(BlueprintType)
+enum class EGSSplatEditMode : uint8
+{
+	Keep = 0,
+	Remove = 1,
+	Grade = 2,
+};
+
+USTRUCT(BlueprintType)
+struct GAUSSIANSRENDERER_API FGSSplatEdit
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Edit")
+	bool bActive = false;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Edit")
+	bool bSphere = false;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Edit")
+	EGSSplatEditMode Mode = EGSSplatEditMode::Grade;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Edit")
+	bool bInvert = false;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Edit")
+	FVector3f Centre = FVector3f::ZeroVector;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Edit")
+	FVector3f Size = FVector3f(100.0f, 100.0f, 100.0f);
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Edit")
+	FLinearColor Tint = FLinearColor::White;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Edit", meta = (ClampMin = "0"))
+	float Saturation = 1.0f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Edit", meta = (ClampMin = "0"))
+	float Brightness = 1.0f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Edit", meta = (ClampMin = "0"))
+	float Opacity = 1.0f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Edit", meta = (ClampMin = "0"))
+	float MinOpacity = 0.0f;
+	// Centimetres; 0 is off.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Edit", meta = (ClampMin = "0"))
+	float MaxScale = 0.0f;
+};
+
 USTRUCT()
 struct GAUSSIANSRENDERER_API FGaussianSplatData
 {
@@ -154,6 +203,19 @@ struct GAUSSIANSRENDERER_API FGaussianSplatData
 	TArray<float> Transfer;
 	UPROPERTY()
 	TArray<float> TransferMetallic;
+	// A zonal transfer (athenea's transferZonal): the direct half as two lobes
+	// in each gaussian's own frame, its ten values at the start of each record
+	// of TransferDirectCount 9 (GSColor.ush, GSZonalTransfer); no indirect half.
+	UPROPERTY(VisibleAnywhere, Category = "Gaussians")
+	bool bTransferZonal = false;
+	// A shadow catcher (primvars:athenea:splat:catcher): a TX patch on the
+	// ground drawn black, as opaque as the object's shadow (GSCatcherAlpha).
+	UPROPERTY(VisibleAnywhere, Category = "Gaussians")
+	bool bShadowCatcher = false;
+	// A light catcher (primvars:athenea:splat:lightCatcher): its lamps' layers
+	// alone, added over what is behind it, covering nothing.
+	UPROPERTY(VisibleAnywhere, Category = "Gaussians")
+	bool bLightCatcher = false;
 
 	// athenea: what a TX cloud's polish reflects with, GS_SURFACE_STRIDE floats a
 	// splat (the layout is GSColor.ush's): the shading normal in the file's
@@ -190,6 +252,96 @@ struct GAUSSIANSRENDERER_API FGaussianSplatData
 	TArray<float> TransferCurvature;
 	UPROPERTY()
 	bool bPackedCurvature = false;
+
+	// The light each gaussian gives off by itself (athenea's
+	// primvars:athenea:splat:emission, a .athc's or .athz's RGB9E5 word): 3
+	// linear floats a splat, which a TX cloud's lit body starts from (athenea's
+	// relitSplat). Empty where the cloud carries none, or where the device
+	// decodes it (bPackedEmission).
+	UPROPERTY()
+	TArray<float> Emission;
+	UPROPERTY()
+	bool bPackedEmission = false;
+
+	// athenea: THE LAMPS' LAYERS (primvars:athenea:splat:lightLayer:<group>,
+	// docs/decisions.md in athenea, light groups): for each group of lamps, the
+	// light each gaussian sends out from that group alone at a radiance of one.
+	// A frame adds each layer times its group's weight (the component's
+	// LightGroups), so a lamp switched or dimmed is a number. At most
+	// GS_MAX_LIGHT_LAYERS groups; LightLayerNames.Num() words a splat in
+	// LightLayers, RGB9E5 of the light times 2^14 (athenea's kLightLayerScale).
+	// LightLayerDefaults: each group's level as the stage leaves it
+	// (emissionLuminance x emissionColor where initially on, else 0).
+	UPROPERTY(VisibleAnywhere, Category = "Gaussians")
+	TArray<FString> LightLayerNames;
+	UPROPERTY(VisibleAnywhere, Category = "Gaussians")
+	TArray<FLinearColor> LightLayerDefaults;
+	UPROPERTY()
+	TArray<uint32> LightLayers;
+
+	// athenea: A CLOUD CARRIED BY A SKELETON (mesh2splat --skinned: a USD
+	// cloud's skel:jointIndices and skel:jointWeights, skel:geomBindTransform,
+	// primvars:athenea:splat:jointWeightGradients and the joints' transforms at
+	// each time code, primvars:athenea:splat:skinningXforms; a .athc's SKIN
+	// section and ATSK skeleton). SkinPerSplat influences a gaussian, a word
+	// each (joint | weight unorm16 << 16), the gradients' words after, and for
+	// each sampled instant (SkinTimes, seconds) SkinJoints x 3 rows of the
+	// joint's skinning transform after the bind transform, for column vectors
+	// (USD's row-vector matrices transposed). The bind pose is the cloud as
+	// decoded; GSSkin.usf poses it each frame into Positions, Scales and
+	// Orientations.
+	UPROPERTY(VisibleAnywhere, Category = "Gaussians")
+	uint32 SkinJoints = 0;
+	UPROPERTY()
+	uint32 SkinPerSplat = 0;
+	UPROPERTY()
+	TArray<uint32> SkinInfluences;
+	UPROPERTY()
+	TArray<uint32> SkinGradients;
+	// An .athz's layer K: the influences and gradients are decoded on the
+	// device with the splats (GSAthzSkinCS), not held here; the splats are
+	// the first SplatCount - groups elements, and the merged levels are not
+	// drawn while the cloud is skinned.
+	UPROPERTY()
+	bool bSkinFromDecode = false;
+	UPROPERTY(VisibleAnywhere, Category = "Gaussians")
+	TArray<float> SkinTimes;
+	UPROPERTY()
+	TArray<FVector4f> SkinXforms;
+
+	// Its parts' baked visibility (athenea visibility: primvars:athenea:splat:
+	// visibilityParts, 12 floats a part; visibilityTexels and visibilityAmbient,
+	// two halves a word; visibilityPartOf, a part a gaussian).
+	UPROPERTY()
+	TArray<float> VisibilityParts;
+	UPROPERTY()
+	TArray<uint32> VisibilityTexels;
+	UPROPERTY()
+	TArray<uint32> VisibilityAmbient;
+	UPROPERTY()
+	TArray<uint32> VisibilityPartOf;
+
+	bool IsSkinned() const { return SkinJoints > 0 && SkinTimes.Num() > 0 && SkinXforms.Num() == SkinTimes.Num() * int32(SkinJoints) * 3; }
+
+	// athenea: CRYPTOMATTE (primvars:athenea:splat:cryptoObject, one id a
+	// gaussian: the hash of the prim it came from; cryptoManifest names them).
+	UPROPERTY()
+	TArray<uint32> CryptoIds;
+
+	// athenea: a HARD SURFEL's p (primvars:athenea:splat:hardness, one a
+	// gaussian; 2 the gaussian): its disc drawn as exp(-(|u|^p + |v|^p) / 2) in
+	// its own axes, its stored scale the moment-matched one. Empty: all 2.
+	UPROPERTY()
+	TArray<float> Hardness;
+	UPROPERTY(VisibleAnywhere, Category = "Gaussians")
+	TArray<FString> CryptoNames;
+	UPROPERTY(VisibleAnywhere, Category = "Gaussians")
+	TArray<uint32> CryptoHashes;
+
+	// athenea: the edit the stage put over this cloud (AtheneaSplatEditAPI),
+	// in local centimetres; drawn unless the component's own edit is active.
+	UPROPERTY(VisibleAnywhere, Category = "Gaussians")
+	FGSSplatEdit Edit;
 	// Centimetres a unit of the file the cloud came from: what the curvature's
 	// units are taken from.
 	UPROPERTY()
@@ -253,6 +405,10 @@ struct GAUSSIANSRENDERER_API FGaussianSplatData
 	// Radiance of the absorbing part: the medium gives off (1 - albedo) times it.
 	UPROPERTY(EditAnywhere, Category = "Gaussians|Volume")
 	FVector3f VolumeEmission = FVector3f::ZeroVector;
+	// athenea: the medium's Henyey-Greenstein g (primvars:athenea:anisotropy):
+	// 0 scatters alike every way, toward 1 forward (a cloud's silver lining).
+	UPROPERTY(EditAnywhere, Category = "Gaussians|Volume", meta = (ClampMin = "-0.99", ClampMax = "0.99"))
+	float VolumeAnisotropy = 0.0f;
 	// A gaussian glows as a black body at its temperature times this (0: no fire).
 	UPROPERTY(EditAnywhere, Category = "Gaussians|Volume")
 	float VolumeEmissionScale = 0.0f;

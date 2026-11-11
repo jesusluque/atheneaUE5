@@ -338,7 +338,7 @@ float GSLobeOpen(uint SplatIndex, float3 m, float Roughness, float3 Axis)
 // transfer's constant term (an open plane's is C0).
 float GSOpenness(uint SplatIndex)
 {
-	return saturate(GSResources.Transfer[SplatIndex * 4u * GSResources.TransferDirectCount] / 0.28209479177387814f);
+	return saturate(GSDirectTransfer(SplatIndex, 0u) / 0.28209479177387814f);
 }
 
 // specularOpenness: Lagarde and de Rousiers' fit of a reflection's occlusion

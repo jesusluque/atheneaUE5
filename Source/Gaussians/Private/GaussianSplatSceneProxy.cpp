@@ -36,6 +36,54 @@ FGaussianSplatSceneProxy::FGaussianSplatSceneProxy(const UGaussianSplatComponent
 
 	bSupportsRuntimeVirtualTexture = true;
 	bIsStaticMesh = false;
+
+	// The component's edit where it is active, else the stage's.
+	const FGSSplatEdit* Edit = InComponent->Edit.bActive ? &InComponent->Edit
+		: InComponent->GaussianSplatAsset && InComponent->GaussianSplatAsset->Splats.Edit.bActive ? &InComponent->GaussianSplatAsset->Splats.Edit : nullptr;
+	if (Edit)
+	{
+		SplatEdit.Flags = FUintVector4(1u, Edit->bSphere ? 1u : 0u, uint32(Edit->Mode), Edit->bInvert ? 1u : 0u);
+		SplatEdit.Centre = FVector4f(Edit->Centre, Edit->Opacity);
+		SplatEdit.Size = FVector4f(Edit->Size, Edit->MinOpacity);
+		SplatEdit.Tint = FVector4f(Edit->Tint.R, Edit->Tint.G, Edit->Tint.B, Edit->Saturation);
+		SplatEdit.More = FVector4f(Edit->Brightness, Edit->MaxScale, 0.0f, 0.0f);
+	}
+
+	SkinSeconds = InComponent->SkinTime;
+	// athenea: the matte, by the prim path (or its last name) the manifest gives.
+	if (!InComponent->MatteIsolate.IsEmpty() && InComponent->GaussianSplatAsset)
+	{
+		const FGaussianSplatData& Splats = InComponent->GaussianSplatAsset->Splats;
+		for (int32 k = 0; k < Splats.CryptoNames.Num() && k < Splats.CryptoHashes.Num(); ++k)
+		{
+			if (Splats.CryptoNames[k] == InComponent->MatteIsolate || Splats.CryptoNames[k].EndsWith(TEXT("/") + InComponent->MatteIsolate))
+			{
+				MatteId = Splats.CryptoHashes[k];
+				break;
+			}
+		}
+	}
+	// athenea: a catcher is the shadow (or the light) on the ground, not a
+	// body: it casts nothing into UE's shadow maps.
+	if (InComponent->GaussianSplatAsset && (InComponent->GaussianSplatAsset->Splats.bShadowCatcher || InComponent->GaussianSplatAsset->Splats.bLightCatcher))
+	{
+		bCastDynamicShadow = false;
+		bCastStaticShadow = false;
+	}
+
+	const TArray<FVector4f> Weights = InComponent->GetLightWeights();
+	for (int32 k = 0; k < GSMaxLightLayers; ++k)
+	{
+		LightWeights[k] = k < Weights.Num() ? Weights[k] : FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+	}
+}
+
+void FGaussianSplatSceneProxy::SetLightWeights_RenderThread(const TArray<FVector4f>& Weights)
+{
+	for (int32 k = 0; k < GSMaxLightLayers; ++k)
+	{
+		LightWeights[k] = k < Weights.Num() ? Weights[k] : FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+	}
 }
 
 FGaussianSplatSceneProxy::~FGaussianSplatSceneProxy()

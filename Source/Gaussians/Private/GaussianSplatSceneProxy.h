@@ -59,6 +59,13 @@ public:
 	virtual bool SupportsRelighting() const override;
 
 	virtual inline float GetScaleMultiplier() const override { return ScaleMultiplier; }
+	virtual inline const FVector4f* GetLightWeights() const override { return LightWeights; }
+	virtual inline const FGSSplatEditParams& GetSplatEdit() const override { return SplatEdit; }
+	virtual inline float GetSkinSeconds() const override { return SkinSeconds; }
+	virtual inline uint32 GetMatteId() const override { return MatteId; }
+	void SetSkinSeconds_RenderThread(float Seconds) { SkinSeconds = Seconds; }
+	// athenea: the lamp groups' weights, set from the game thread by a render command.
+	void SetLightWeights_RenderThread(const TArray<FVector4f>& Weights);
 	virtual inline bool CastsSplatShadow() const override { return CastsDynamicShadow() || CastsStaticShadow(); }
 	virtual bool HasAnyClippingTags(const FGameplayTagContainer& Tags, bool bExactMatch) const override;
 	//~ End IGaussianSplatInterface
@@ -86,6 +93,10 @@ private:
 
 	// Per-instance properties
 	float ScaleMultiplier = 1.0f;
+	FVector4f LightWeights[GSMaxLightLayers];
+	FGSSplatEditParams SplatEdit;
+	float SkinSeconds = 0.0f;
+	uint32 MatteId = 0;
 
 	FGameplayTagContainer ClippingTags;
 	bool bClippingTagsExactMatchOnly = false;

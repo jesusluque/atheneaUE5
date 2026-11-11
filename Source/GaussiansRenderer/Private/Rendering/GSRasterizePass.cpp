@@ -38,6 +38,14 @@ static TAutoConsoleVariable<int32> CVarGaussiansMaxSplats(
 	ECVF_RenderThreadSafe
 );
 
+// athenea: a surfel (a gaussian with a scale of zero) drawn where each pixel's
+// ray meets its disc, as athenea's splat_blend does, in place of the thin
+// gaussian it projects to.
+static TAutoConsoleVariable<int32> CVarGaussiansAtheneaSurfels(
+	TEXT("r.Gaussians.Athenea.Surfels"), 1,
+	TEXT("Surfels drawn from each pixel's ray through their disc (1), or as the gaussians they project to (0)."),
+	ECVF_RenderThreadSafe);
+
 // athenea: what a TX cloud draws in place of its body, to check a stage of it:
 // 0 the body; 1 the sky's mean radiance as projected (SkySH[0] C0); 2-5 the
 // projected sky along the file's +y, -y, +z, -z; 6 which sharp-lobe inputs
@@ -51,6 +59,12 @@ static TAutoConsoleVariable<int32> CVarGaussiansAtheneaDebug(
 
 // athenea: r.Gaussians.Athenea.LogSky 1 reads a TX cloud's projected sky back
 // once and logs its 16 coefficients, then sets itself back to 0.
+static TAutoConsoleVariable<int32> CVarGaussiansAtheneaCryptoView(
+	TEXT("r.Gaussians.Athenea.CryptoView"),
+	0,
+	TEXT("1: each gaussian of a cloud with Cryptomatte ids drawn in its id's colour (the id's three low bytes), for an ID pass; 0: its light."),
+	ECVF_RenderThreadSafe);
+
 static TAutoConsoleVariable<int32> CVarGaussiansAtheneaResidual(
 	TEXT("r.Gaussians.Athenea.Residual"),
 	1,
@@ -67,7 +81,7 @@ static FLinearColor GAtheneaResidualColor = FLinearColor::Black;
 static TAutoConsoleVariable<int32> CVarGaussiansAtheneaLogSky(
 	TEXT("r.Gaussians.Athenea.LogSky"),
 	0,
-	TEXT("1: log the next TX cloud's projected sky (16 rgb coefficients and its sun), once."),
+	TEXT("1: log the next TX cloud's projected sky (16 rgb coefficients and its sun), or why there is none, once. 2: log what the sky lookup finds, each frame."),
 	ECVF_RenderThreadSafe
 );
 static TUniquePtr<FRHIGPUBufferReadback> GAtheneaSkyReadback;
@@ -100,6 +114,10 @@ static TAutoConsoleVariable<float> CVarGaussiansOpacityThreshold(
 
 class FPermutationEnableRelighting : SHADER_PERMUTATION_BOOL("ENABLE_RELIGHTING");
 using FSplattingPermutationDomain = TShaderPermutationDomain<FPermutationEnableRelighting>;
+// athenea: the surfel interpolant only where a cloud drawn holds surfels.
+class FPermutationSurfels : SHADER_PERMUTATION_BOOL("GS_SURFELS");
+using FSplattingDrawPermutationDomain = TShaderPermutationDomain<FPermutationEnableRelighting, FPermutationSurfels>;
+using FSplattingFrontPermutationDomain = TShaderPermutationDomain<FPermutationSurfels>;
 
 class FGSPrepassCS : public FGlobalShader
 {
@@ -119,6 +137,23 @@ class FGSPrepassCS : public FGlobalShader
 
 		SHADER_PARAMETER(float, SplatScaleMultiplier)
 		SHADER_PARAMETER(float, SplatOpacityThreshold)
+		// athenea: each lamp group's weight (rgb) this frame
+		SHADER_PARAMETER_ARRAY(FVector4f, LightWeights, [GS_MAX_LIGHT_LAYERS])
+		// athenea: the scene's local lights a TX cloud is lit by (GSLocalLights)
+		SHADER_PARAMETER(uint32, LocalLightCount)
+		SHADER_PARAMETER_ARRAY(FVector4f, LocalLightPosition, [GS_MAX_LOCAL_LIGHTS])
+		SHADER_PARAMETER_ARRAY(FVector4f, LocalLightColor, [GS_MAX_LOCAL_LIGHTS])
+		SHADER_PARAMETER_ARRAY(FVector4f, LocalLightDirection, [GS_MAX_LOCAL_LIGHTS])
+		SHADER_PARAMETER_ARRAY(FVector4f, LocalLightSpot, [GS_MAX_LOCAL_LIGHTS])
+		// athenea: Cryptomatte: the id drawn alone (0: all), and the id view
+		SHADER_PARAMETER(uint32, MatteId)
+		SHADER_PARAMETER(uint32, CryptoView)
+		// athenea: the splat edit (GSEditFate)
+		SHADER_PARAMETER(FUintVector4, EditFlags)
+		SHADER_PARAMETER(FVector4f, EditCentre)
+		SHADER_PARAMETER(FVector4f, EditSize)
+		SHADER_PARAMETER(FVector4f, EditTint)
+		SHADER_PARAMETER(FVector4f, EditMore)
 
 		// athenea: the sky on the transfer's harmonics, for a TX cloud
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, SkySH)
@@ -155,6 +190,8 @@ class FGSPrepassCS : public FGlobalShader
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint4>, OutSharpA)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint4>, OutSharpB)
 		SHADER_PARAMETER(uint32, SharpOut)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint4>, OutSurfel)
+		SHADER_PARAMETER(uint32, SurfelOut)
 
 		// Only used when relighting is enabled
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OutNormal)
@@ -296,7 +333,7 @@ class FSplattingPassVS : public FGlobalShader
 {
 	DECLARE_GLOBAL_SHADER(FSplattingPassVS)
 
-	using FPermutationDomain = FSplattingPermutationDomain;
+	using FPermutationDomain = FSplattingDrawPermutationDomain;
 
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
@@ -308,6 +345,8 @@ class FSplattingPassVS : public FGlobalShader
 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint4>, VS_SharpA)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint4>, VS_SharpB)
 		SHADER_PARAMETER(uint32, SharpIn)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint4>, VS_Surfel)
+		SHADER_PARAMETER(uint32, SurfelIn)
 
 		// Only used when relighting is enabled
 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, VS_Normal) // Octahedron encoding 16bpc
@@ -329,7 +368,7 @@ class FSplattingPassPS : public FGlobalShader
 {
 	DECLARE_GLOBAL_SHADER(FSplattingPassPS)
 
-	using FPermutationDomain = FSplattingPermutationDomain;
+	using FPermutationDomain = FSplattingDrawPermutationDomain;
 
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
@@ -367,6 +406,7 @@ static TAutoConsoleVariable<int32> CVarGaussiansAtheneaFrontToBack(
 class FSplattingFrontVS : public FGlobalShader
 {
 	DECLARE_GLOBAL_SHADER(FSplattingFrontVS)
+	using FPermutationDomain = FSplattingFrontPermutationDomain;
 
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_STRUCT_INCLUDE(FSplattingPassVS::FParameters, Base)
@@ -388,6 +428,7 @@ IMPLEMENT_GLOBAL_SHADER(FSplattingFrontVS, "/Plugin/StarLightGS/GSCompute.usf", 
 class FSplattingFrontPS : public FGlobalShader
 {
 	DECLARE_GLOBAL_SHADER(FSplattingFrontPS)
+	using FPermutationDomain = FSplattingFrontPermutationDomain;
 	using FParameters = FSplattingPassPS::FParameters;
 	SHADER_USE_PARAMETER_STRUCT(FSplattingFrontPS, FGlobalShader);
 
@@ -546,8 +587,6 @@ void FGSViewExtension::GaussianSplattingPass(
 	Permutation.Set<FPermutationEnableRelighting>(bRelighting);
 
 	TShaderMapRef<FGSPrepassCS> PrePassShader(ShaderMap, Permutation);
-	TShaderMapRef<FSplattingPassVS> VertexShader(ShaderMap, Permutation);
-	TShaderMapRef<FSplattingPassPS> PixelShader(ShaderMap, Permutation);
 
 	// athenea: unlit splats front to back, where asked and there is a depth
 	// buffer to copy (GSFront.usf).
@@ -559,6 +598,13 @@ void FGSViewExtension::GaussianSplattingPass(
 	// (a real-time capture's is not read yet).
 	FTexture* SkyTexture = nullptr;
 	FLinearColor SkyColor = FLinearColor::Black;
+	if (CVarGaussiansAtheneaLogSky.GetValueOnRenderThread() == 2)
+	{
+		const FScene* S = InView.Family && InView.Family->Scene ? InView.Family->Scene->GetRenderScene() : nullptr;
+		UE_LOG(LogTemp, Display, TEXT("athenea: sky lookup: family %d scene %d sky light %d real time %d processed %d"),
+			InView.Family != nullptr, S != nullptr, S && S->SkyLight, S && S->SkyLight && S->SkyLight->bRealTimeCaptureEnabled,
+			S && S->SkyLight && S->SkyLight->ProcessedTexture);
+	}
 	if (const FScene* Scene = InView.Family && InView.Family->Scene ? InView.Family->Scene->GetRenderScene() : nullptr)
 	{
 		if (Scene->SkyLight && !Scene->SkyLight->bRealTimeCaptureEnabled && Scene->SkyLight->ProcessedTexture
@@ -567,7 +613,45 @@ void FGSViewExtension::GaussianSplattingPass(
 			SkyTexture = Scene->SkyLight->ProcessedTexture;
 			SkyColor = Scene->SkyLight->GetEffectiveLightColor();
 		}
+		else if (CVarGaussiansAtheneaLogSky.GetValueOnRenderThread() == 1)
+		{
+			// Why a TX cloud has no sky to be lit by, once.
+			UE_LOG(LogTemp, Display, TEXT("athenea: no sky to light TX clouds: %s"),
+				!Scene->SkyLight ? TEXT("the scene has no sky light")
+				: Scene->SkyLight->bRealTimeCaptureEnabled ? TEXT("its sky light captures in real time, which is not read")
+				: TEXT("its sky light has no processed cubemap yet"));
+			CVarGaussiansAtheneaLogSky->Set(0, ECVF_SetByCode);
+		}
 	}
+	// athenea: THE LOCAL LIGHTS a TX cloud is lit by -- point, spot and rect,
+	// the nearest GS_MAX_LOCAL_LIGHTS to the view among those that reach it
+	// (a rect taken from its centre) -- each with UE's own attenuation, so a
+	// gaussian is lit as a mesh beside it is. The directional light is the
+	// sun the sky's projection carries.
+	struct FGSLocalLight { FVector4f Position, Color, Direction, Spot; double Distance; };
+	TArray<FGSLocalLight> LocalLights;
+	if (const FScene* Scene = InView.Family && InView.Family->Scene ? InView.Family->Scene->GetRenderScene() : nullptr)
+	{
+		const FVector Eye = InView.ViewMatrices.GetViewOrigin();
+		for (auto It = Scene->Lights.CreateConstIterator(); It; ++It)
+		{
+			const FLightSceneInfo* Info = It->LightSceneInfo;
+			const FLightSceneProxy* Light = Info ? Info->Proxy : nullptr;
+			if (!Light || Light->GetLightType() == LightType_Directional)
+			{
+				continue;
+			}
+			FLightRenderParameters L;
+			Light->GetLightShaderParameters(L);
+			const double Distance = FVector::Dist(L.WorldPosition, Eye);
+			const FVector3f At = FVector3f(L.WorldPosition + InView.ViewMatrices.GetPreViewTranslation());
+			LocalLights.Add({ FVector4f(At, L.InvRadius), FVector4f(L.Color.R, L.Color.G, L.Color.B, float(Light->GetLightType())),
+				FVector4f(L.Direction, L.FalloffExponent), FVector4f(L.SpotAngles.X, L.SpotAngles.Y, L.SourceRadius, 0.0f), Distance });
+		}
+		LocalLights.Sort([](const FGSLocalLight& A, const FGSLocalLight& B) { return A.Distance < B.Distance; });
+		LocalLights.SetNum(FMath::Min(LocalLights.Num(), GS_MAX_LOCAL_LIGHTS));
+	}
+
 	// athenea: the sharp lobes are kept where a TX cloud with curvature is
 	// drawn under a sky light and its residual (else one element each).
 	bool bSharp = false;
@@ -589,6 +673,27 @@ void FGSViewExtension::GaussianSplattingPass(
 		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(SharpABuffer, PF_R32G32B32A32_UINT), 0u);
 		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(SharpBBuffer, PF_R32G32B32A32_UINT), 0u);
 	}
+	// athenea: surfels drawn from each pixel's ray (r.Gaussians.Athenea.Surfels),
+	// a disc record a splat where a cloud holds any (else one element).
+	bool bSurfels = false;
+	if (CVarGaussiansAtheneaSurfels.GetValueOnRenderThread() != 0)
+	{
+		for (auto Proxy : Proxies)
+		{
+			const FGaussianSplatResource* Resource = Proxy->GetResource_RenderThread();
+			bSurfels |= Resource && Resource->HasSurfels();
+		}
+	}
+	FRDGBufferRef SurfelBuffer = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(FUintVector4), bSurfels ? uint32(Capacity) : 1u), TEXT("Gaussians.Surfel"));
+	if (!bSurfels)
+	{
+		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(SurfelBuffer, PF_R32G32B32A32_UINT), 0u);
+	}
+	FSplattingDrawPermutationDomain DrawPermutation;
+	DrawPermutation.Set<FPermutationEnableRelighting>(bRelighting);
+	DrawPermutation.Set<FPermutationSurfels>(bSurfels);
+	TShaderMapRef<FSplattingPassVS> VertexShader(ShaderMap, DrawPermutation);
+	TShaderMapRef<FSplattingPassPS> PixelShader(ShaderMap, DrawPermutation);
 	FRDGTextureRef FrameResidual = nullptr;
 
 	for (auto Proxy : Proxies)
@@ -812,6 +917,29 @@ void FGSViewExtension::GaussianSplattingPass(
 
 		PassParameters->SplatScaleMultiplier = Proxy->GetScaleMultiplier();
 		PassParameters->SplatOpacityThreshold = CVarGaussiansOpacityThreshold.GetValueOnRenderThread();
+		for (int32 k = 0; k < GS_MAX_LIGHT_LAYERS; ++k)
+		{
+			PassParameters->LightWeights[k] = Proxy->GetLightWeights()[k];
+		}
+		PassParameters->MatteId = Proxy->GetMatteId();
+		PassParameters->CryptoView = CVarGaussiansAtheneaCryptoView.GetValueOnRenderThread() != 0 ? 1u : 0u;
+		PassParameters->LocalLightCount = uint32(LocalLights.Num());
+		for (int32 k = 0; k < GS_MAX_LOCAL_LIGHTS; ++k)
+		{
+			const bool bOn = k < LocalLights.Num();
+			PassParameters->LocalLightPosition[k] = bOn ? LocalLights[k].Position : FVector4f(0, 0, 0, 0);
+			PassParameters->LocalLightColor[k] = bOn ? LocalLights[k].Color : FVector4f(0, 0, 0, 0);
+			PassParameters->LocalLightDirection[k] = bOn ? LocalLights[k].Direction : FVector4f(0, 0, 1, 0);
+			PassParameters->LocalLightSpot[k] = bOn ? LocalLights[k].Spot : FVector4f(-2, 1, 0, 0);
+		}
+		{
+			const FGSSplatEditParams& Edit = Proxy->GetSplatEdit();
+			PassParameters->EditFlags = Edit.Flags;
+			PassParameters->EditCentre = Edit.Centre;
+			PassParameters->EditSize = Edit.Size;
+			PassParameters->EditTint = Edit.Tint;
+			PassParameters->EditMore = Edit.More;
+		}
 
 		PassParameters->HZB = Gaussians::GetHZBParameters(GraphBuilder, ViewInfo, Gaussians::EHZBType::FurthestHZB);
 
@@ -838,6 +966,8 @@ void FGSViewExtension::GaussianSplattingPass(
 		PassParameters->OutSharpA = GraphBuilder.CreateUAV(SharpABuffer, PF_R32G32B32A32_UINT);
 		PassParameters->OutSharpB = GraphBuilder.CreateUAV(SharpBBuffer, PF_R32G32B32A32_UINT);
 		PassParameters->SharpOut = !bSharp ? 0u : (SkyResidual && Resource->HasCurvature()) ? 1u : 2u;
+		PassParameters->OutSurfel = GraphBuilder.CreateUAV(SurfelBuffer, PF_R32G32B32A32_UINT);
+		PassParameters->SurfelOut = bSurfels ? 1u : 0u;
 		PassParameters->OutGaussianIDX = GraphBuilder.CreateUAV(GaussianIndexBuffer, PF_R32_UINT);
 		PassParameters->OutDepth = GraphBuilder.CreateUAV(GaussianDepthBuffer, PF_R32_UINT);
 
@@ -908,6 +1038,8 @@ void FGSViewExtension::GaussianSplattingPass(
 		PassParameters->VertexShader.VS_SharpA = GraphBuilder.CreateSRV(SharpABuffer, PF_R32G32B32A32_UINT);
 		PassParameters->VertexShader.VS_SharpB = GraphBuilder.CreateSRV(SharpBBuffer, PF_R32G32B32A32_UINT);
 		PassParameters->VertexShader.SharpIn = (bSharp && FrameResidual) ? 1u : 0u;
+		PassParameters->VertexShader.VS_Surfel = GraphBuilder.CreateSRV(SurfelBuffer, PF_R32G32B32A32_UINT);
+		PassParameters->VertexShader.SurfelIn = bSurfels ? 1u : 0u;
 		PassParameters->VertexShader.VS_GaussianIDX = GraphBuilder.CreateSRV(GaussianIndexBuffer, PF_R32_UINT);
 		PassParameters->VertexShader.VS_Depth = GraphBuilder.CreateSRV(GaussianDepthBuffer, PF_R32_UINT);
 
@@ -954,8 +1086,10 @@ void FGSViewExtension::GaussianSplattingPass(
 				Batches->FrontBatchCount = uint32(FrontBatches);
 				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("GSFrontBatches"), TShaderMapRef<FGSFrontBatchesCS>(ShaderMap), Batches, FIntVector(1, 1, 1));
 			}
-			TShaderMapRef<FSplattingFrontVS> FrontVS(ShaderMap);
-			TShaderMapRef<FSplattingFrontPS> FrontPS(ShaderMap);
+			FSplattingFrontPermutationDomain FrontPermutation;
+			FrontPermutation.Set<FPermutationSurfels>(bSurfels);
+			TShaderMapRef<FSplattingFrontVS> FrontVS(ShaderMap, FrontPermutation);
+			TShaderMapRef<FSplattingFrontPS> FrontPS(ShaderMap, FrontPermutation);
 			for (int32 Batch = 0; Batch < FrontBatches; Batch++)
 			{
 				auto* P = GraphBuilder.AllocParameters<FSplattingFrontPipelineParameters>();

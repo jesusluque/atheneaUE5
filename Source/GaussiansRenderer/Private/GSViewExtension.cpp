@@ -2,6 +2,7 @@
 
 #include "GaussiansRenderer.h"
 #include "GaussianSplatInterface.h"
+#include "GaussianSplatResource.h"
 
 #include "Rendering/GSGPUStats.h"
 #include "Rendering/GSplatGBuffer.h"
@@ -74,6 +75,27 @@ void FGSViewExtension::BeginRenderViewFamily(FSceneViewFamily& InViewFamily)
 void FGSViewExtension::PreRenderViewFamily_RenderThread(FRDGBuilder& GraphBuilder, FSceneViewFamily& InViewFamily)
 {
 	GPUStats->ProcessBeginRender(GraphBuilder);
+
+	// athenea: skinned clouds posed before anything reads them (shadows, the
+	// cut, the prepass), once a family; the first directional light is the sun
+	// their parts' baked visibility is read toward.
+	FVector4f SunToLight(0, 0, 0, 0);
+	if (const FScene* Scene = InViewFamily.Scene ? InViewFamily.Scene->GetRenderScene() : nullptr)
+	{
+		if (Scene->DirectionalLights.Num() > 0 && Scene->DirectionalLights[0] && Scene->DirectionalLights[0]->Proxy)
+		{
+			const FVector ToLight = -Scene->DirectionalLights[0]->Proxy->GetDirection();
+			SunToLight = FVector4f(FVector3f(ToLight), 1.0f);
+		}
+	}
+	for (IGaussianSplatInterface* Proxy : RelightableProxies.Union(NonRelightableProxies))
+	{
+		FGaussianSplatResource* Resource = Proxy ? Proxy->GetResource_RenderThread() : nullptr;
+		if (Resource && Resource->IsSkinned())
+		{
+			Resource->Skin_RenderThread(GraphBuilder, Proxy->GetSkinSeconds(), Proxy->GetSplatLocalToWorld(), SunToLight);
+		}
+	}
 }
 
 void FGSViewExtension::PostRenderBasePassDeferred_RenderThread(FRDGBuilder& GraphBuilder, FSceneView& InView,

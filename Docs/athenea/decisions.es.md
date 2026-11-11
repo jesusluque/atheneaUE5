@@ -25,6 +25,7 @@ usar el plugin está en `operations.es.md`; cómo está organizado el código, e
 14. [Niveles de detalle](#14-niveles-de-detalle-9-nov)
 15. [Medios de gaussianas](#15-medios-de-gaussianas-9-nov)
 16. [Secuencias](#16-secuencias-9-nov)
+17. [El resto de las gaussianas de athenea](#17-el-resto-de-las-gaussianas-de-athenea-11-nov)
 
 ## 1. El fork y dónde se ejecuta
 
@@ -579,26 +580,25 @@ splats.
 ## 13. Lo que no está hecho
 
 - **Transferencia (TX), más allá del pulido opaco:** una pared fina medida
-  contra el fotograma de athenea, una pendiente a lo largo
-  de un splat para los lóbulos que no son nítidos (`slopeX`, `slopeY` de
-  athenea), el ensanchamiento de un pliegue (su `bakeSpread`), la curvatura de
-  un fichero v2, las luces analíticas, la transferencia zonal de las nubes con skinning, y una captura del cielo en
-  tiempo real.
+  contra el fotograma de athenea, el ensanchamiento de la capa clara en un
+  pliegue, la curvatura de un fichero v2, el cono de una luz sobre su tamaño
+  (§17), y una captura del cielo en tiempo real.
 - **Streaming de `.athc`.** El streaming de chunks (los niveles se cortan
-  cada frame, §14, pero todos los chunks están en el asset); las normales, la
-  emisión y los extras. En la versión 3 los niveles fusionados de tipo 0, el
-  codebook de oclusión, una transferencia zonal, el skin y el tier compacto.
+  cada frame, §14, pero todos los chunks están en el asset); las normales y
+  los extras. En la versión 3 el codebook de oclusión, los niveles de una
+  nube con esqueleto y el tier compacto (los niveles fusionados de tipo 0,
+  la transferencia zonal y el skin se leen, §17).
 - **Otros formatos.** `.athv` (vídeo HEVC), `.athl` (las capas de luz de la
   web), la capa K de un `.athz`; la extensión de sistema de coordenadas de un SPZ; la transformación de
   un nodo de glTF, más de una primitiva de gaussianas, los accessors sparse y
   `EXT_meshopt_compression`.
 - **La transformación del ParticleField** (una rotación tendría que girar los
   armónicos).
-- **Defectos de upstream restantes** de `DESIGN.es.md`: el desplazamiento del
-  ViewRect, el GBuffer iluminado sin normalizar por el alpha, el crash del
-  importador con un array de metallic/roughness vacío, los buffers
+- **Defectos de upstream restantes** de `DESIGN.es.md`: los buffers
   transitorios dimensionados a `MaxSplats`, los 64 workgroups y los 32 bits
-  del sort.
+  del sort. (El desplazamiento del ViewRect, la normalización del GBuffer
+  iluminado y el crash del importador con metallic/roughness están
+  corregidos, §17.)
 - **Almacenamiento f16** para las rutas PLY y USD, y su conversión en la GPU.
 - **Tests automáticos** del render: los de los importadores ya están
   (development §7); los fotogramas se siguen comparando a mano con athenea.
@@ -897,3 +897,192 @@ frame en 300 frames es de 33,3 ms de mediana, 34,6 ms de p99 y 35,1 ms como
 máximo: los cambios no dejan parones.
 No está hecho el streaming de una secuencia desde disco en vez de tenerla
 entera.
+
+## 17. El resto de las gaussianas de athenea (11 nov)
+
+**Una nube que lleva un esqueleto.** Donde el stage de athenea guarda las
+transformaciones de las articulaciones en cada time code (`skinningXforms`,
+escritas por `mesh2splat --skinned`), el asset las guarda también, tras la
+transformación de bind (C = X G, tres filas por articulación y pose): las 61
+poses del gorrión son unos cientos de kilobytes, y nada ata la nube a un
+Skeleton de UE, al que un ParticleField no puede enlazarse. La pose de bind se
+queda en el espacio del fichero y el pase escribe el del componente (la
+correspondencia de GSSplatData.ush para una nube empaquetada), así que el
+kernel es el de athenea línea por línea y su salida es lo que ya leen todos
+los pases. Corre una vez por familia de vistas, antes de las sombras; una pose
+ya dibujada no se vuelve a calcular. Entre dos muestras las filas se mezclan
+linealmente: con las 30 muestras por segundo que escribe la conversión, una
+articulación gira unos pocos grados entre ellas. La pose del asset la
+comparten los componentes que lo dibujan.
+
+**La transferencia zonal** se reconstruye para cada gaussiana a partir de la
+rotación que tiene cuando se lee su color -- en pose, en una nube con
+esqueleto -- en los nueve armónicos que leen los demás; no tiene mitad
+indirecta (athenea no la escribe para una nube con esqueleto), así que una
+nube zonal tampoco tiene campo ni celdas.
+
+**Visibilidad por partes.** La lectura es la de athenea: una parte no se
+sombrea a sí misma, y el campo de cada otra parte se lee donde estaría la
+gaussiana si esa parte no se hubiera movido, la inversa de la pose de su
+articulación, calculada en el procesador una vez por pose (doce inversas de
+3 x 4). Sus dos factores se guardan por gaussiana junto a la nube en pose,
+escritos por el pase de skinning hacia la primera luz direccional de la
+escena, así que no cuestan nada mientras la pose y el sol no cambian.
+
+**Lámparas.** Una capa se empaqueta al importar (RGB9E5 por 2^14, el
+`lightLayerPack` de athenea) para que el asset sea una palabra por grupo y
+gaussiana; los pesos de los grupos son dieciséis float4 por draw, fijados con
+un comando de render, así que atenuar una lámpara no vuelve a crear nada.
+
+**La edición y la emisión** son la aritmética de athenea en el prepass: los
+filtros y la caja de la edición sobre el splat tal como está guardado, y su
+gradación después de las lámparas.
+
+**Las luces locales** sobre una nube TX usan la atenuación de UE en vez de las
+luces de athenea, para que una gaussiana junto a una malla se ilumine como la
+malla; una rect se toma desde su centro, y la sombra de una luz son las
+celdas abiertas de la propia gaussiana en su dirección (una dirección,
+bilineal), no el cono de athenea sobre el tamaño de la luz.
+
+**Los shadow catchers** leen los armónicos del cielo en cada celda abierta, no
+el mapa prefiltrado que athenea lee para cada una: el horizonte bajo un cuerpo
+queda algo más suave. La sombra más tenue (opacidad por debajo de 1/255 en el
+centro de la gaussiana) se recorta como cualquier splat, donde athenea dibuja
+un catcher entero.
+
+**Defectos de upstream.** El `Mean` de un splat está en píxeles del render
+target, como `SV_Position`, así que una vista cuyo rect no empieza en la
+esquina lo dibuja donde va; el GBuffer de la ruta relit se lee dividido por su
+alpha acumulado (una media, no una suma); el importador PLY solo escribe
+metallic/roughness donde se dimensionó el array para ellos.
+
+**Pendientes y el ensanchamiento del horneado.** Donde una nube TX guarda su
+curvatura, un lóbulo demasiado rugoso para la ruta nítida (el pulido por
+encima de 0,5, la capa clara por encima de 0,2) cambia a lo largo del splat
+según el cielo leído en los espejos un píxel a la derecha y un píxel abajo,
+dos diferencias rgb que viajan en la carga de los lóbulos nítidos bajo una
+marca y que suma el pixel shader (el `SplatSlope` de athenea). Un lóbulo
+nítido lee el cielo con la rugosidad de antes de que el horneado la
+ensanchara por el giro de la superficie a lo largo de la gaussiana
+(`bakeSpread`, la mayor curvatura principal por el tamaño mayor;
+`unwidened`), ya que su espejo ya gira por píxel.
+
+**Cryptomatte** es el id de 32 bits por gaussiana de athenea: una vista de ID
+(sus tres bytes bajos como color) y un mate por componente; no hay salida
+Cryptomatte en EXR con varias capas (el pase de ID de Movie Render Queue es lo
+que se renderiza).
+
+Las **sombras translúcidas** son estocásticas: el vertex factory da al
+material de sombra la opacidad por su valor de recorte dividida por un número
+uniforme por píxel, así que un píxel pasa la máscara tantas veces como la
+gaussiana es opaca ahí, sin cambiar el material. Tras una variable de
+consola, porque entonces todas las gaussianas entran en los pases de
+profundidad de sombra (los millones de una captura donde antes solo las pocas
+opacas).
+
+Los **surfels** se dibujan desde el rayo de cada píxel, como los dibuja el
+`splat_blend` de athenea: el pase de proyección escribe los dos ejes anchos
+del disco como direcciones de píxel homogéneas divididas por la profundidad
+del centro (seis medios flotantes) y su p, así que el pixel shader solo
+necesita el centro que ya tiene. En un fixture de seis discos girados 0, 50 y
+75 grados, duros y no, el frame coincide con el de athenea: error medio
+0,008, 33,6 dB (sRGB de 8 bits; el peor píxel, 0,145, en el borde del disco
+de 75 grados). La muestra de un surfel por debajo de 1/255 se corta, como la
+corta el blend de athenea: su quad, ensanchado para la perspectiva del disco,
+llega más allá de donde acaba el de una gaussiana, y sin el corte se veían
+sus colas. La captura de la comprobación escribe un target sRGB sin curva de
+tono y a 0 EV; un target lineal de 8 bits hacía que todos los frames de UE
+parecieran más oscuros que los de athenea con la misma luz (el centro del
+disco 0,618 0,263 0,121 frente a 0,618 0,266 0,125). La p de un surfel duro se lee
+de USD; la de un `.athc`, que va en el logaritmo de su eje plano, aún no se
+decodifica.
+
+Los **niveles fusionados de un fichero versión 3** se leen como los de uno
+versión 2: tras los chunks, cortados a partir de dos palabras por gaussiana.
+Esas palabras se escriben en el dispositivo a partir de las colas de CORE
+(`GSAthc3LodCS`), porque CORE puede venir en planos de bytes o en deltas que
+la CPU no deshace; la fila de cada bloque lleva su nivel en la palabra que
+sigue a sus secciones. Lo comprueban `Athenea.Import.Athc3Levels` (un
+fichero de 9 niveles: las cuentas y el sitio del nivel más fino) y un cuerpo
+TX a `LodPixels` 0, 1 y 40, cuyas fusiones gruesas quedan donde están sus
+piezas. Un fichero con esqueleto sigue quedándose solo con sus splats.
+
+**Tests de frame.** `Athenea.Frame.Surfels` y `Athenea.Frame.SparrowSky`
+dibujan un fixture y lo comparan en el dispositivo con el frame de athenea
+(`GSCompare.usf`: un histograma de pasos de sRGB de 8 bits, con el alfa de la
+referencia enmascarando lo que athenea dibujó sobre un fondo que UE no
+tiene). Los surfels coinciden (media 3,5 pasos, p99 28). El gorrión TX bajo
+el cielo studio -- la sky light girada 180 grados, que es la cúpula de
+athenea puesta en pie -- coincide con media 10,4 pasos, p99 45; sobre el
+pájaro las medias lineales de UE son 0,95, 0,95 y 0,94 de las de athenea, y
+el albedo que decodifican los dos es el mismo al 2 %. Una primera referencia
+dibujada con la cúpula visible detrás del pájaro salía una quinta parte más
+clara: la cúpula se veía a través de la cobertura parcial de las plumas,
+donde el fondo de UE es negro; se dibuja con la cúpula iluminando y sin
+verse (`athenea:domeVisible` desactivado, mediante `--render-settings` y un
+prim de cámara). La normal de una gaussiana zonal es ahora su tercer eje
+posado, como la toma el transferFrame de athenea, y no la normal en reposo
+del fichero. athenea dibuja 81.785 de los 124.819 splats del fichero; UE,
+todos.
+
+**La capa K de un `.athz`** (el `readAthzSkinned` de athenea): la cuarta
+capa de sus páginas se decodifica con los splats -- cuatro pares (joint,
+peso) en floats y tres palabras de gradiente por splat -- y `GSAthzSkinCS`
+los pasa a los buffers del skin (joint | peso unorm16 << 16, los gradientes
+tal cual); el bloque de frames -- la transformación de bind de la geometría,
+el time code de cada frame y la matriz de cada joint en la disposición por
+columnas del skinner, tres filas en halves -- se convierte en las filas que
+hace el lector USD, C = X G. El fichero guarda time codes y no la cadencia:
+se toman a 30 por segundo. Los splats son los primeros elementos y los
+grupos fusionados no tienen influencias, así que el corte de una nube con
+esqueleto dibuja solo sus splats (umbral 0, sin adelgazar ni morph), como
+el de athenea: escribe ceros en las influencias de un grupo fusionado («nada
+los mueve»), y su respuesta para una nube que se mueve es un nivel de
+detalle discreto, la nube convertida otra vez a una celda más gruesa con su
+propio rig (`mesh2splat --lod-levels`), que esto aún no lee.
+Comprobado con el `.athz` del gorrión (1.504.096 splats, 609 joints, 61
+poses): la pose del vuelo a 0, 0,5, 1 y 1,5 s es la del gorrión USD.
+
+**Tiempos** (RTX 3070 Laptop, 1080p, `-game`, medianas de 300 frames,
+`Tools/athenea/ue_time.sh` sobre los niveles de `timing_level.py` en un
+proyecto de prueba; ejecuciones alternadas). Los surfels dibujados desde el
+rayo no cuestan nada medible: el cuerpo v3 de 421.911 splats con sus
+niveles, raster 0,460 / 0,460 ms activado frente a 0,470 / 0,474
+desactivado, el prepass 0,486 / 0,458 frente a 0,471 / 0,478. El `.athz` del
+gorrión reproduciéndose y quieto tarda 52 ms de GPU por frame en los dos
+casos (prepass 18,5, sort 8,7, raster 10,0): su pase de skin queda bajo el
+ruido, y el coste son sus 1.504.096 splats dibujados enteros -- una nube con
+esqueleto no tiene niveles -- y su transferencia zonal reconstruida cada
+frame. El vuelo del pueblo (TestProj, 1920 × 1080, frames 60 a 1400 de
+1500, medianas, cada ejecución empezada por debajo de 72 C, alternadas): la
+1.2 tardaba 12,71 ms de GPU por frame; la 1.3 tarda 14,00 (de 13,38 a 14,47
+en cinco ejecuciones), 12,35 con `r.Gaussians.Athenea.Surfels 0`. La
+diferencia son los niveles fusionados del pueblo dibujados como surfels: una
+nube empaquetada con niveles cuenta como que tiene surfels, ya que athenea
+escribe una fusión plana como uno, y el registro del disco le cuesta al
+prepass 0,6 ms escribirlo y al raster 0,5 ms llevarlo (un interpolante
+`uint4`). Los shaders de dibujo se compilan con ese interpolante solo donde
+una nube dibujada tiene surfels (`GS_SURFELS`), así que una nube sin
+ninguno no paga nada; surfels 0 cambia los bordes correctos de los discos
+fusionados por ese tiempo. La permutación no cambia los frames (surfels
+3,49 pasos, gorrión 10,44).
+
+El tier compacto (`CMPC`, el tier 4 de un fichero versión 3) es la ruta para
+teléfono del reproductor web -- 56 bytes por nodo, bases CPCA conjuntas y
+diccionarios de sombra, para que un teléfono dibuje una página reiluminada
+sin los tiers 1 a 3 -- y no se lee: en una GPU de escritorio el plugin tiene
+los tiers a los que sustituye.
+
+Ni `.athz` ni `.athc` guardan su eje vertical, y el gorrión de athenea se
+escribió desde un stage con z arriba: la opción de importación `bFileZUp`
+lleva un fichero así a (X, −Y, Z) en vez de al (X, Z, Y) de y arriba. Es
+solo el swizzle del importador -- el skin, los marcos zonales y el cielo se
+evalúan en el marco del fichero y se giran con sus ejes --, así que nada más
+cambia.
+
+Un `.athc` no lleva dureza: el escritor de athenea (`lod/Athc.cpp`) no
+guarda ninguna, así que un surfel duro solo llega al plugin por USD
+(`primvars:athenea:splat:hardness`, que se lee).
+
+No hecho aquí: el streaming por chunks y `.athv`.
+

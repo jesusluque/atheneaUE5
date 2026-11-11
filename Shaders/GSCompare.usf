@@ -1,0 +1,40 @@
+// Copyright (c) 2026 jesus luque.
+// athenea: TWO FRAMES COMPARED ON THE DEVICE, as athenea's tests compare a
+// frame with its reference (compareImages): a histogram of each pixel's
+// largest channel difference in 8-bit steps of the sRGB values a viewer sees
+// (256 bins), and their sum in the last word. The frame is an sRGB target
+// read as linear, encoded again; the reference is read as its bytes. A
+// reference pixel with an alpha under a half is left out (a mask: what
+// athenea drew over a background the other frame does not have).
+#include "/Engine/Private/Common.ush"
+
+Texture2D<float4> Frame;
+Texture2D<float4> Reference;
+uint2 Size;
+RWStructuredBuffer<uint> Histogram;
+
+float3 GSEncodeSrgb(float3 L)
+{
+	L = saturate(L);
+	return select(L <= 0.0031308f, L * 12.92f, 1.055f * pow(L, 1.0f / 2.4f) - 0.055f);
+}
+
+[numthreads(8, 8, 1)]
+void GSCompareCS(uint3 Id : SV_DispatchThreadID)
+{
+	if (any(Id.xy >= Size))
+	{
+		return;
+	}
+	const float4 R = Reference.Load(int3(Id.xy, 0));
+	if (R.a < 0.5f)
+	{
+		return;
+	}
+	const float3 A = GSEncodeSrgb(Frame.Load(int3(Id.xy, 0)).rgb);
+	const float3 B = R.rgb;
+	const float3 D = abs(A - B);
+	const uint Step = min(uint(max(max(D.x, D.y), D.z) * 255.0f + 0.5f), 255u);
+	InterlockedAdd(Histogram[Step], 1u);
+	InterlockedAdd(Histogram[256], Step);
+}

@@ -51,6 +51,11 @@ void UGaussianSplatComponent::PostEditChangeProperty(struct FPropertyChangedEven
 	bool bCullingDirty = false;
 
 	FName PropertyName = PropertyChangedEvent.GetPropertyName();
+	if (PropertyName == GET_MEMBER_NAME_CHECKED(UGaussianSplatComponent, LightGroups)
+		|| PropertyChangedEvent.MemberProperty && PropertyChangedEvent.MemberProperty->GetFName() == GET_MEMBER_NAME_CHECKED(UGaussianSplatComponent, LightGroups))
+	{
+		PushLightWeights();
+	}
 	if (PropertyName == GET_MEMBER_NAME_CHECKED(UGaussianSplatComponent, GaussianSplatAsset))
 	{
 		bCullingDirty = true;
@@ -67,6 +72,8 @@ void UGaussianSplatComponent::PostEditChangeProperty(struct FPropertyChangedEven
 	}
 
 	bCullingDirty |= PropertyName == GET_MEMBER_NAME_CHECKED(UGaussianSplatComponent, SplatScaleMultiplier);
+	bCullingDirty |= PropertyName == GET_MEMBER_NAME_CHECKED(UGaussianSplatComponent, MatteIsolate);
+	bCullingDirty |= PropertyChangedEvent.MemberProperty && PropertyChangedEvent.MemberProperty->GetFName() == GET_MEMBER_NAME_CHECKED(UGaussianSplatComponent, Edit);
 	bCullingDirty |= PropertyName == GET_MEMBER_NAME_CHECKED(UGaussianSplatComponent, ClippingTags);
 	bCullingDirty |= PropertyName == GET_MEMBER_NAME_CHECKED(UGaussianSplatComponent, bClippingTagsExactMatchOnly);
 
@@ -192,6 +199,81 @@ void UGaussianSplatComponent::SetGaussianSplatAsset(UGSplatAsset* Asset)
 	MarkRenderStateDirty();
 }
 
+TArray<FVector4f> UGaussianSplatComponent::GetLightWeights() const
+{
+	TArray<FVector4f> Weights;
+	if (!GaussianSplatAsset)
+	{
+		return Weights;
+	}
+	const FGaussianSplatData& Splats = GaussianSplatAsset->Splats;
+	for (int32 k = 0; k < Splats.LightLayerNames.Num() && k < GSMaxLightLayers; ++k)
+	{
+		FLinearColor W = Splats.LightLayerDefaults.IsValidIndex(k) ? Splats.LightLayerDefaults[k] : FLinearColor::Black;
+		for (const FGSLightGroup& Group : LightGroups)
+		{
+			// A group's emission layer (its indirect light) follows the group.
+			if (Group.Name == Splats.LightLayerNames[k] || TEXT("emission:") + Group.Name == Splats.LightLayerNames[k])
+			{
+				W = Group.bOn ? Group.Color * Group.Intensity : FLinearColor::Black;
+				break;
+			}
+		}
+		Weights.Add(FVector4f(W.R, W.G, W.B, 0.0f));
+	}
+	return Weights;
+}
+
+void UGaussianSplatComponent::PushLightWeights()
+{
+	if (FGaussianSplatSceneProxy* Proxy = static_cast<FGaussianSplatSceneProxy*>(SceneProxy))
+	{
+		ENQUEUE_RENDER_COMMAND(GSLightWeights)([Proxy, Weights = GetLightWeights()](FRHICommandListImmediate&)
+		{
+			Proxy->SetLightWeights_RenderThread(Weights);
+		});
+	}
+}
+
+void UGaussianSplatComponent::SetLightGroup(const FString& Name, FLinearColor Color, float Intensity, bool bOn)
+{
+	FGSLightGroup* Found = LightGroups.FindByPredicate([&](const FGSLightGroup& G) { return G.Name == Name; });
+	if (!Found)
+	{
+		Found = &LightGroups.AddDefaulted_GetRef();
+		Found->Name = Name;
+	}
+	Found->Color = Color;
+	Found->Intensity = FMath::Max(Intensity, 0.0f);
+	Found->bOn = bOn;
+	PushLightWeights();
+}
+
+void UGaussianSplatComponent::FillLightGroupsFromAsset()
+{
+	if (!GaussianSplatAsset)
+	{
+		return;
+	}
+	const FGaussianSplatData& Splats = GaussianSplatAsset->Splats;
+	LightGroups.Reset();
+	for (int32 k = 0; k < Splats.LightLayerNames.Num(); ++k)
+	{
+		if (Splats.LightLayerNames[k].StartsWith(TEXT("emission:")))
+		{
+			continue;
+		}
+		FGSLightGroup& Group = LightGroups.AddDefaulted_GetRef();
+		Group.Name = Splats.LightLayerNames[k];
+		const FLinearColor D = Splats.LightLayerDefaults.IsValidIndex(k) ? Splats.LightLayerDefaults[k] : FLinearColor::Black;
+		const float Level = FMath::Max3(D.R, D.G, D.B);
+		Group.bOn = Level > 0.0f;
+		Group.Intensity = Level > 0.0f ? Level : 1.0f;
+		Group.Color = Level > 0.0f ? FLinearColor(D.R / Level, D.G / Level, D.B / Level, 1.0f) : FLinearColor::White;
+	}
+	PushLightWeights();
+}
+
 void UGaussianSplatComponent::SetSequenceTime(float Seconds)
 {
 	SequenceTime = Seconds;
@@ -218,5 +300,22 @@ void UGaussianSplatComponent::TickComponent(float DeltaTime, ELevelTick TickType
 	if (SequenceFrames.Num() > 0)
 	{
 		SetSequenceTime(bSequencePlaying ? SequenceTime + DeltaTime : SequenceTime);
+	}
+	if (GaussianSplatAsset && GaussianSplatAsset->Splats.IsSkinned())
+	{
+		SetSkinTime(bSkinPlaying ? SkinTime + DeltaTime * SkinRate : SkinTime);
+	}
+}
+
+void UGaussianSplatComponent::SetSkinTime(float Seconds)
+{
+	const float Duration = GaussianSplatAsset && GaussianSplatAsset->Splats.SkinTimes.Num() > 0 ? GaussianSplatAsset->Splats.SkinTimes.Last() : 0.0f;
+	SkinTime = Duration > 0.0f ? (bSkinLoop ? FMath::Fmod(FMath::Fmod(Seconds, Duration) + Duration, Duration) : FMath::Clamp(Seconds, 0.0f, Duration)) : 0.0f;
+	if (FGaussianSplatSceneProxy* Proxy = static_cast<FGaussianSplatSceneProxy*>(SceneProxy))
+	{
+		ENQUEUE_RENDER_COMMAND(GSSkinTime)([Proxy, Seconds = SkinTime](FRHICommandListImmediate&)
+		{
+			Proxy->SetSkinSeconds_RenderThread(Seconds);
+		});
 	}
 }

@@ -76,7 +76,146 @@ float GSEnvBasis(uint k, float3 d)
 	}
 }
 
+// A ZONAL TRANSFER (athenea's transferZonal, splat_relight.slang's
+// splatTransferFrame): the direct half as two lobes in the gaussian's own
+// frame, ten values a splat at the start of its record -- each lobe the
+// octahedral square's (u, v) of its axis and its zonal coefficients for bands
+// 0 to 2. Turned each frame by the frame the gaussian has now (posed, for a
+// cloud a skeleton carries) into the nine harmonics every reader takes, in the
+// file's frame the sky is projected in. No indirect half.
+static float GSZonal[9];
+static bool GSZonalOn = false;
+// Its gaussian's third axis as it stands now, in the file's frame: the normal
+// every reader takes for a zonal transfer (athenea's thinAxisThird, its
+// transferFrame), where the file's normal is the rest pose's.
+static float3 GSZonalNormal = float3(0.0f, 0.0f, 1.0f);
+
+// Coefficient k of the direct transfer: stored, or rebuilt from the lobes.
+float GSDirectTransfer(uint SplatIndex, uint k)
+{
+	return GSZonalOn ? GSZonal[min(k, 8u)] : GSResources.Transfer[SplatIndex * 4u * GSResources.TransferDirectCount + k];
+}
+
 #include "GSPolish.ush"
+
+void GSZonalTransfer(uint SplatIndex)
+{
+	GSZonalOn = GSResources.TransferZonal != 0u;
+	if (!GSZonalOn)
+	{
+		return;
+	}
+	// The rotation back on the file's axes (GSSplatData.ush's mapping, undone).
+	const float4 L = GSRot(SplatIndex);
+	const float Handed = dot(cross(GSResources.FileAxisX, GSResources.FileAxisY), GSResources.FileAxisZ);
+	const float4 q = float4(dot(L.xyz, GSResources.FileAxisX), dot(L.xyz, GSResources.FileAxisY), dot(L.xyz, GSResources.FileAxisZ),
+		Handed > 0.0f ? -L.w : L.w);
+	const float x = q.x, y = q.y, z = q.z, w = q.w;
+	const float3x3 Frame = float3x3(1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w),
+	                                2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w),
+	                                2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y));
+	GSZonalNormal = normalize(float3(Frame[0][2], Frame[1][2], Frame[2][2]));
+	UNROLL
+	for (uint k = 0; k < 9u; ++k)
+	{
+		GSZonal[k] = 0.0f;
+	}
+	const uint Base = SplatIndex * 4u * GSResources.TransferDirectCount;
+	UNROLL
+	for (uint Lobe = 0; Lobe < 2u; ++Lobe)
+	{
+		const uint At = Base + Lobe * 5u;
+		const float3 Axis = normalize(mul(Frame, GSOctDecode(float2(GSResources.Transfer[At], GSResources.Transfer[At + 1u]))));
+		const float3 Zonal = float3(GSResources.Transfer[At + 2u], GSResources.Transfer[At + 3u], GSResources.Transfer[At + 4u]);
+		UNROLL
+		for (uint k = 0; k < 9u; ++k)
+		{
+			const float Band = k == 0u ? Zonal.x : (k < 4u ? Zonal.y : Zonal.z);
+			const float Scale = k == 0u ? 3.5449077018110318f : (k < 4u ? 2.0466534158929770f : 1.5853309190424043f);
+			GSZonal[k] += Band * Scale * GSEnvBasis(k, Axis);
+		}
+	}
+}
+
+// A SHADOW CATCHER (athenea mesh2splat --shadow-catcher; splat_project's
+// catcherOpacity): a TX patch on the ground drawn black, its opacity what the
+// object takes of the light reaching it -- the sky over the cells of its
+// open directions, the sun by the cells about it, each weighed by the
+// cosine -- through catcherAlphaFor, the opacity a lattice of such gaussians
+// needs to leave that share of what is behind it.
+float GSCatcherAlphaFor(float Ratio)
+{
+	const float Ln[8] = { -0.0513f, -0.2231f, -0.5108f, -0.9163f, -1.6094f, -2.3026f, -2.9957f, -3.9120f };
+	const float A[8] = { 0.00824f, 0.03558f, 0.08051f, 0.14203f, 0.24233f, 0.33663f, 0.42501f, 0.53292f };
+	const float l = log(max(Ratio, 1.0e-4f));
+	if (l >= Ln[0])
+	{
+		return A[0] * l / Ln[0];
+	}
+	for (uint k = 1; k < 8u; ++k)
+	{
+		if (l >= Ln[k])
+		{
+			return lerp(A[k - 1u], A[k], (l - Ln[k - 1u]) / (Ln[k] - Ln[k - 1u]));
+		}
+	}
+	return saturate(A[7] + (l - Ln[7]) * (A[7] - A[6]) / (Ln[7] - Ln[6]));
+}
+
+float GSCatcherAlpha(uint SplatIndex)
+{
+	if (GSResources.CellWords < 8u)
+	{
+		return 0.0f;
+	}
+	// The facing the bake measured from: the stored normal, in the file's frame.
+	const uint o = SplatIndex * GS_SURFACE_STRIDE;
+	float3 n = float3(GSResources.TransferSurface[o], GSResources.TransferSurface[o + 1u], GSResources.TransferSurface[o + 2u]);
+	n = dot(n, n) > 1.0e-8f ? normalize(n) : float3(0.0f, 0.0f, 1.0f);
+	const float3 Luma = float3(0.2126f, 0.7152f, 0.0722f);
+	float Sky[16];
+	UNROLL
+	for (uint k = 0; k < 16u; ++k)
+	{
+		Sky[k] = dot(SkySH[k].rgb, Luma);
+	}
+	const uint Side = GSCellSide();
+	float With = 0.0f;
+	float Without = 0.0f;
+	for (uint Cell = 0; Cell < Side * Side; ++Cell)
+	{
+		const float2 uv = (float2(float(Cell % Side), float(Cell / Side)) + 0.5f) / float(Side);
+		const float3 d = GSOctDecode(uv);
+		const float Cosine = dot(n, d);
+		if (!(Cosine > 0.0f))
+		{
+			continue;
+		}
+		float Radiance = 0.0f;
+		UNROLL
+		for (uint k = 0; k < 16u; ++k)
+		{
+			Radiance += Sky[k] * GSEnvBasis(k, d);
+		}
+		const float l1 = abs(d.x) + abs(d.y) + abs(d.z);
+		const float Worth = max(Radiance, 0.0f) * Cosine * (4.0f / float(Side * Side)) * l1 * l1 * l1;
+		Without += Worth;
+		With += GSCellBit(SplatIndex, Cell) ? Worth : 0.0f;
+	}
+	if (SkySH[16].w > 0.0f)
+	{
+		const float Sun = dot(SkySH[17].rgb, Luma) * max(dot(n, SkySH[16].xyz), 0.0f);
+		const float Open = GSCellsOpen(SplatIndex, SkySH[16].xyz, n);
+		With += Sun * (Open >= 0.0f ? Open : 1.0f);
+		Without += Sun;
+	}
+	if (!(Without > 0.0f))
+	{
+		return 0.0f;
+	}
+	return GSCatcherAlphaFor(saturate(With / max(Without, 1.0e-6f)));
+}
+
 
 // What of the sky reaches a TX gaussian, direct and bounced: <T_direct +
 // T_indirect, L> -- athenea's transferredBody (splat_relight.slang), the
@@ -89,10 +228,10 @@ float3 GSTransferredFront(uint SplatIndex)
 	for (uint k = 0; k < D; ++k)
 	{
 		const float3 L = SkySH[k].rgb;
-		const float3 Indirect = float3(GSResources.Transfer[Base + D + k * 3u],
+		const float3 Indirect = GSZonalOn ? 0.0f : float3(GSResources.Transfer[Base + D + k * 3u],
 		                               GSResources.Transfer[Base + D + k * 3u + 1u],
 		                               GSResources.Transfer[Base + D + k * 3u + 2u]);
-		Sum += L * (GSResources.Transfer[Base + k] + Indirect);
+		Sum += L * (GSDirectTransfer(SplatIndex, k) + Indirect);
 	}
 	return max(Sum, 0.0f);
 }
@@ -104,7 +243,7 @@ float3 GSIndirectAlong(uint SplatIndex, float3 d)
 	const uint D = GSResources.TransferDirectCount;
 	const uint Base = SplatIndex * 4u * D + D;
 	float3 Sum = 0;
-	for (uint k = 0; k < D; ++k)
+	for (uint k = 0; k < D && !GSZonalOn; ++k)
 	{
 		Sum += float3(GSResources.Transfer[Base + k * 3u], GSResources.Transfer[Base + k * 3u + 1u],
 		              GSResources.Transfer[Base + k * 3u + 2u]) * GSEnvBasis(k, d);
@@ -158,10 +297,30 @@ static bool GSSharpOn = false;
 static float3 GSSharpTurnX = 0;
 static float3 GSSharpTurnY = 0;
 static float GSSharpTurn2 = 0;
+// HOW FAR THE BAKE WIDENED THE ROUGHNESS (athenea's bakeSpread, mesh2splat's
+// Toksvig): the largest principal curvature times the wider size. A sharp lobe
+// reads the sky at the roughness before it (GSUnwidened), since the mirror
+// already turns across the splat.
+static float GSBakeSpread = 0;
 static uint4 GSSharpA = 0;
 static uint4 GSSharpB = 0;
 
 uint GSPackHalves(float a, float b) { return (f32tof16(a) & 0xFFFFu) | (f32tof16(b) << 16); }
+
+float GSUnwidened(float Roughness, float Spread)
+{
+	if (!(Spread > 0.0f))
+	{
+		return Roughness;
+	}
+	const float Alpha = Roughness * Roughness;
+	return sqrt(sqrt(max(Alpha * Alpha - 2.0f * Spread * Spread, 0.0f)));
+}
+
+// A SLOPE (athenea's SplatSlope, slopeX and slopeY), marked in the payload's
+// last word: a lobe too rough to draw per pixel changes across the splat by
+// the sky read along the mirrors a pixel right and a pixel down.
+#define GS_SLOPE_MARK 0xFFFFFFFFu
 
 // GSOctEncode, GSOctDecode: GSPolish.ush (athenea's common/octahedral.slang).
 
@@ -284,9 +443,10 @@ float GSMeanCurvature(uint SplatIndex, bool BackFacing)
 // separates from a sky, glass and thin walls.
 float3 GSTransferredRadiance(uint SplatIndex, float3 Albedo, float3 d)
 {
+	GSZonalTransfer(SplatIndex);
 	FGSSurface s = GSReadSurface(SplatIndex, Albedo);
 	const float3 wo = -d;
-	float3 n = normalize(s.Normal);
+	float3 n = GSZonalOn ? GSZonalNormal : normalize(s.Normal);
 	const bool BackFacing = dot(n, wo) < 0.0f;
 	n = BackFacing ? -n : n;
 	const float NdotV = max(dot(n, wo), 1.0e-4f);
@@ -295,7 +455,10 @@ float3 GSTransferredRadiance(uint SplatIndex, float3 Albedo, float3 d)
 	// transferViewless: the sky's harmonics, then the sun athenea separates
 	// from the sky -- its cosine shadowed by the cells along it, and its
 	// bounce read from the indirect transfer along it.
-	float3 Front = GSTransferredFront(SplatIndex);
+	// The other parts' shadow (a skinned cloud's baked visibility): the sky
+	// by its probes' mean, the sun by its direction.
+	const float2 Seen = GSResources.HasVisibility != 0u ? GSResources.Visibility[SplatIndex] : float2(1.0f, 1.0f);
+	float3 Front = GSTransferredFront(SplatIndex) * Seen.y;
 	const bool HasSun = SkySH[16].w > 0.0f;
 	const float3 SunDirection = SkySH[16].xyz;
 	const float3 Irradiance = SkySH[17].rgb;
@@ -305,6 +468,7 @@ float3 GSTransferredRadiance(uint SplatIndex, float3 Albedo, float3 d)
 		const float Open = GSCellsOpen(SplatIndex, SunDirection, n);
 		SunShare = Open >= 0.0f ? Open : 1.0f;
 	}
+	SunShare *= Seen.x;
 	if (HasSun)
 	{
 		Front += Irradiance * (max(dot(n, SunDirection), 0.0f) * SunShare / PI);
@@ -434,7 +598,7 @@ float3 GSTransferredRadiance(uint SplatIndex, float3 Albedo, float3 d)
 					Radiance -= CoatSunW * Irradiance * GSSunReflectPdf(Mirror, SunDirection, s.CoatRoughness, SkySH[16].w);
 				}
 				// The pixel's own spread: the normal turns across it.
-				const float a = s.CoatRoughness * s.CoatRoughness;
+				const float a = GSUnwidened(s.CoatRoughness, GSBakeSpread) * GSUnwidened(s.CoatRoughness, GSBakeSpread);
 				CoatR = sqrt(sqrt(min(a * a + GSSharpTurn2 / 6.0f, 1.0f)));
 			}
 			if (SharpPolish)
@@ -447,7 +611,7 @@ float3 GSTransferredRadiance(uint SplatIndex, float3 Albedo, float3 d)
 					PolishSunW = Brdf * SunShare;
 					Radiance -= PolishSunW * Irradiance * GSSunReflectPdf(Mirror, SunDirection, s.Roughness, SkySH[16].w);
 				}
-				const float a = s.Roughness * s.Roughness;
+				const float a = GSUnwidened(s.Roughness, GSBakeSpread) * GSUnwidened(s.Roughness, GSBakeSpread);
 				PolishR = sqrt(sqrt(min(a * a + GSSharpTurn2 / 6.0f, 1.0f)));
 			}
 			const float2 At = GSOctEncode(GSFileToWorld(Mirror));
@@ -460,6 +624,31 @@ float3 GSTransferredRadiance(uint SplatIndex, float3 Albedo, float3 d)
 				GSPackHalves(CoatW, CoatR));
 			GSSharpB = uint4(GSPackHalves(PolishW.x, PolishW.y), GSPackHalves(PolishW.z, PolishR),
 				GSPackHalves(PolishSunW.x, PolishSunW.y), GSPackHalves(PolishSunW.z, CoatSunW));
+		}
+		else
+		{
+			// The slopes: the polish (and the coat) read a pixel away.
+			const float Side = dot(n, s.Normal) >= 0.0f ? 1.0f : -1.0f;
+			const float3 MirrorX = reflect(d, normalize(n + Side * GSSharpTurnX));
+			const float3 MirrorY = reflect(d, normalize(n + Side * GSSharpTurnY));
+			const float3 PolishW = Gain * Layers.Under * GSEnvironmentBrdf(s, NdotV) * Narrowed;
+			const float3 Seen = GSSkyRadiance(Mirror, s.Roughness);
+			float3 SlopeX = PolishW * (GSSkyRadiance(MirrorX, s.Roughness) - Seen);
+			float3 SlopeY = PolishW * (GSSkyRadiance(MirrorY, s.Roughness) - Seen);
+			if (s.CoatWeight > 0.0f)
+			{
+				const float CoatOpen = Cells ? GSLobeOpen(SplatIndex, Mirror, s.CoatRoughness, n)
+				                             : GSSpecularOpenness(NdotV, Openness, s.CoatRoughness);
+				const float3 CoatW = Layers.Coat * CoatOpen;
+				const float3 CoatSeen = GSSkyRadiance(Mirror, s.CoatRoughness);
+				SlopeX += CoatW * (GSSkyRadiance(MirrorX, s.CoatRoughness) - CoatSeen);
+				SlopeY += CoatW * (GSSkyRadiance(MirrorY, s.CoatRoughness) - CoatSeen);
+			}
+			if (any(SlopeX != 0.0f) || any(SlopeY != 0.0f))
+			{
+				GSSharpA = uint4(GSPackHalves(SlopeX.x, SlopeX.y), GSPackHalves(SlopeX.z, SlopeY.x), GSPackHalves(SlopeY.y, SlopeY.z), 0u);
+				GSSharpB = uint4(0u, 0u, 0u, GS_SLOPE_MARK);
+			}
 		}
 	}
 	return Radiance;
@@ -548,9 +737,19 @@ float4 GSSplatColor(uint SplatIndex, float3 LocalView, bool bViewDependent)
 			}
 			return float4(L, ColorOpacity.a);
 		}
+		if (GSResources.Catcher != 0u)
+		{
+			// Black, as opaque as the object's shadow there.
+			return float4(0.0f, 0.0f, 0.0f, ColorOpacity.a * GSCatcherAlpha(SplatIndex));
+		}
 		const float3 v = normalize(LocalView);
 		const float3 d = float3(dot(v, GSResources.FileAxisX), dot(v, GSResources.FileAxisY), dot(v, GSResources.FileAxisZ));
-		return float4(GSTransferredRadiance(SplatIndex, Albedo, d), ColorOpacity.a);
+		// athenea's relitSplat: the lit body starts from what the splat gives
+		// off by itself.
+		const float3 Glow = GSResources.HasEmission != 0u
+			? float3(GSResources.Emission[SplatIndex * 3u], GSResources.Emission[SplatIndex * 3u + 1u], GSResources.Emission[SplatIndex * 3u + 2u])
+			: 0.0f;
+		return float4(GSTransferredRadiance(SplatIndex, Albedo, d) + Glow, ColorOpacity.a);
 	}
 
 	if (bViewDependent && (GSResources.ColorFlags & GS_COLOR_HIGH_ORDER_SH) != 0)

@@ -250,6 +250,32 @@ saltándose el que no esté:
 UnrealEditor-Cmd.exe <proyecto> -nullrhi -unattended -ExecCmds="Automation RunTests Athenea; Quit"
 ```
 
+Los tests de frame (`Athenea.Frame.*`) dibujan un fixture y comparan el frame
+con el de athenea del mismo fichero y cámara, en el dispositivo
+(`GSCompare.usf`, `Gaussians::CompareFrames`): un histograma de la mayor
+diferencia de canal de cada píxel en pasos de sRGB de 8 bits, leído de vuelta
+como 257 palabras, da la media, el p99, el máximo y la fracción por encima de
+2, como hace `compareImages` en athenea. La captura es el fixture solo (una
+lista show-only, sin atmósfera ni niebla) en un target sRGB sin curva de tono
+y a 0 EV, capturando durante 120 frames, porque un editor sin viewport solo
+dibuja una escena cuando se captura. `Athenea.Frame.Surfels` toma
+`surfels.usda` y el `surfels_athenea.png` de athenea de la carpeta de los
+ficheros de prueba; sus límites son la medida del 11 nov en una RTX 3070
+(media 3,49, p99 28, máximo 37 pasos) con margen para un driver.
+`Athenea.Frame.SparrowSky` toma `sparrow160tx.usdc` a 0,5 s bajo el cubemap
+`/Game/Tx/studio` del proyecto, girado 180 grados, y el
+`sparrow_sky_athenea.png` de athenea (dibujado con `--render-settings`, un
+prim de cámara y `athenea:domeVisible` desactivado, para que la cúpula
+ilumine el pájaro y no se vea a través de él), cuyo alfa (la cobertura del
+pájaro, erosionada 3 píxeles) deja fuera el resto; la comparación salta un
+píxel de referencia con alfa por debajo de la mitad. Sus límites: media 13,
+p99 56 (medidos 10,4 y 45). Necesitan
+GPU, así que se ejecutan sin `-nullrhi` y se saltan solos con él:
+
+```
+UnrealEditor-Cmd.exe <proyecto> -RenderOffscreen -unattended -ExecCmds="Automation RunTests Athenea.Frame; Quit"
+```
+
 Más allá de ellos, un cambio se comprueba en una máquina Windows contra
 athenea:
 
@@ -295,7 +321,9 @@ los ficheros de prueba en `~/athenea-unreal/`, y escriben las capturas en
 | `shot_dbg.py` | `-ExecCmds="py shot_dbg.py 100 101 ..."` | capturas con `r.Gaussians.Athenea.Debug` en cada valor |
 | `setup_files.py` | `-ExecCmds="py setup_files.py a.spz b.glb@100 --quit"` | importa cada fichero (de `athenea-unreal` en la carpeta personal) con la factory del plugin en `/Game/Files` y guarda un nivel `/Game/F_<nombre>_<ext>` con un actor de él; `@k` escala el actor, para un fichero en unidades distintas de metros |
 | `shot_framed.py` | `-ExecCmds="py shot_framed.py +y x3 /Game/F_a /Game/F_b"` | una captura de cada nivel, encuadrada sobre los bounds de sus splats desde un lado (`±x`, `±y`), `x<k>` k veces más lejos, en `shots/framed_<nivel><lado>.png` |
-| `ue_time.sh` | `ue_time.sh /Game/Nivel salida.csv ["cvar valor,..."]`, desde una máquina con `ssh` a la Windows | mide un nivel en `-game` con el CSV profiler (límite de 30 fps), con las variables de consola fijadas antes, e imprime las medianas de las etapas de splats |
+| `ue_time.sh` | `ue_time.sh /Game/Nivel salida.csv ["cvar valor,..."]`, desde una máquina con `ssh` a la Windows | mide un nivel en `-game` con el CSV profiler (límite de 30 fps), con las variables de consola fijadas antes, e imprime las medianas de las etapas de splats; solo detiene su propia ejecución `-game` (`stop_game.ps1`, copiado junto al proyecto de prueba), nunca un editor abierto |
+| `timing_level.py` | `py timing_level.py /Game/F_nombre nombre [still]` en el editor | un nivel de comprobación encuadrado por una cámara por la que mira el jugador, guardado como `/Game/T_nombre` para `ue_time.sh`; `still` deja una nube con esqueleto en su primera pose |
+| `stop_game.ps1` | `stop_game.ps1 PROYECTO [-DryRun]` en la máquina Windows | detiene las ejecuciones `-game` de un proyecto, y nada más |
 | `setup_scene.py` | `-ExecCmds="py setup_scene.py /Game/Nivel sky.hdr 100 0:0.05:0.18 0:0.05:0 39.6 a.athc b.athc --quit"` | varias nubes y el sky light de un HDRI en un nivel, una cámara desde el frame de los ficheros (`x:y:z`, porque `-ExecCmds` separa por comas), cada actor y la cámara escalados (una escena mucho menor que el plano cercano de UE) |
 | `tx_regions.py` | `python3 tx_regions.py ue.exr athenea.exr [exposure]` | la bola del frame de prueba TX, sus mitades y el suelo, UE (sobre el factor de exposición de la captura, 2,02) frente al frame de athenea: medias, cociente y error relativo absoluto medio |
 | `TestProj.uproject`, `DefaultEngine.ini`, `DefaultEditorPerProjectUserSettings.ini` | -- | el proyecto de prueba: solo SM6, sin auto-exposure, bloom, motion blur ni AA temporal; los ajustes del servidor MCP (operations §8) |

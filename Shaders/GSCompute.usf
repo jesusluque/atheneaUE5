@@ -13,6 +13,24 @@
 #include "GSSplatData.ush"
 #include "GSColor.ush"
 
+// athenea's packing.slang: a HARD SURFEL's p. ln Gamma(x) for x in (0, 3]
+// (Stirling's series at x + 3, brought back by the recurrence), and the
+// variance of exp(-|x|^p / 2) along one axis, a unit gaussian's being 1:
+// 2^(2/p) Gamma(3/p) / Gamma(1/p).
+float GSLnGamma(float X)
+{
+	const float Z = X + 3.0f;
+	const float IZ = 1.0f / Z;
+	const float IZ2 = IZ * IZ;
+	const float S = (Z - 0.5f) * log(Z) - Z + 0.91893853f + IZ * (1.0f / 12.0f - IZ2 * (1.0f / 360.0f - IZ2 / 1260.0f));
+	return S - log(X * (X + 1.0f) * (X + 2.0f));
+}
+
+float GSHardnessVariance(float P)
+{
+	return exp(2.0f / P * 0.69314718f + GSLnGamma(3.0f / P) - GSLnGamma(1.0f / P));
+}
+
 #ifndef ENABLE_RELIGHTING
 #define ENABLE_RELIGHTING true
 #endif
@@ -93,6 +111,11 @@ RWBuffer<float4> OutColorOpacity;
 // athenea: a TX splat's sharp lobes, for the raster to read per pixel (GSColor.ush).
 RWBuffer<uint4> OutSharpA;
 RWBuffer<uint4> OutSharpB;
+// athenea: a SURFEL's disc for the pixel shader's ray-plane intersection (its
+// two wide axes as homogeneous screen directions over the centre's depth,
+// halves, and its hardness p; .w 0 for a gaussian drawn as one).
+RWBuffer<uint4> OutSurfel;
+uint SurfelOut;
 uint SharpOut;    // 0: the frame keeps none; 1: this cloud's are made; 2: written as none
 
 #if ENABLE_RELIGHTING
@@ -113,6 +136,163 @@ uint MipPay;
 
 float SplatScaleMultiplier;
 float SplatOpacityThreshold;
+// athenea: each lamp group's weight (rgb) this frame, in the asset's order.
+float4 LightWeights[GS_MAX_LIGHT_LAYERS];
+
+// athenea: THE LOCAL LIGHTS a TX cloud is lit by (athenea's relitByOne, a
+// light at a time beside the sky): point, spot and rect, in translated world
+// centimetres, with UE's own attenuation (inverse square windowed by the
+// radius, or the falloff exponent; the spot's cone), each shadowed by the
+// gaussian's open directions along it where the cloud keeps them.
+//   Position: xyz, 1 / radius; Color: rgb, the light's type (1 point, 2 spot,
+//   3 rect); Direction: xyz (where a spot or rect faces), falloff exponent
+//   (0: inverse square); Spot: cos outer, 1 / (cos inner - cos outer), source
+//   radius.
+uint LocalLightCount;
+float4 LocalLightPosition[GS_MAX_LOCAL_LIGHTS];
+float4 LocalLightColor[GS_MAX_LOCAL_LIGHTS];
+float4 LocalLightDirection[GS_MAX_LOCAL_LIGHTS];
+float4 LocalLightSpot[GS_MAX_LOCAL_LIGHTS];
+
+float3 GSLocalLit(uint SplatIndex, float3 TranslatedCm, float3 LocalView)
+{
+	if (LocalLightCount == 0u || (GSResources.ColorFlags & GS_COLOR_TRANSFER) == 0u || GSResources.Catcher != 0u)
+	{
+		return 0.0f;
+	}
+	float3 Albedo = max(GSShOp(SplatIndex).rgb, 0.0f);
+	if ((GSResources.ColorFlags & GS_COLOR_LINEARIZE) != 0)
+	{
+		Albedo = select(Albedo <= 0.04045f, Albedo / 12.92f, pow((Albedo + 0.055f) / 1.055f, 2.4f));
+	}
+	const FGSSurface s = GSReadSurface(SplatIndex, Albedo);
+	const float3 v = normalize(LocalView);
+	const float3 wo = -float3(dot(v, GSResources.FileAxisX), dot(v, GSResources.FileAxisY), dot(v, GSResources.FileAxisZ));
+	float3 n = normalize(s.Normal);
+	n = dot(n, wo) < 0.0f ? -n : n;
+	const float NoV = max(dot(n, wo), 1.0e-4f);
+	const float a2 = max(s.Roughness * s.Roughness, 1.0e-3f) * max(s.Roughness * s.Roughness, 1.0e-3f);
+	const float3 F0 = lerp(0.04f * s.SpecularWeight * s.SpecularColor, s.Albedo, s.Metallic);
+	float3 Lit = 0.0f;
+	for (uint k = 0; k < LocalLightCount; ++k)
+	{
+		const float3 ToLight = LocalLightPosition[k].xyz - TranslatedCm;
+		const float DistSq = dot(ToLight, ToLight);
+		const float3 Lw = ToLight * rsqrt(max(DistSq, 1.0e-6f));
+		const float InvR2 = LocalLightPosition[k].w * LocalLightPosition[k].w;
+		float Attenuation = LocalLightDirection[k].w == 0.0f
+			? 1.0f / (DistSq + 1.0f) * Square(saturate(1.0f - Square(DistSq * InvR2)))
+			: pow(1.0f - saturate(DistSq * InvR2), LocalLightDirection[k].w);
+		Attenuation *= Square(saturate((dot(Lw, -LocalLightDirection[k].xyz) - LocalLightSpot[k].x) * LocalLightSpot[k].y));
+		if (LocalLightColor[k].w == 3.0f)
+		{
+			Attenuation *= saturate(dot(-Lw, LocalLightDirection[k].xyz));
+		}
+		if (!(Attenuation > 0.0f))
+		{
+			continue;
+		}
+		// The light's way in the file's frame, as the transfer is.
+		const float3 Ll = normalize(mul(Lw, (float3x3)Primitive.RelativeWorldToLocal));
+		const float3 L = normalize(float3(dot(Ll, GSResources.FileAxisX), dot(Ll, GSResources.FileAxisY), dot(Ll, GSResources.FileAxisZ)));
+		const float NoL = dot(n, L);
+		if (!(NoL > 0.0f))
+		{
+			continue;
+		}
+		float Open = 1.0f;
+		if (GSResources.CellWords >= 8u)
+		{
+			const float o = GSCellsOpen(SplatIndex, L, n);
+			Open = o >= 0.0f ? o : 1.0f;
+		}
+		const float3 H = normalize(L + wo);
+		const float NoH = saturate(dot(n, H));
+		const float D = a2 / (PI * Square(NoH * NoH * (a2 - 1.0f) + 1.0f));
+		const float Vis = 0.5f / (NoL * sqrt(NoV * NoV * (1.0f - a2) + a2) + NoV * sqrt(NoL * NoL * (1.0f - a2) + a2));
+		const float3 F = F0 + (1.0f - F0) * pow(1.0f - saturate(dot(wo, H)), 5.0f);
+		const float3 Body = s.Albedo * (1.0f - s.Metallic) * (1.0f - s.Transmission) / PI;
+		Lit += LocalLightColor[k].rgb * Attenuation * Open * NoL * (Body + D * Vis * F);
+	}
+	return Lit;
+}
+
+// athenea: CRYPTOMATTE: the id a component draws alone (0: all), and 1 to draw
+// each gaussian in its id's colour.
+uint MatteId;
+uint CryptoView;
+
+// athenea: A SPLAT EDIT (athenea's common/edit.slang, rule for rule).
+uint4 EditFlags;    // active, shape (1 sphere), mode (0 keep, 1 remove, 2 grade), invert
+float4 EditCentre;  // xyz in local centimetres, opacity
+float4 EditSize;    // half extents (or radius in x), min opacity
+float4 EditTint;    // rgb, saturation
+float4 EditMore;    // brightness, max scale
+
+// What the edit does to a splat: x 1 where removed, y 1 where graded, z its
+// opacity after the edit.
+float3 GSEditFate(float3 Position, float Opacity, float3 Scale)
+{
+	if (EditFlags.x == 0u)
+	{
+		return float3(0.0f, 0.0f, Opacity);
+	}
+	if (EditSize.w > 0.0f && Opacity < EditSize.w)
+	{
+		return float3(1.0f, 0.0f, Opacity);
+	}
+	if (EditMore.y > 0.0f && max(max(abs(Scale.x), abs(Scale.y)), abs(Scale.z)) > EditMore.y)
+	{
+		return float3(1.0f, 0.0f, Opacity);
+	}
+	const float3 Rel = Position - EditCentre.xyz;
+	bool bInside = EditFlags.y == 1u ? dot(Rel, Rel) <= EditSize.x * EditSize.x
+		: (abs(Rel.x) <= EditSize.x && abs(Rel.y) <= EditSize.y && abs(Rel.z) <= EditSize.z);
+	bInside = EditFlags.w != 0u ? !bInside : bInside;
+	if ((EditFlags.z == 0u && !bInside) || (EditFlags.z == 1u && bInside))
+	{
+		return float3(1.0f, 0.0f, Opacity);
+	}
+	if (bInside)
+	{
+		const float Edited = Opacity * EditCentre.w;
+		return float3(Edited >= 1.0f / 255.0f ? 0.0f : 1.0f, 1.0f, Edited);
+	}
+	return float3(0.0f, 0.0f, Opacity);
+}
+
+// The grade, in linear light: a brightness of 2 is twice the light.
+float3 GSEditGrade(float3 Colour)
+{
+	const float3 c = Colour * EditTint.rgb * EditMore.x;
+	const float Luma = dot(c, float3(0.2126f, 0.7152f, 0.0722f));
+	return max(lerp(Luma.xxx, c, EditTint.w), 0.0f);
+}
+
+// WHAT THE LAMPS ADD TO A GAUSSIAN (athenea's splat_project, lampLight): the
+// sum over the groups its cloud carries of this frame's weight times its
+// layer, RGB9E5 times 2^14. Light is linear: a lamp switched, dimmed or
+// tinted is a weight and nothing else.
+float3 GSLampLight(uint SplatIndex)
+{
+	float3 Sum = 0.0f;
+	if (SplatIndex >= GSResources.LightLayerSplats)
+	{
+		return Sum;
+	}
+	const uint Base = SplatIndex * GSResources.LightLayerCount;
+	for (uint k = 0; k < GSResources.LightLayerCount; ++k)
+	{
+		const float3 w = LightWeights[k].rgb;
+		if (any(w != 0.0f))
+		{
+			const uint Word = GSResources.LightLayers[Base + k];
+			const float Step = exp2(float(int(Word >> 27) - 24)) * (1.0f / 16384.0f);
+			Sum += w * float3(float(Word & 511u), float((Word >> 9) & 511u), float((Word >> 18) & 511u)) * Step;
+		}
+	}
+	return Sum;
+}
 
 
 // athenea: A BLACK BODY'S LIGHT at `Kelvin` (athenea's volume_blackbody.slang):
@@ -190,6 +370,7 @@ groupshared float3 GS_Conic[THREADGROUP_SIZE_1D];
 groupshared float4 GS_ColorOpacity[THREADGROUP_SIZE_1D];
 groupshared uint4 GS_SharpA[THREADGROUP_SIZE_1D];
 groupshared uint4 GS_SharpB[THREADGROUP_SIZE_1D];
+groupshared uint4 GS_Surfel[THREADGROUP_SIZE_1D];
 
 #if ENABLE_RELIGHTING
 groupshared uint GS_Normal[THREADGROUP_SIZE_1D];
@@ -225,6 +406,8 @@ void GSPrepass(uint3 DispatchThreadId : SV_DispatchThreadID, uint3 GroupId : SV_
 	if (SplatIndex < GSResources.SplatCount && GSShOp(SplatIndex).a > SplatOpacityThreshold)
     {
 	    float3 LocalPosition = GSPos(SplatIndex);
+		// athenea: the edit, on the splat as stored.
+		const float3 EditFate = GSEditFate(LocalPosition, GSShOp(SplatIndex).a, GSScl(SplatIndex));
 		// athenea: the cut morphed (GSLod.ush, athenea's lod_gather): the
 		// gaussian a fraction MorphT of the way to its parent -- position,
 		// log-scales, rotation (nlerp, sign aligned) and colour -- its opacity
@@ -317,7 +500,9 @@ void GSPrepass(uint3 DispatchThreadId : SV_DispatchThreadID, uint3 GroupId : SV_
 			true,
 			false
 		);
-		bVisible = bVisible && (FrustumCullData.bIsVisible);
+		bVisible = bVisible && (FrustumCullData.bIsVisible) && EditFate.x == 0.0f;
+		// The matte: only the gaussians of the prim asked for.
+		bVisible = bVisible && (MatteId == 0u || (GSResources.HasCrypto != 0u && GSResources.CryptoIds[SplatIndex] == MatteId));
 
 		if (bVisible)
 		{
@@ -394,16 +579,25 @@ void GSPrepass(uint3 DispatchThreadId : SV_DispatchThreadID, uint3 GroupId : SV_
 			const float DetBefore = Covariance2D[0][0] * Covariance2D[1][1] - Covariance * Covariance;
 			const float MipPaid = MipPay != 0u ? sqrt(max(DetBefore, 0.0f) / max(Determinant, 1.0e-20f)) : 1.0f;
 
+			// athenea: a surfel drawn from the pixel's ray (SurfelOut) reaches past
+			// what the affine projection bounds where perspective stretches it:
+			// its quad is the conic widened by half again and by the 2DGS screen
+			// filter's variance, as splat_project's tile bound.
+			const bool bSurfelRay = SurfelOut != 0u && bSurfel;
+			const float QX = bSurfelRay ? X * 2.25f + 0.5f : X;
+			const float QY = bSurfelRay ? Y * 2.25f + 0.5f : Y;
+			const float QC = bSurfelRay ? Covariance * 2.25f : Covariance;
+
 		    // Finally calculate the bounds of a screenspace quad that will be rasterized for this splat
-			float Mid = (X + Y);
-			float Delta = length(float2((X - Y), (2 * Covariance)));
+			float Mid = (QX + QY);
+			float Delta = length(float2((QX - QY), (2 * QC)));
 			
 		    float Lambda1 = 0.5f * (Mid + Delta);
 		    float Lambda2 = 0.5f * (Mid - Delta);
 
 		    if (Lambda2 > 0.0f)
 		    {
-				float2 DiagonalVector = normalize(float2((Covariance - Y + Lambda1), (-X + Covariance + Lambda1)));
+				float2 DiagonalVector = normalize(float2((QC - QY + Lambda1), (-QX + QC + Lambda1)));
 				// athenea: the harder kernel's flat top reaches past three sigmas;
 				// its quad is widened by 0.7 (D - 1) sigma, as Spark and athenea's
 				// falloffCutoff widen the cut (D held to 5).
@@ -444,6 +638,31 @@ void GSPrepass(uint3 DispatchThreadId : SV_DispatchThreadID, uint3 GroupId : SV_
 					GS_SSPositions[Index] = ClipPosition.xy;
 					GS_SSScale[Index] = float4(MajorAxisMultiplier, MinorAxisMultiplier);
 					GS_Conic[Index] = Conic;
+					GS_Surfel[Index] = uint4(0, 0, 0, 0);
+					if (bSurfelRay)
+					{
+						// athenea's splat_project: the disc's two wide axes (scale
+						// times direction, metres, in the view), widened for a hard
+						// surfel to the box its moments stand for; as homogeneous
+						// pixel directions (fx x + cx z, cy z - fy y, z), all over the
+						// centre's depth, so the centre's own is (Mean, 1).
+						const float3 S = MorphScale;
+						const uint Flat = S.x == 0.0f ? 0u : S.y == 0.0f ? 1u : 2u;
+						const uint UA = Flat == 0u ? 1u : 0u;
+						const uint VA = Flat == 2u ? 1u : 2u;
+						const float P = GSResources.HasHardness != 0u ? GSResources.Hardness[SplatIndex] : 2.0f;
+						const float Widen = P > 2.0f ? rsqrt(GSHardnessVariance(P)) : 1.0f;
+						const float3x3 W2V = (float3x3) PrimaryView.TranslatedWorldToView;
+						const float3 AxisU = mul(float3(T[0][UA], T[1][UA], T[2][UA]), W2V) * Widen;
+						const float3 AxisV = mul(float3(T[0][VA], T[1][VA], T[2][VA]), W2V) * Widen;
+						const float FX = PrimaryView.ViewSizeAndInvSize.x / (2.0f * PrimaryView.TanAndInvTanHalfFOV.x);
+						const float2 C = PrimaryView.ViewRectMin.xy + 0.5f * PrimaryView.ViewSizeAndInvSize.xy;
+						const float InvZ = 1.0f / ViewPosition.z;
+						const float3 HU = float3(FX * AxisU.x + C.x * AxisU.z, C.y * AxisU.z - FocalZ * AxisU.y, AxisU.z) * InvZ;
+						const float3 HV = float3(FX * AxisV.x + C.x * AxisV.z, C.y * AxisV.z - FocalZ * AxisV.y, AxisV.z) * InvZ;
+						GS_Surfel[Index] = uint4(f32tof16(HU.x) | (f32tof16(HU.y) << 16), f32tof16(HU.z) | (f32tof16(HV.x) << 16),
+							f32tof16(HV.y) | (f32tof16(HV.z) << 16), asuint(max(P, 2.0f)));
+					}
 	        
 					// athenea: the eye sits at the translated world's origin, so the
 					// splat's translated position is the view direction; the colour
@@ -458,6 +677,7 @@ void GSPrepass(uint3 DispatchThreadId : SV_DispatchThreadID, uint3 GroupId : SV_
 					// splat's plane in metres, then in the file's units; the turn
 					// along those axes, in the file's frame.
 					GSSharpOn = false;
+					GSBakeSpread = 0.0f;
 					if (SharpOut == 1u && GSResources.HasCurvature != 0u && (GSResources.ColorFlags & GS_COLOR_TRANSFER) != 0u)
 					{
 						const float3x3 LocalAxes = QuatToMatrix(MorphRotation);
@@ -490,6 +710,12 @@ void GSPrepass(uint3 DispatchThreadId : SV_DispatchThreadID, uint3 GroupId : SV_
 							GSSharpTurnX = dX * min(1.0f, Most / max(length(dX), 1.0e-9f));
 							GSSharpTurnY = dY * min(1.0f, Most / max(length(dY), 1.0e-9f));
 							GSSharpTurn2 = dot(dX, dX) + dot(dY, dY);
+							// The bake's spread: the largest principal curvature
+							// (file units) times the widest size, in file units.
+							const float CurveA = Shape[0][0], CurveB = Shape[0][1], CurveC = Shape[1][1];
+							const float KMax = abs(0.5f * (CurveA + CurveC)) + sqrt(0.25f * (CurveA - CurveC) * (CurveA - CurveC) + CurveB * CurveB);
+							const float3 Wide = MorphScale * (100.0f / max(GSResources.FileUnitsToCm, 1.0e-6f));
+							GSBakeSpread = KMax * max(max(Wide.x, Wide.y), Wide.z);
 							GSSharpOn = true;
 						}
 					}
@@ -505,6 +731,19 @@ void GSPrepass(uint3 DispatchThreadId : SV_DispatchThreadID, uint3 GroupId : SV_
 					}
 					// An opacity over 1 is the harder kernel, drawn as it is: no
 					// payback (athenea's splat_project, alphaOwn).
+					// The scene's local lights on a TX cloud (TranslatedWorldPosition
+					// is in metres here).
+					GS_ColorOpacity[Index].rgb += GSLocalLit(SplatIndex, TranslatedWorldPosition.xyz * 100.0f, LocalView);
+					// THE LAMPS, over whatever the cloud shows: each layer is light already.
+					if (GSResources.LightLayerCount != 0u)
+					{
+						GS_ColorOpacity[Index].rgb += GSLampLight(SplatIndex);
+					}
+					if (EditFate.y != 0.0f)
+					{
+						GS_ColorOpacity[Index].rgb = GSEditGrade(GS_ColorOpacity[Index].rgb);
+						GS_ColorOpacity[Index].a *= EditCentre.w;
+					}
 					GS_ColorOpacity[Index].a *= GS_ColorOpacity[Index].a > 1.0f ? 1.0f : SurfelPaid;
 					if (!bSurfel && GS_ColorOpacity[Index].a <= 1.0f)
 					{
@@ -534,13 +773,22 @@ void GSPrepass(uint3 DispatchThreadId : SV_DispatchThreadID, uint3 GroupId : SV_
 						// absorbing part glows with. The phase is isotropic; multiple
 						// scattering is athenea's octaves (Wrenninge): energy and
 						// extinction halved at each, four of them.
+						// The sun's octaves take the medium's Henyey-Greenstein phase at
+						// the angle between the light and the eye's ray (athenea's
+						// volume_splat_shade: g halved an octave, as energy and
+						// extinction are), times 4 pi against the isotropic phase
+						// folded into Sun below; the sky's stay isotropic.
 						const float2 Lit = VolumeShadow[SplatIndex];
+						const float CosTheta = dot(View.DirectionalLightDirection, Ray);
 						float2 Octaves = 0.0f;
 						UNROLL
 						for (uint o = 0; o < 4u; ++o)
 						{
 							const float a = exp2(-float(o));
-							Octaves += a * float2(pow(max(Lit.x, 1.0e-6f), a), pow(max(Lit.y, 1.0e-6f), a));
+							const float g = GSResources.VolumeAnisotropy * a;
+							const float Denom = 1.0f + g * g - 2.0f * g * CosTheta;
+							const float Phase = (1.0f - g * g) / (Denom * sqrt(max(Denom, 1.0e-8f)));
+							Octaves += a * float2(Phase * pow(max(Lit.x, 1.0e-6f), a), pow(max(Lit.y, 1.0e-6f), a));
 						}
 						const float3 Albedo = saturate(GS_ColorOpacity[Index].rgb * GSResources.VolumeAlbedo);
 						const float3 Sun = View.DirectionalLightColor.rgb * 3.14159265f * (1.0f / (4.0f * 3.14159265f));
@@ -551,7 +799,50 @@ void GSPrepass(uint3 DispatchThreadId : SV_DispatchThreadID, uint3 GroupId : SV_
 						{
 							Glow += GSResources.VolumeEmissionScale * GSBlackbody(GSResources.VolumeTemperatureOffset + GSResources.VolumeTemperatureScale * Medium.y);
 						}
-						GS_ColorOpacity[Index] = float4(max(Albedo * Scattered + (1.0f - Albedo) * Glow, 0.0f), -Tau);
+						// The scene's local lights scatter in too, at the same phase,
+						// through the medium's own shadow as the sky reads it (the
+						// grid holds no other direction).
+						float3 Local = 0.0f;
+						for (uint k = 0; k < LocalLightCount; ++k)
+						{
+							const float3 ToLight = LocalLightPosition[k].xyz - TranslatedWorldPosition.xyz * 100.0f;
+							const float DistSq = dot(ToLight, ToLight);
+							const float3 Lw = ToLight * rsqrt(max(DistSq, 1.0e-6f));
+							const float InvR2 = LocalLightPosition[k].w * LocalLightPosition[k].w;
+							float Attenuation = LocalLightDirection[k].w == 0.0f
+								? 1.0f / (DistSq + 1.0f) * Square(saturate(1.0f - Square(DistSq * InvR2)))
+								: pow(1.0f - saturate(DistSq * InvR2), LocalLightDirection[k].w);
+							Attenuation *= Square(saturate((dot(Lw, -LocalLightDirection[k].xyz) - LocalLightSpot[k].x) * LocalLightSpot[k].y));
+							if (!(Attenuation > 0.0f))
+							{
+								continue;
+							}
+							const float Cos = dot(Lw, Ray);
+							float Through = 0.0f;
+							UNROLL
+							for (uint o = 0; o < 4u; ++o)
+							{
+								const float a = exp2(-float(o));
+								const float g = GSResources.VolumeAnisotropy * a;
+								const float Denom = 1.0f + g * g - 2.0f * g * Cos;
+								Through += a * (1.0f - g * g) / (4.0f * PI * Denom * sqrt(max(Denom, 1.0e-8f))) * pow(max(Lit.y, 1.0e-6f), a);
+							}
+							Local += LocalLightColor[k].rgb * Attenuation * Through;
+						}
+						GS_ColorOpacity[Index] = float4(max(Albedo * (Scattered + Local) + (1.0f - Albedo) * Glow, 0.0f), -Tau);
+					}
+					if (CryptoView != 0u && GSResources.HasCrypto != 0u)
+					{
+						// The id's colour, an ID pass: its three low bytes.
+						const uint Id = GSResources.CryptoIds[SplatIndex];
+						GS_ColorOpacity[Index].rgb = float3(float(Id & 0xFFu), float((Id >> 8) & 0xFFu), float((Id >> 16) & 0xFFu)) / 255.0f;
+					}
+					if (GSResources.LightCatcher != 0u)
+					{
+						// athenea: A LIGHT CATCHER (mesh2splat --light-catcher): its
+						// lamps' layers alone, added over whatever is behind it --
+						// carried as an opacity past -1000 (GSSplatting_PS).
+						GS_ColorOpacity[Index] = float4(GSLampLight(SplatIndex), -1000.0f - saturate(GSShOp(SplatIndex).a));
 					}
 					GS_SharpA[Index] = GSSharpOn ? GSSharpA : uint4(0, 0, 0, 0);
 					GS_SharpB[Index] = GSSharpOn ? GSSharpB : uint4(0, 0, 0, 0);
@@ -618,6 +909,10 @@ void GSPrepass(uint3 DispatchThreadId : SV_DispatchThreadID, uint3 GroupId : SV_
 		OutSSPositions[Idx] = GS_SSPositions[GroupIndex];
 		OutSSScale[Idx] = GS_SSScale[GroupIndex];
 		OutConic[Idx] = GS_Conic[GroupIndex];
+		if (SurfelOut != 0u)
+		{
+			OutSurfel[Idx] = GS_Surfel[GroupIndex];
+		}
         
 		OutGaussianIDX[Idx] = Idx;
 		OutColorOpacity[Idx] = GS_ColorOpacity[GroupIndex];
@@ -670,6 +965,8 @@ uint FrontBatch;
 Buffer<uint4> VS_SharpA;
 Buffer<uint4> VS_SharpB;
 uint SharpIn;
+Buffer<uint4> VS_Surfel;
+uint SurfelIn;
 StructuredBuffer<float4> SunWorld;
 
 struct FOutVertex
@@ -685,6 +982,11 @@ struct FOutVertex
 
 	nointerpolation uint4 SharpA : SHARPA;
 	nointerpolation uint4 SharpB : SHARPB;
+#if GS_SURFELS
+	// athenea: only where a cloud holds surfels -- the interpolant costs a
+	// cloud without any a tenth of its frame (decisions §17).
+	nointerpolation uint4 Surfel : SURFEL;
+#endif
 
 #if ENABLE_RELIGHTING
     float2 MR : METALLICROUGHNESS;
@@ -718,6 +1020,9 @@ FOutVertex GSSplatting_VS(uint GlobalVertexId : SV_VertexID, uint InstanceID : S
     Output.Opacity = VS_ColorOpacity[Index].a;
 	Output.SharpA = SharpIn != 0u ? VS_SharpA[Index] : uint4(0, 0, 0, 0);
 	Output.SharpB = SharpIn != 0u ? VS_SharpB[Index] : uint4(0, 0, 0, 0);
+#if GS_SURFELS
+	Output.Surfel = SurfelIn != 0u ? VS_Surfel[Index] : uint4(0, 0, 0, 0);
+#endif
 
     float3 Conic = VS_Conic[Index];
 	Output.Conic = float3(-0.5 * Conic.x, -Conic.y, -0.5 * Conic.z);
@@ -726,7 +1031,10 @@ FOutVertex GSSplatting_VS(uint GlobalVertexId : SV_VertexID, uint InstanceID : S
     float2 ScreenSpacePos = VS_SSPositions[Index];
     float2 Vertex = Quad[GlobalVertexId];
 
-	Output.Mean = float2((float2(ScreenSpacePos.x, -ScreenSpacePos.y) + 1) * 0.5f * PrimaryView.ViewSizeAndInvSize.xy);
+	// athenea: in the render target's pixels, as SV_Position is: a view whose
+	// rect does not start at the corner (split screen, stereo) drew its splats
+	// offset by it (upstream's defect).
+	Output.Mean = float2((float2(ScreenSpacePos.x, -ScreenSpacePos.y) + 1) * 0.5f * PrimaryView.ViewSizeAndInvSize.xy) + PrimaryView.ViewRectMin.xy;
     Output.Position = float4(ScreenSpacePos.xy + (Vertex.x * QuadScale.zw + Vertex.y * QuadScale.xy), 0, 1);
 
     // Must invert bits for unlit splats as they are sorted in opposite order
@@ -804,13 +1112,54 @@ float3 GSSharpSky(uint4 A, uint4 B, float2 Offset)
 	return Sky;
 }
 
+// athenea's splat_blend (surfelPower): WHERE A PIXEL'S RAY MEETS A SURFEL, as a
+// power: the squared radius in the disc's own axes where the ray crosses its
+// plane (Huang et al. 2024: the pixel's planes x = px and y = py pulled back
+// through the disc's map to the screen meet in one point of the disc's
+// plane, their cross product), against the screen filter, a gaussian of
+// sigma sqrt(2)/2 pixel round the centre: the smaller power, the larger of
+// the two. A hard surfel's |u|^p + |v|^p is held at 0 out to where it would
+// fall to 1/2, so that two hard merges side by side overlap at their seam.
+float GSSurfelPower(uint4 W, float2 Mean, float2 Pixel)
+{
+	const float3 HU = float3(f16tof32(W.x), f16tof32(W.x >> 16), f16tof32(W.y));
+	const float3 HV = float3(f16tof32(W.y >> 16), f16tof32(W.z), f16tof32(W.z >> 16));
+	const float3 RowX = float3(HU.x, HV.x, Mean.x);
+	const float3 RowY = float3(HU.y, HV.y, Mean.y);
+	const float3 RowW = float3(HU.z, HV.z, 1.0f);
+	const float3 UV = cross(RowX - Pixel.x * RowW, RowY - Pixel.y * RowW);
+	const float2 D = Pixel - Mean;
+	const float Filter = 2.0f * dot(D, D);
+	if (!(abs(UV.z) > 1.0e-20f))
+	{
+		return Filter;
+	}
+	const float2 At = UV.xy / UV.z;
+	const float P = asfloat(W.w);
+	const float Own = P > 2.0f ? max(pow(abs(At.x), P) + pow(abs(At.y), P) - 2.0f * 0.69314718f, 0.0f) : dot(At, At);
+	return min(Own, Filter);
+}
+
 FRTOut GSSplatting_PS(FOutVertex Input)
 {
 	FRTOut Output;
 
     float2 DistanceFromMean = (Input.Mean.xy - Input.Position.xy);
 
-    float Power = dot(Input.Conic.xzy, float3(DistanceFromMean * DistanceFromMean, DistanceFromMean.x * DistanceFromMean.y));
+#if GS_SURFELS
+    const bool bSurfel = Input.Surfel.w != 0u;
+#else
+    const bool bSurfel = false;
+    const uint4 SurfelRecord = uint4(0, 0, 0, 0);
+#endif
+    float Power = bSurfel ? -0.5f * GSSurfelPower(
+#if GS_SURFELS
+		Input.Surfel,
+#else
+		SurfelRecord,
+#endif
+		Input.Mean.xy, Input.Position.xy)
+		: dot(Input.Conic.xzy, float3(DistanceFromMean * DistanceFromMean, DistanceFromMean.x * DistanceFromMean.y));
     // athenea: an opacity D over 1 is Spark's harder kernel (athenea's
     // falloffAlpha): A = exp((D^2 - 1)/e) coincident gaussians, 1 - (1 - g)^A,
     // a flat top and the gaussian's shoulder past it -- what a .athc's merged
@@ -819,17 +1168,36 @@ FRTOut GSSplatting_PS(FOutVertex Input)
     const float Gauss = exp(Power);
     // athenea: a medium's gaussian (a negative opacity, its optical depth
     // through the centre): 1 - exp(-tau) of its ray's depth.
-    float Alpha = Input.Opacity < 0.0f ? 1.0f - exp(Input.Opacity * Gauss)
+    // athenea: a light catcher's (an opacity past -1000): light added, nothing covered.
+    const bool bAdded = Input.Opacity <= -1000.0f;
+    float Alpha = bAdded ? Gauss * (-1000.0f - Input.Opacity)
+        : Input.Opacity < 0.0f ? 1.0f - exp(Input.Opacity * Gauss)
         : Input.Opacity > 1.0f
         ? 1.0f - pow(max(1.0f - Gauss, 0.0f), exp((Input.Opacity * Input.Opacity - 1.0f) * 0.36787944f))
         : Gauss * Input.Opacity;
+	// athenea's splat_blend: a sample under 1/255 adds nothing. A gaussian's
+	// quad already ends there (TightQuads); a surfel's, widened for the
+	// perspective of its disc, does not, and its tails would show.
+	if (bSurfel && Input.Opacity > 0.0f && Alpha < 1.0f / 255.0f)
+	{
+		Alpha = 0.0f;
+	}
 
 	float3 Shade = Input.Color;
-	if (any(Input.SharpA != 0u))
+	if (Input.SharpB.w == GS_SLOPE_MARK)
+	{
+		// athenea's splat_blend: the colour's slope across the splat.
+		const float2 Px = -DistanceFromMean;
+		const float3 SlopeX = float3(f16tof32(Input.SharpA.x), f16tof32(Input.SharpA.x >> 16), f16tof32(Input.SharpA.y));
+		const float3 SlopeY = float3(f16tof32(Input.SharpA.y >> 16), f16tof32(Input.SharpA.z), f16tof32(Input.SharpA.z >> 16));
+		Shade = max(Shade + SlopeX * Px.x + SlopeY * Px.y, 0.0f);
+	}
+	else if (any(Input.SharpA != 0u))
 	{
 		Shade = max(Shade + GSSharpSky(Input.SharpA, Input.SharpB, -DistanceFromMean), 0.0f);
 	}
 	Output.Color = float4(Shade, 1) * Alpha;
+	Output.Color.a = bAdded ? 0.0f : Output.Color.a;
 #if !ENABLE_RELIGHTING
 	// athenea: an unlit splat's colour is scene light, so it takes the view's
 	// pre-exposure as everything else in SceneColor does.
@@ -844,7 +1212,7 @@ FRTOut GSSplatting_PS(FOutVertex Input)
 
 #else
 	// Must write out velocity for TAA/TSR for unlit splats, as they do not write depth information where velocity can be reconstructed from
-	float2 ClipPos = ((Input.Mean.xy * PrimaryView.ViewSizeAndInvSize.zw * 2.0f) - 1.0f) * float2(1.0f, -1.0f);
+	float2 ClipPos = (((Input.Mean.xy - PrimaryView.ViewRectMin.xy) * PrimaryView.ViewSizeAndInvSize.zw * 2.0f) - 1.0f) * float2(1.0f, -1.0f);
 
 	// Calculate previous clip position from world position
 	float3 PrevTranslatedWorldPos = Input.TranslatedWorldPosition + DFSubtractDemote(PrimaryView.PrevPreViewTranslation, PrimaryView.PreViewTranslation);

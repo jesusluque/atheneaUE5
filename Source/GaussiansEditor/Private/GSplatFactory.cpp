@@ -10,6 +10,7 @@
 #include "GSplatImporter.h"
 #include "GSplatImportWindow.h"
 #include "EditorFramework/AssetImportData.h"
+#include "AssetImportTask.h"
 #include "Interfaces/IMainFrameModule.h"
 #include "HAL/PlatformApplicationMisc.h"
 
@@ -229,6 +230,17 @@ UObject* UGSplatFactory::ImportInternal(UClass* InClass, UObject* InParent, FNam
 		return nullptr;
 	}
 
+	// athenea: a script's import of an .athc or .athz says whether the file is
+	// z-up (bFileZUp): the files do not record it. A reimport keeps the
+	// asset's own.
+	if (bIsUnattended && AssetImportTask)
+	{
+		if (const UGSplatImportData* Options = Cast<UGSplatImportData>(AssetImportTask->Options))
+		{
+			Object->AssetImportData->bFileZUp = Options->bFileZUp;
+		}
+	}
+
 	// athenea: a web scene's .athz brings several clouds and its sky.
 	if (GSplatImporter::IsAthzFile(Filename) && GSplatImporter::IsAthzScene(Filename))
 	{
@@ -287,6 +299,23 @@ UObject* UGSplatFactory::ImportInternal(UClass* InClass, UObject* InParent, FNam
 			LOCTEXT("ImportFailedDialogText", "Failed to parse ply file. See output log for details."),
 			LOCTEXT("ImportFailedDialogTitle", "Ply Parse Failed")
 		);
+	}
+
+	// athenea: an automated import (a script's AssetImportTask) takes the PLY
+	// options from the task's Options, a GSplatImportData, as UE's own
+	// factories do: normals and metallic/roughness, read or filled with
+	// defaults, are what the relit route needs.
+	if (bIsUnattended && AssetImportTask)
+	{
+		if (const UGSplatImportData* Options = Cast<UGSplatImportData>(AssetImportTask->Options))
+		{
+			Object->AssetImportData->bImportNormals = Options->bImportNormals;
+			Object->AssetImportData->bImportHighOrderSH = Options->bImportHighOrderSH;
+			Object->AssetImportData->bImportMetallicRoughness = Options->bImportMetallicRoughness;
+			Object->AssetImportData->bPopulateMRWithDefault = Options->bPopulateMRWithDefault;
+			Object->AssetImportData->MetallicDefaultValue = Options->MetallicDefaultValue;
+			Object->AssetImportData->RoughnessDefaultValue = Options->RoughnessDefaultValue;
+		}
 	}
 
 	// Open import dialogue for user to select options

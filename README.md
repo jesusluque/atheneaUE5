@@ -79,6 +79,32 @@ RTX 3070 Laptop (8 GB), GPU time a frame:
 capture to a level in the editor: converting to `.athc`, importing, placing
 the parts, and the console variables that make it fit.
 
+## New in 1.3
+
+The rest of athenea's gaussians, each checked against athenea's own frame on
+the same GPU ([decisions §17](Docs/athenea/decisions.md)):
+
+- **Animated clouds.** A cloud a skeleton carries -- USD `jointIndices`,
+  weights and their gradients, a web `.athc`'s `SKIN` and `ATSK`, or an
+  `.athz`'s layer K -- posed
+  on the GPU every frame, its covariance turned by the full Jacobian, its
+  zonal transfer and per-part visibility following the pose. Played, looped
+  or keyed in Sequencer (`SkinTime`).
+- **More of the light.** Emission, lamp groups (light layers) with a
+  per-group colour on the component, Unreal's point, spot and rect lights on
+  TX clouds and on media, shadow and light catchers for a ground made of
+  gaussians, translucent and stochastic shadows, slopes, and the
+  StarLightGS relit route for PLY clouds imported by script.
+- **True 2DGS surfels**, drawn where each pixel's ray meets the disc, and
+  hard surfels (`athenea:splat:hardness`).
+- **Editing and compositing.** athenea's SplatEdit (grade, keep, remove in a
+  box), Cryptomatte ids with an ID view and a matte per component.
+- **A `.athc` version 3's merged levels**, cut every frame like a version 2's.
+- **z-up athenea files**: an `.athc` or `.athz` written from a z-up stage
+  imported upright (`bFileZUp`).
+- **Frame tests** (`Athenea.Frame.*`): a fixture drawn and compared on the
+  GPU with athenea's frame.
+
 ## Quick start
 
 1. Download the [latest release](https://github.com/jesusluque/atheneaUE5/releases/latest)

@@ -230,6 +230,30 @@ there:
 UnrealEditor-Cmd.exe <project> -nullrhi -unattended -ExecCmds="Automation RunTests Athenea; Quit"
 ```
 
+The frame tests (`Athenea.Frame.*`) draw a fixture and compare the frame
+with athenea's of the same file and camera, on the device (`GSCompare.usf`,
+`Gaussians::CompareFrames`): a histogram of each pixel's largest channel
+difference in 8-bit sRGB steps, read back as 257 words, gives the mean, p99,
+max and the share over 2, as athenea's `compareImages` does. The capture is
+the fixture alone (a show-only list, no atmosphere or fog) into an sRGB
+target with no tone curve and 0 EV, kept capturing for 120 frames, since an
+editor with no viewport draws a scene only when it is captured.
+`Athenea.Frame.Surfels` takes `surfels.usda` and athenea's
+`surfels_athenea.png` from the test files' folder; its bounds are the 11 Nov
+measurement on an RTX 3070 (mean 3.49, p99 28, max 37 steps) with room for a
+driver. `Athenea.Frame.SparrowSky` takes `sparrow160tx.usdc` at 0.5 s under
+the project's `/Game/Tx/studio` cubemap, turned 180 degrees, and athenea's
+`sparrow_sky_athenea.png` (drawn with `--render-settings`, a camera prim and
+`athenea:domeVisible` off, so the dome lights the bird and is not seen
+through it), whose alpha (the bird's coverage, eroded by 3 pixels) leaves out
+the rest; the compare skips a reference pixel with an alpha under a half.
+Its bounds: mean 13, p99 56 (measured 10.4 and 45). They need a GPU, so they run without `-nullrhi` and skip themselves
+under it:
+
+```
+UnrealEditor-Cmd.exe <project> -RenderOffscreen -unattended -ExecCmds="Automation RunTests Athenea.Frame; Quit"
+```
+
 Past them, a change is checked on a Windows machine against athenea:
 
 1. **Build**: `RunUAT BuildPlugin` (operations §2), with no new warning.
@@ -273,7 +297,9 @@ files in `~/athenea-unreal/`, and write shots to `~/athenea-unreal/shots/`.
 | `shot_dbg.py` | `-ExecCmds="py shot_dbg.py 100 101 ..."` | shots with `r.Gaussians.Athenea.Debug` at each value |
 | `setup_files.py` | `-ExecCmds="py setup_files.py a.spz b.glb@100 --quit"` | imports each file (from the home folder's `athenea-unreal`) with the plugin's factory into `/Game/Files` and saves a level `/Game/F_<name>_<ext>` with an actor of it; `@k` scales the actor, for a file in units other than metres |
 | `shot_framed.py` | `-ExecCmds="py shot_framed.py +y x3 /Game/F_a /Game/F_b"` | a shot of each level, framed on its splats' bounds from a side (`±x`, `±y`), `x<k>` k times further, into `shots/framed_<level><side>.png` |
-| `ue_time.sh` | `ue_time.sh /Game/Level out.csv ["cvar value,..."]`, from a machine with `ssh` to the Windows one | times a level in `-game` with the CSV profiler (30 fps cap), console variables set first, and prints the splat stages' medians |
+| `ue_time.sh` | `ue_time.sh /Game/Level out.csv ["cvar value,..."]`, from a machine with `ssh` to the Windows one | times a level in `-game` with the CSV profiler (30 fps cap), console variables set first, and prints the splat stages' medians; it stops only its own `-game` run (`stop_game.ps1`, copied beside the test project), never an open editor |
+| `timing_level.py` | `py timing_level.py /Game/F_name name [still]` in the editor | a check level framed by a camera the player looks through, saved as `/Game/T_name` for `ue_time.sh`; `still` holds a skinned cloud at its first pose |
+| `stop_game.ps1` | `stop_game.ps1 PROJECT [-DryRun]` on the Windows machine | stops the `-game` runs of a project, and nothing else |
 | `setup_scene.py` | `-ExecCmds="py setup_scene.py /Game/Level sky.hdr 100 0:0.05:0.18 0:0.05:0 39.6 a.athc b.athc --quit"` | several clouds and an HDRI's sky light in a level, a camera from the files' frame (`x:y:z`, as `-ExecCmds` splits on commas), every actor and the camera scaled (a scene far smaller than UE's near plane) |
 | `tx_regions.py` | `python3 tx_regions.py ue.exr athenea.exr [exposure]` | the TX test frame's ball, its halves and the ground, UE (over the capture's exposure factor, 2.02) against athenea's frame: means, ratio and mean absolute relative error |
 | `TestProj.uproject`, `DefaultEngine.ini`, `DefaultEditorPerProjectUserSettings.ini` | -- | the test project: SM6 only, auto-exposure, bloom, motion blur and temporal AA off; the MCP server's settings (operations §8) |

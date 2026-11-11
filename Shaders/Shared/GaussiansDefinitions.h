@@ -38,6 +38,11 @@ struct FGaussians_ClippingVolume
 #define GAUSSIANS_CLIPPING_MODE_CLIP_OUTSIDE_ALL 2
 #define GAUSSIANS_CLIPPING_MODE_CLIP_OUTSIDE_ANY 3
 
+// athenea: the most lamp groups a cloud's layers are drawn for.
+#define GS_MAX_LIGHT_LAYERS 16
+// athenea: the most local lights a TX cloud is lit by in a view.
+#define GS_MAX_LOCAL_LIGHTS 8
+
 #define GAUSSIANS_CLIPPING_SHAPE_BOX	0
 #define GAUSSIANS_CLIPPING_SHAPE_SPHERE 1
 

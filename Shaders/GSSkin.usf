@@ -1,0 +1,312 @@
+// Copyright (c) 2026 jesus luque.
+//
+// A CLOUD CARRIED BY A SKELETON, one thread a gaussian: athenea's
+// scene/splat_skin.slang, rule for rule. The bind pose is a copy of the
+// cloud's own buffers as first decoded (the component's space), taken back to
+// the file's (axes and units) here, each gaussian with the joints that move
+// it (a word an influence: joint in the low 16 bits, weight as unorm16 in the
+// high -- athenea's packed influences, a .athc's SKIN); the joints are applied -- the position by the linear
+// blend, the frame by the whole Jacobian of that map, the weights' gradients
+// included (the elastic term that stretches a gaussian between two joints that
+// disagree) -- and the result written in the component's local space as the
+// rasteriser reads it: positions in centimetres, scales in metres, rotations
+// as the packed decoders turn a file's quaternion (GSSplatData.ush).
+//
+// SkinXforms: 3 rows a joint of C_j = X_j G, the joint's skinning transform
+// after the geometry's bind transform (column vectors, as athenea's
+// skinningXforms and geomBindTransform are written), for this instant.
+
+#include "/Engine/Public/Platform.ush"
+
+uint Count;
+uint PerSplat;
+uint GradientsIn;
+float UnitsToCm;
+float3 FileAxisX;
+float3 FileAxisY;
+float3 FileAxisZ;
+
+StructuredBuffer<float3> RestPositions;   // the bind pose as decoded: centimetres, the component's axes
+StructuredBuffer<float4> RestRotations;   // its quaternions (GSSplatData.ush's mapping)
+StructuredBuffer<float3> RestScales;      // its sizes, metres
+StructuredBuffer<uint> Influences;        // PerSplat words a gaussian: joint | weight unorm16 << 16
+StructuredBuffer<uint> Gradients;         // PerSplat - 1 words a gaussian, two halves each
+StructuredBuffer<float4> SkinXforms;      // 3 rows a joint
+
+// THE PARTS' BAKED VISIBILITY (athenea's splat_visibility_read.slang): each
+// part a field of probes over its rest box, an octahedral map of how much of
+// a direction gets through at each. A gaussian's factor for a light is the
+// product over the other parts of their field, read where the gaussian would
+// stand if that part had not moved (PartFrames: the part joint's posed-to-rest
+// map). Two factors a gaussian: the sun's direction, and the probes' mean (a
+// dome's). VisibilityParts 0: none.
+uint VisibilityParts;
+float4 SunDirection;                      // the sun's way in the file's frame, w 1 where there is one
+StructuredBuffer<float4> Parts;           // three float4 a part: box min (w joint), box max, (grid, octave, offset) as bits
+StructuredBuffer<uint> PartOf;            // the part each gaussian is of
+StructuredBuffer<uint> Texels;            // two halves a word
+StructuredBuffer<uint> Ambient;           // two halves a word: a probe's mean
+StructuredBuffer<float4> PartFrames;      // three rows a part
+RWStructuredBuffer<float2> OutVisibility; // (sun, dome)
+
+float GSHalfAt(StructuredBuffer<uint> Words, uint t)
+{
+	const uint Word = Words[t >> 1];
+	return f16tof32((t & 1u) != 0u ? (Word >> 16) : (Word & 0xFFFFu));
+}
+
+float2 GSOctEncodeSkin(float3 n)
+{
+	n /= abs(n.x) + abs(n.y) + abs(n.z);
+	float2 p = n.xy;
+	if (n.z < 0.0)
+	{
+		p = (1.0 - abs(n.yx)) * float2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+	}
+	return p * 0.5 + 0.5;
+}
+
+// The field of a part at a point (its rest space) in a direction, or its
+// probes' mean (Direction zero): trilinear over the probes, bilinear over the
+// map. Outside its box a part stops nothing.
+float GSFieldAt(uint Part, float3 p, float3 w, bool bMean)
+{
+	const float4 Lo = Parts[Part * 3u], Hi = Parts[Part * 3u + 1u];
+	const uint3 Layout = asuint(Parts[Part * 3u + 2u].xyz);
+	const uint Grid = Layout.x, Octave = Layout.y, Offset = Layout.z;
+	const float3 Unit = (p - Lo.xyz) / max(Hi.xyz - Lo.xyz, 1.0e-20);
+	if (Grid == 0u || any(Unit < 0.0) || any(Unit > 1.0))
+	{
+		return 1.0;
+	}
+	const float Gf = float(Grid);
+	const float3 At = clamp(Unit * Gf - 0.5, 0.0, Gf - 1.0);
+	const uint3 C0 = uint3(floor(At));
+	const uint3 C1 = min(C0 + 1u, uint3(Grid - 1u, Grid - 1u, Grid - 1u));
+	const float3 Fr = At - float3(C0);
+	const float Of = float(Octave);
+	const float2 Ouv = clamp(GSOctEncodeSkin(w) * Of - 0.5, 0.0, Of - 1.0);
+	const uint2 U0 = uint2(floor(Ouv));
+	const uint2 U1 = min(U0 + 1u, uint2(Octave - 1u, Octave - 1u));
+	const float2 Ufr = Ouv - float2(U0);
+	const uint Probes = Grid * Grid * Grid;
+	float Result = 0.0;
+	for (uint c = 0; c < 8u; ++c)
+	{
+		const uint3 Cell = uint3((c & 1u) != 0u ? C1.x : C0.x, (c & 2u) != 0u ? C1.y : C0.y, (c & 4u) != 0u ? C1.z : C0.z);
+		const float Wc = ((c & 1u) != 0u ? Fr.x : 1.0 - Fr.x) * ((c & 2u) != 0u ? Fr.y : 1.0 - Fr.y) * ((c & 4u) != 0u ? Fr.z : 1.0 - Fr.z);
+		const uint Probe = (Cell.z * Grid + Cell.y) * Grid + Cell.x;
+		if (bMean)
+		{
+			Result += Wc * GSHalfAt(Ambient, Part * Probes + Probe);
+			continue;
+		}
+		const uint t = Offset + Probe * Octave * Octave;
+		const float V00 = GSHalfAt(Texels, t + U0.y * Octave + U0.x);
+		const float V10 = GSHalfAt(Texels, t + U0.y * Octave + U1.x);
+		const float V01 = GSHalfAt(Texels, t + U1.y * Octave + U0.x);
+		const float V11 = GSHalfAt(Texels, t + U1.y * Octave + U1.x);
+		Result += Wc * lerp(lerp(V00, V10, Ufr.x), lerp(V01, V11, Ufr.x), Ufr.y);
+	}
+	return Result;
+}
+
+RWStructuredBuffer<float3> OutPositions;
+RWStructuredBuffer<float3> OutScales;
+RWStructuredBuffer<float4> OutOrientations;
+
+float3x3 AxesOfQuaternion(float4 q)
+{
+	const float x = q.x, y = q.y, z = q.z, w = q.w;
+	return float3x3(1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w),
+	                2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w),
+	                2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y));
+}
+
+float4 QuaternionOfAxes(float3x3 m)
+{
+	const float Trace = m[0][0] + m[1][1] + m[2][2];
+	float4 q;
+	if (Trace > 0.0)
+	{
+		const float s = 0.5 / sqrt(Trace + 1.0);
+		q = float4((m[2][1] - m[1][2]) * s, (m[0][2] - m[2][0]) * s, (m[1][0] - m[0][1]) * s, 0.25 / s);
+	}
+	else if (m[0][0] > m[1][1] && m[0][0] > m[2][2])
+	{
+		const float s = 2.0 * sqrt(1.0 + m[0][0] - m[1][1] - m[2][2]);
+		q = float4(0.25 * s, (m[1][0] + m[0][1]) / s, (m[0][2] + m[2][0]) / s, (m[2][1] - m[1][2]) / s);
+	}
+	else if (m[1][1] > m[2][2])
+	{
+		const float s = 2.0 * sqrt(1.0 - m[0][0] + m[1][1] - m[2][2]);
+		q = float4((m[1][0] + m[0][1]) / s, 0.25 * s, (m[2][1] + m[1][2]) / s, (m[0][2] - m[2][0]) / s);
+	}
+	else
+	{
+		const float s = 2.0 * sqrt(1.0 - m[0][0] - m[1][1] + m[2][2]);
+		q = float4((m[0][2] + m[2][0]) / s, (m[2][1] + m[1][2]) / s, 0.25 * s, (m[1][0] - m[0][1]) / s);
+	}
+	return normalize(q);
+}
+
+float3 ToLocal(float3 V)
+{
+	return FileAxisX * V.x + FileAxisY * V.y + FileAxisZ * V.z;
+}
+
+[numthreads(64, 1, 1)]
+void GSSkinCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint At = DispatchThreadId.x;
+	if (At >= Count)
+	{
+		return;
+	}
+	const float Eps = 1.0e-5;
+	// The bind pose back in the file's space: GSSplatData.ush's mapping undone.
+	const float3 Pl = RestPositions[At];
+	const float3 Rest = float3(dot(Pl, FileAxisX), dot(Pl, FileAxisY), dot(Pl, FileAxisZ)) / UnitsToCm;
+	const float3 Sl = RestScales[At];
+	const float3 Scale = abs(float3(dot(Sl, FileAxisX), dot(Sl, FileAxisY), dot(Sl, FileAxisZ))) * (100.0f / UnitsToCm);
+	const float4 Ql = RestRotations[At];
+	const float HandedRest = dot(cross(FileAxisX, FileAxisY), FileAxisZ);
+	const float4 RestQ = float4(dot(Ql.xyz, FileAxisX), dot(Ql.xyz, FileAxisY), dot(Ql.xyz, FileAxisZ), HandedRest > 0.0f ? -Ql.w : Ql.w);
+	float3 Moved = 0.0;
+	float3x3 Blended = (float3x3)0;
+	float3 AlongU = 0.0;
+	float3 AlongV = 0.0;
+	float2 GradientSum = 0.0;
+	float2 LastGradient = 0.0;
+	float Total = 0.0;
+	const uint Offset = At * PerSplat;
+	const uint GradientWords = PerSplat > 0u ? PerSplat - 1u : 0u;
+	for (uint k = 0; k < PerSplat; ++k)
+	{
+		const uint Packed = Influences[Offset + k];
+		const float Weight = float(Packed >> 16) / 65535.0f;
+		float2 Gradient = 0.0;
+		if (GradientsIn != 0u)
+		{
+			if (k < GradientWords)
+			{
+				const uint Word = Gradients[At * GradientWords + k];
+				Gradient = float2(f16tof32(Word & 0xFFFFu), f16tof32(Word >> 16));
+				LastGradient -= Gradient;
+			}
+			else
+			{
+				Gradient = LastGradient;
+			}
+			if (any(isnan(Gradient)) || any(isinf(Gradient)))
+			{
+				Gradient = 0.0;
+			}
+		}
+		const bool bPulls = any(Gradient != 0.0);
+		if (!(Weight > Eps) && !bPulls)
+		{
+			continue;
+		}
+		const uint Joint = Packed & 0xFFFFu;
+		const float4 R0 = SkinXforms[Joint * 3u], R1 = SkinXforms[Joint * 3u + 1u], R2 = SkinXforms[Joint * 3u + 2u];
+		const float3 Carried = float3(dot(R0.xyz, Rest) + R0.w, dot(R1.xyz, Rest) + R1.w, dot(R2.xyz, Rest) + R2.w);
+		if (bPulls)
+		{
+			AlongU += Carried * Gradient.x;
+			AlongV += Carried * Gradient.y;
+			GradientSum += Gradient;
+		}
+		if (!(Weight > Eps))
+		{
+			continue;
+		}
+		Moved += Carried * Weight;
+		Blended += float3x3(R0.xyz, R1.xyz, R2.xyz) * Weight;
+		Total += Weight;
+	}
+	if (!(Total > Eps))
+	{
+		// Carried by nothing: it stays where the bind pose left it.
+		Moved = Rest;
+		Blended = float3x3(1, 0, 0, 0, 1, 0, 0, 0, 1);
+		AlongU = 0.0;
+		AlongV = 0.0;
+		GradientSum = 0.0;
+	}
+	// Relative to the blended point, which keeps a cloud far from its origin exact.
+	AlongU -= Moved * GradientSum.x;
+	AlongV -= Moved * GradientSum.y;
+
+	// THE FRAME: the Jacobian's columns on the rest axes, the covariance's
+	// in-plane eigenvectors and sizes (splat_skin.slang).
+	const float3x3 Axes = AxesOfQuaternion(RestQ);
+	const float3 RestU = float3(Axes[0][0], Axes[1][0], Axes[2][0]);
+	const float3 RestV = float3(Axes[0][1], Axes[1][1], Axes[2][1]);
+	const float3 RestN = float3(Axes[0][2], Axes[1][2], Axes[2][2]);
+	const float3 MovedU = (mul(Blended, RestU) + AlongU) * Scale.x;
+	const float3 MovedV = (mul(Blended, RestV) + AlongV) * Scale.y;
+	const float LengthU = length(MovedU);
+	const float3 E1 = LengthU > 1.0e-20 ? MovedU / LengthU : RestU;
+	float3 E2 = MovedV - E1 * dot(E1, MovedV);
+	const float Across = length(E2);
+	E2 = Across > 1.0e-20 * max(length(MovedV), 1.0e-20) && Across > 1.0e-30 ? E2 / Across : normalize(cross(RestN, E1) + float3(1.0e-6, 0.0, 0.0));
+	const float K00 = LengthU;
+	const float K01 = dot(E1, MovedV);
+	const float K11 = dot(E2, MovedV);
+	const float C00 = K00 * K00 + K01 * K01;
+	const float C01 = K01 * K11;
+	const float C11 = K11 * K11;
+	const float Mean = 0.5 * (C00 + C11);
+	const float Spread = 0.5 * (C00 - C11);
+	const float Radius = sqrt(Spread * Spread + C01 * C01);
+	const float Major = Mean + Radius;
+	const float Determinant = K00 * K11;
+	const float Minor = Major > 0.0 ? Determinant * Determinant / Major : 0.0;
+	float Angle = abs(C01) > 1.0e-6 * (C00 + C11) ? 0.5 * atan2(2.0 * C01, C00 - C11) : (C00 >= C11 ? 0.0 : 1.5707963);
+	float SizeU = sqrt(Major);
+	float SizeV = sqrt(Minor);
+	if (abs(Angle) > 0.78539816)
+	{
+		Angle -= Angle > 0.0 ? 1.5707963 : -1.5707963;
+		SizeU = sqrt(Minor);
+		SizeV = sqrt(Major);
+	}
+	const float Cosine = cos(Angle);
+	const float Sine = sin(Angle);
+	const float3 U = normalize(E1 * Cosine + E2 * Sine);
+	const float3 V = normalize(E2 * Cosine - E1 * Sine);
+	const float3 N = cross(U, V);
+	const float3x3 Frame = float3x3(U.x, V.x, N.x, U.y, V.y, N.y, U.z, V.z, N.z);
+	const float4 Q = QuaternionOfAxes(Frame);
+	const float3 Posed = float3(SizeU > 1.0e-20 ? SizeU : Scale.x, SizeV > 1.0e-20 ? SizeV : Scale.y, Scale.z);
+
+	// THE OTHER PARTS' SHADOW on this gaussian, from where it stands now.
+	if (VisibilityParts > 0u)
+	{
+		float2 Through = 1.0;
+		const uint Own = PartOf[At];
+		for (uint Part = 0; Part < VisibilityParts; ++Part)
+		{
+			if (Part == Own)
+			{
+				continue;   // a part does not shadow itself (athenea's visFactors)
+			}
+			const float4 F0 = PartFrames[Part * 3u], F1 = PartFrames[Part * 3u + 1u], F2 = PartFrames[Part * 3u + 2u];
+			const float3 p = float3(dot(F0.xyz, Moved) + F0.w, dot(F1.xyz, Moved) + F1.w, dot(F2.xyz, Moved) + F2.w);
+			if (SunDirection.w > 0.0)
+			{
+				const float3 w = normalize(float3(dot(F0.xyz, SunDirection.xyz), dot(F1.xyz, SunDirection.xyz), dot(F2.xyz, SunDirection.xyz)));
+				Through.x *= GSFieldAt(Part, p, w, false);
+			}
+			Through.y *= GSFieldAt(Part, p, float3(0, 0, 1), true);
+		}
+		OutVisibility[At] = Through;
+	}
+
+	// Into the component's space, as GSSplatData.ush unpacks a packed cloud.
+	OutPositions[At] = ToLocal(Moved) * UnitsToCm;
+	OutScales[At] = abs(ToLocal(Posed)) * (UnitsToCm / 100.0f);
+	const float Handed = dot(cross(FileAxisX, FileAxisY), FileAxisZ);
+	OutOrientations[At] = normalize(float4(ToLocal(Q.xyz), Handed > 0.0f ? -Q.w : Q.w));
+}

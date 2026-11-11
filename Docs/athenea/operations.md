@@ -111,6 +111,17 @@ opens (and in an unattended import, which has no dialogue):
 A PLY without that comment takes upstream's defaults: swizzle (Z, X, −Y),
 which suits COLMAP's y-down captures, scale 100 and no gamma.
 
+**Relit PLY clouds.** Upstream's relit route -- a cloud written into UE's
+GBuffer and shaded by its lights, where a TX cloud is lit by the plugin
+itself -- needs normals and metallic/roughness, which the dialogue's
+options import (normals; metallic/roughness read, or filled with defaults,
+0 and 1). An unattended import has no dialogue: a script passes them as an
+`AssetImportTask`'s `options`, a `GSplatImportData` with `import_normals`,
+`import_metallic_roughness`, `populate_mr_with_default`,
+`metallic_default_value` and `roughness_default_value`
+(`Tools/athenea/setup_files.py FILE!relit`). Without them the cloud is drawn
+with its baked colour and no light changes it.
+
 ### 4.3 USD stages
 
 What is read, from the stage's first `ParticleField3DGaussianSplat`:
@@ -145,11 +156,22 @@ What is read, from the stage's first `ParticleField3DGaussianSplat`:
 | `primvars:athenea:volume:emission` (constant) | radiance of the absorbing part, times 1 − albedo (default none) |
 | `primvars:athenea:volume:emissionScale` (constant) | a gaussian glows as a black body at its temperature times this (default 0: no fire) |
 | `primvars:athenea:volume:temperatureScale`, `:temperatureOffset` (constant) | kelvin a unit of the file's temperature, and kelvin added (defaults 1 and 0) |
+| `primvars:athenea:splat:transferZonal` | where there is no `transferDirect`: the direct half as two zonal lobes in each gaussian's own frame, 10 values a gaussian; turned each frame by the gaussian's current rotation (§6.0.1). No indirect half |
+| `primvars:athenea:splat:emission` | with a transfer: color3f a gaussian, linear, the light it gives off, added to its lit body |
+| `primvars:athenea:splat:lightLayer:<group>`, `:lightLayer:emission:<group>` | color3f a gaussian, linear, per unit of the group's radiance: the lamps' layers (§6.0.2), at most 16 |
+| `LightGroups` scope's children: `athenea:lightGroup:emissionLuminance`, `:emissionColor`, `:initialOn` (`:radiance`, `:color` where missing) | each group's level when imported |
+| `primvars:athenea:edit:*` (AtheneaSplatEditAPI on the field or the nearest prim above it) | the splat edit (§6.0.3), brought to the component's space |
+| `primvars:skel:jointIndices`, `:jointWeights` (or `primvars:athenea:splat:jointIndices`, `:jointWeights`), `primvars:skel:geomBindTransform` | the skeleton that carries the cloud: the influences a gaussian (`elementSize`) and the bind transform (§6.0.1) |
+| `primvars:athenea:splat:catcher` | with a transfer: a shadow catcher (§6.0.5) |
+| `primvars:athenea:splat:lightCatcher` | a light catcher: its lamps' layers alone, added over what is behind it (§6.0.5) |
+| `primvars:athenea:splat:cryptoObject`, `:cryptoManifest` | Cryptomatte: an id a gaussian and the prims they name (§6.0.6) |
+| `primvars:athenea:anisotropy` (constant) | a medium's Henyey-Greenstein g (default 0) |
+| `primvars:athenea:splat:metallic` with `:roughness`, no transfer | the relit route's material, beside the normal, where the import window's *Metallic/Roughness* is checked |
+| `primvars:athenea:splat:visibilityParts`, `:visibilityTexels`, `:visibilityAmbient`, `:visibilityPartOf` | a skinned cloud's parts' baked visibility (§6.0.5) |
+| `primvars:athenea:splat:jointWeightGradients` | half[], the weights' gradients in each gaussian's rest axes, (influences − 1) × 2 a gaussian |
+| `primvars:athenea:splat:skinningXforms` | matrix4d[] a joint, at each time code: the poses the cloud plays |
 | stage `upAxis` | `Y` → (X, Z, Y); `Z` → (X, −Y, Z) |
 | stage `metersPerUnit` | positions times it times 100 |
-
-Not read yet from a TX cloud: emission, and the zonal transfer of a skinned
-cloud.
 
 Values are read at the earliest time sample, so a cloud whose arrays are
 animated imports its first frame. The prim's own transform is not applied;
@@ -244,6 +266,7 @@ cloud with levels is culled every frame, whatever its clipping volumes.
 | `r.Gaussians.Debug.CullEveryFrame` | `false` | upstream's, for debugging: the culling against clipping volumes runs every frame, not only when something moved |
 | `r.Gaussians.Debug.DisableViewExtension` | `false` | upstream's, for debugging: the view extension draws nothing in the primary view |
 | `r.Gaussians.Athenea.LogSplats` | `0` | `1` logs the splats each frame sends to the rasteriser (`athenea: splats drawn N lit, M unlit, LodPixels xF`), a frame or two late: what the cut is checked by |
+| `r.Gaussians.Athenea.Surfels` | `1` | `1` draws a surfel (a gaussian with a zero scale) where each pixel's ray meets its disc; `0` draws the thin gaussian it projects to. Costs 16 bytes a drawn splat, and only where a cloud in the view holds a surfel -- a `.athc` or `.athz` with levels counts, its flat merges being surfels: the town's flight 14.0 ms against 12.35 with `0` (§17) |
 
 A merged group is drawn with the kernel athenea gives it: an opacity D over 1
 is Spark's harder kernel, 1 − (1 − g)^A with A = exp((D² − 1)/e), a flat top
@@ -251,6 +274,18 @@ reaching past three deviations, and its quad is widened by 0.7 (D − 1)
 deviations; a gaussian with a zero scale (a flat disc) gives back the third
 of a pixel of dilation as athenea's `surfelPaid` does, its opacity times its
 disc's area over the area drawn, so that one seen edge on is not drawn.
+
+A surfel is drawn as a disc, from the ray through each pixel (athenea's
+`surfelPower`, Huang et al. 2024's ray-splat intersection): the squared
+radius in the disc's own axes where the ray crosses its plane, against a
+screen filter of half a pixel squared round its centre, the larger of the
+two. Seen at a slant, its edge is where perspective puts it, not where the
+affine projection of a thin gaussian does; its quad is widened by half again
+and by the filter's variance to hold it. A hard surfel
+(`primvars:athenea:splat:hardness`, p over 2; 2 the gaussian) is drawn as
+exp(−(|u|^p + |v|^p)/2) in its axes, widened from its stored, moment-matched
+scale to the box it stands for, and held at 1 out to where it would fall to
+a half, so two side by side meet without a seam.
 
 A version 3 file's paged tree (a web scene's `.athz` pages) is cut every frame
 as athenea's `lod_tree_cut.slang` cuts it: each node's parent is named at the
@@ -279,10 +314,17 @@ pawn's glass top: 82,892 and 292,056 splats at sixteen times the framing
 distance), where an opaque TX piece still coarsens (close.athz: 1,197 of
 404,092).
 
+A version 3 file's merged levels (kind 0 blocks, coarsest first, as opposed
+to a paged tree) are read after its chunks, as a version 2 file lays them,
+and cut every frame the same way: the two words a gaussian the cut reads are
+written on the device from CORE's tail (a splat's finest group, a group's
+octree cell) and its block's level (`GSAthc3LodCS`), in any of CORE's
+encodings. A skinned version 3 file is drawn from its splats alone: its
+levels are not read (the import log says so).
+
 Not done for the levels: streaming (every chunk is in the asset; nothing is
-loaded as the cut asks), a version 3 file's merged levels (kind 0 blocks, as
-opposed to a paged tree), and the paged tree's guards (athenea's relaxed
-share for a merge across a colour edge).
+loaded as the cut asks), and the paged tree's guards (athenea's relaxed share
+for a merge across a colour edge).
 
 ### 4.5 `.splat`, `.spz`, `.sog` and glTF files
 
@@ -374,11 +416,20 @@ Before anything is decoded the header's CRC-32 (over its first 60 bytes) and
 each page's (over its layers' bytes, in layer order) are checked: a corrupt
 or cut file is refused, naming the page (`page N is corrupt`).
 
-Not read: layer K (a skinned cloud's rig), and a file that is a prefix of
-its bands (refused: its splats are not all there). A CPCA transfer whose
+Layer K (a skinned cloud's rig) is read: the splats' influences decoded with
+them, the frames' joints taken at 30 time codes a second, and the cloud's
+merged levels not drawn while it is skinned (§6.0.1). Not read: a file that
+is a prefix of its bands (refused: its splats are not all there). A CPCA transfer whose
 basis does not match the asset table (256 clusters or fewer, 8 axes a block,
 112 values, the bytes in the file) is refused (`a CPCA transfer whose basis
 does not add up`).
+
+**Up axis.** Neither a `.athz` nor a `.athc` records its up axis: both are
+read as y-up, swizzle (X, Z, Y). A file written from a right-handed z-up
+stage (athenea's sparrow) is imported with `GSplatImportData.file_z_up`
+true in an `AssetImportTask`'s `options` (§4.2), swizzle (X, −Y, Z); a
+reimport keeps the asset's own. The skin, the zonal transfer and the sky
+follow, since they work in the file's frame.
 
 ### 4.5.2 A web scene's `.athz`
 
@@ -590,6 +641,122 @@ frame is its own asset on the GPU; the component switches which one it draws.
 `Tools/athenea/setup_sequence.py` imports a folder of frames into one, and
 `capture_sequence.py` renders frames of it (§7.1).
 
+### 6.0.1 A cloud a skeleton carries
+
+An asset imported from a stage `athenea mesh2splat --skinned` wrote keeps its
+bind pose in the file's space, the four joints of each gaussian, the weights'
+gradients and the joints' transforms at each authored time code. Each frame,
+before the shadows and the cut, a compute pass (`GSSkin.usf`, athenea's
+`splat_skin.slang` rule for rule) poses it: the position by the linear blend,
+the frame by the whole Jacobian of that blend, the elastic term of the
+weights' gradients included, so a gaussian stretches with its triangle. A
+zonal transfer (`transferZonal`) is turned by that posed frame, so the light
+turns with the limb.
+
+The component plays the poses (*Gaussian Splats | Skeleton*):
+`bSkinPlaying` (default on), `bSkinLoop` (default on, else it holds the last
+pose), `SkinRate` (default 1) and `SkinTime` (seconds into the poses, keyable
+in Sequencer with `bSkinPlaying` off); `SetSkinTime` from Blueprints or
+Python. Between two sampled poses the joints' transforms are blended row by
+row. Components that share a skinned asset share its pose: the last one
+asked is drawn by all. The skeleton is the stage's, not a UE Skeleton; the
+cloud's bounds are its bind pose's. A rig is read from USD, from a version 3
+`.athc`'s `SKIN` and `ATSK`, and from an `.athz`'s layer K.
+
+### 6.0.2 Lamps
+
+A cloud whose stage carries light layers (`athenea lights merge`: one layer a
+group of lamps, the light each gaussian sends out from that group at a
+radiance of one) adds each layer times its group's weight, after whatever
+else lights it, as athenea's `lampLight` does. The asset lists its groups
+(`LightLayerNames`) and the levels the stage leaves them at
+(`LightLayerDefaults`). The component's *Gaussian Splats | Lamps*:
+`LightGroups`, a group each (`Name`, `Color`, `Intensity`, `bOn`; its weight
+is colour × intensity, 0 where off); a group of the asset's that the list
+does not name is drawn at its stage level. *Fill Light Groups From Asset*
+lists them; `SetLightGroup(Name, Color, Intensity, bOn)` changes one from
+Blueprints or Python without re-creating the render state. A group's
+`emission:` layer follows the group. On the device a layer is a word a
+gaussian (RGB9E5 times 2^14), as in athenea.
+
+### 6.0.3 Splat edit
+
+athenea's SplatEdit (`AtheneaSplatEditAPI`), rule for rule, over a cloud:
+the filters wherever the volume is (opacity below `MinOpacity`, longest scale
+above `MaxScale` in centimetres: gone), then a box of half extents `Size` or
+a sphere of radius `Size.X` around `Centre`, in the component's local
+centimetres. `Keep` drops what is outside, `Remove` what is inside, `Grade`
+nothing; `bInvert` turns the test round. What is inside and kept has its
+opacity times `Opacity` (gone below 1/255) and its colour, in linear light,
+times `Tint` × `Brightness`, then lerped from its Rec.709 luminance by
+`Saturation`. The component's `Edit` (*Gaussian Splats | Edit*), when
+`bActive`, replaces the one the stage carried (the asset's `Edit`). The
+clipping volumes (§6) are UE's own and still apply.
+
+### 6.0.4 Emission
+
+A TX cloud whose gaussians carry emission (`.athc` and `.athz` flag bit 2,
+RGB9E5; USD `primvars:athenea:splat:emission`) adds it to the lit body, as
+athenea's `relitSplat` starts from it: what a lamp's shade or a screen gives
+off stays lit whatever the sky.
+
+### 6.0.5 Local lights, shadow catchers and the parts' shadow
+
+A TX cloud is also lit by the scene's point, spot and rect lights: the
+nearest eight to the view, each with UE's own attenuation (so a gaussian
+beside a mesh is lit as the mesh is), shading the body and a GGX lobe and
+shadowed by the gaussian's open directions along the light where the cloud
+keeps them. A rect light is taken from its centre. The directional light is
+the sun the sky's projection carries (§6.1).
+
+A shadow catcher (`mesh2splat --shadow-catcher`, `primvars:athenea:splat:catcher`)
+is drawn black at the opacity that leaves what the object does not take of
+the sky over its open cells and of the sun; with no cells it draws nothing.
+
+A light catcher (`mesh2splat --light-catcher`, `primvars:athenea:splat:lightCatcher`)
+draws its lamps' layers alone (§6.0.2), added over whatever is behind it and
+covering nothing. Neither kind of catcher casts into UE's shadow maps.
+
+A medium's sun and local lights scatter at its Henyey-Greenstein phase
+(`VolumeAnisotropy`, from `primvars:athenea:anisotropy`), halved an octave as
+athenea halves it; the sky's light stays isotropic.
+
+A skinned cloud whose stage carries its parts' baked visibility (`athenea
+visibility`) has each part shadowed by the others as posed: its sky by the
+fields' probe means, its sun (the scene's first directional light) by their
+maps, read where each other part was baked.
+
+### 6.0.5.1 Translucent shadows
+
+`r.Gaussians.Athenea.TranslucentShadows 1` makes every gaussian cast into
+UE's shadow maps as opaque as it is, where by default only those at least 0.9
+opaque cast, whole: each pixel of a gaussian passes the shadow material's
+mask with probability its falloff times its opacity (a stochastic mask the
+shadow's filter averages). It is read when a cloud's resource is made (set it
+before the level loads, or re-import). `r.Gaussians.Athenea.ShadowClip` is the
+shadow material's opacity mask clip value it scales against (default 0.3333).
+A medium casts no shadow either way.
+
+A gaussian's quad in a shadow map is pushed away from the light by
+`r.Gaussians.Athenea.ShadowPush` of its deviations along the shadow view
+(default 8; a surfel facing the light counts half its widest axis), read when
+a cloud's resource is made. A relit surface lies at the blend's depth, which
+half its gaussians are in front of: unpushed, they shadowed it in a grain of
+dark pixels under virtual shadow maps (the pawn under a sun at 45 degrees;
+at 2 deviations some remained, at 8 none, and the shadows between its parts
+stay where they are).
+
+### 6.0.6 Cryptomatte
+
+A cloud converted with ids (`primvars:athenea:splat:cryptoObject`, the hash
+of the prim each gaussian came from, and the manifest naming them) keeps them;
+the asset lists the prims (`CryptoNames`, `CryptoHashes`).
+`r.Gaussians.Athenea.CryptoView 1` draws each gaussian in its id's colour (its
+three low bytes), which Movie Render Queue renders as an ID pass with the
+console variable set in its settings. A component's `MatteIsolate` (*Gaussian
+Splats | Matte*: a prim path from the manifest, or its last name) draws that
+prim's gaussians alone, for a matte or a hold-out.
+
 ### 6.1 The sky a TX cloud is lit by
 
 - The level's **sky light**, with a **specified cubemap** (an HDRI imported as
@@ -650,7 +817,7 @@ frame is its own asset on the GPU; the component switches which one it draws.
 | | `100` to `115` | coefficient `n − 100` of the projected sky, plus 4 |
 | `r.Gaussians.Athenea.Residual` | `1` (default) | a TX cloud reflects the sky without its sun and the sun analytically |
 | | `0` | it reflects the sky light's own prefiltered cube, sun included |
-| `r.Gaussians.Athenea.LogSky` | `1` | the next TX cloud's projected sky is read back from the GPU and logged once (`LogTemp: athenea sky: 0:(r g b) ...`); it sets itself back to 0 |
+| `r.Gaussians.Athenea.LogSky` | `1` | the next TX cloud's projected sky is read back from the GPU and logged once (`LogTemp: athenea sky: 0:(r g b) ...`), or why there is none (`athenea: no sky to light TX clouds: ...`); it sets itself back to 0 where it was set by code. `2` logs each frame what the sky lookup found (`athenea: sky lookup: ...`) |
 
 ## 7. Rendering and timing without a window
 

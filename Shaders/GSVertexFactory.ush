@@ -98,6 +98,20 @@ FPrimitiveSceneData GetPrimitiveData(FVertexFactoryIntermediates Intermediates)
     return Intermediates.SceneData.Primitive;
 }
 
+// athenea: a gaussian's quad in a shadow map pushed from the light by
+// ShadowPush deviations along the shadow view's z (centimetres), so a surface
+// is not shadowed by the gaussians it is made of: it lies at the blend's
+// depth, which half of them are in front of. A surfel facing the light has
+// no depth along it, so half its widest axis stands in -- the gap to the next
+// disc it overlaps. Every shadow view (a directional light's, a virtual
+// shadow map's page, a spot's) looks along its own z.
+float3 GSShadowPush(float3x3 Covariance3D, float3 Scale, float3x3 ViewToWorld)
+{
+	const float3 Away = normalize(ViewToWorld[2]);
+	const float Along = max(sqrt(max(dot(Away, mul(Covariance3D, Away)), 0.0f)), 0.5f * max(max(Scale.x, Scale.y), Scale.z)) * 100.f;
+	return Away * (GSResources.ShadowPush * Along);
+}
+
 float3x3 VecToScaleMatrix(in float3 Scale)
 {
     return float3x3(
@@ -215,6 +229,7 @@ ComputeSplatParameters(
         float4 TranslatedMeanPosition = TransformLocalToTranslatedWorld(MeanPosition, Primitive.LocalToWorld);
 
         OutWorldPosition = float4(TranslatedMeanPosition.xyz + worldOffset.xyz, 1);
+        OutWorldPosition.xyz += GSShadowPush(Covariance3D, GSScl(SplatIndex), (float3x3) ViewToTranslatedWorld);
 
         OutConic = Conic;
         OutWorldNormal = RotateLocalToWorld(GSResources.Normals[SplatIndex], Primitive.LocalToWorld, Primitive.InvNonUniformScale);
@@ -296,6 +311,7 @@ ComputeSplatParameters(
             worldOffset /= worldOffset.w;
 
             OutWorldPosition = float4(TranslatedWorldPositionNaniteView + worldOffset.xyz - DFFastSubtractDemote(PreViewTranslation, ResolvedView.PreViewTranslation), 1);
+            OutWorldPosition.xyz += GSShadowPush(Covariance3D, GSScl(SplatIndex), (float3x3) ViewToTranslatedWorld);
             OutConic = Conic;
             OutWorldNormal = RotateLocalToWorld(GSResources.Normals[SplatIndex], Primitive.LocalToWorld, Primitive.InvNonUniformScale);
 		}
@@ -347,7 +363,9 @@ FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput In
     // athenea: a medium's gaussians (an optical depth, not an opacity) cast
     // no opaque shadow; their shadow on the scene is athenea-research's
     // proposal 108, not done.
-    if (GSShOp(SplatIndex).w < 0.9 || GSResources.VolumeOn != 0u)
+    // athenea: with translucent shadows every gaussian casts (ShadowCut 1/255),
+    // each pixel of it passing the mask as often as it is opaque there.
+    if (GSShOp(SplatIndex).w < GSResources.ShadowCut || GSResources.VolumeOn != 0u)
     {
         Intermediates.WorldPosition = float4(0, 0, 0, 0);
         Intermediates.Conic = float3(0, 0, 0);
@@ -643,7 +661,18 @@ FMaterialPixelParameters GetMaterialPixelParameters(FVertexFactoryInterpolantsVS
 #endif	//NUM_MATERIAL_TEXCOORDS
 
 	//Result.VertexColor = float4(Alpha, 1, 1, 1);
-	Result.VertexColor = float4(Interpolants.Conic, Interpolants.Opacity);
+	// athenea: TRANSLUCENT SHADOWS (stochastic): the shadow material passes a
+	// pixel where its gaussian times opacity is over its clip value c; handed
+	// opacity c / u for a u uniform in (0, 1] a pixel, it passes with
+	// probability gaussian x opacity, so a gaussian a tenth opaque shadows a
+	// tenth of what it covers and the shadow's filtering averages it.
+	float Opacity = Interpolants.Opacity;
+	if (GSResources.ShadowCut < 0.9f)
+	{
+		const float u = max(InterleavedGradientNoise(SvPosition.xy, View.StateFrameIndexMod8), 1.0e-3f);
+		Opacity = Opacity * GSResources.ShadowClip / u;
+	}
+	Result.VertexColor = float4(Interpolants.Conic, Opacity);
     Result.PrimitiveId = GetPrimitiveId(Interpolants);
       
     return Result;

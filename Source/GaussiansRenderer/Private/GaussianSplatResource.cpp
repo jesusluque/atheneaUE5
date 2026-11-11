@@ -2,6 +2,7 @@
 #include "HAL/IConsoleManager.h"
 
 #include "GaussianData.h"
+#include "GaussianSplatInterface.h"
 #include "RenderingThread.h"
 #include "RHICommandList.h"
 #include "RHIResourceUtils.h"
@@ -224,6 +225,42 @@ class FGSAthzLodCS : public FGlobalShader
 };
 IMPLEMENT_GLOBAL_SHADER(FGSAthzLodCS, "/Plugin/StarLightGS/GSDecode.usf", "GSAthzLodCS", SF_Compute);
 
+// athenea: a .athc v3's levels of detail, two words a gaussian from CORE's
+// tails and its block's LOD word.
+class FGSAthc3LodCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FGSAthc3LodCS);
+	SHADER_USE_PARAMETER_STRUCT(FGSAthc3LodCS, FGlobalShader);
+	using FParameters = FGSDecodeFileParameters;
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+};
+IMPLEMENT_GLOBAL_SHADER(FGSAthc3LodCS, "/Plugin/StarLightGS/GSDecode.usf", "GSAthc3LodCS", SF_Compute);
+
+// athenea: an .athz's layer K, the splats' influences and gradients lifted
+// from the decode's scratch into the skin's buffers.
+class FGSAthzSkinCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FGSAthzSkinCS);
+	SHADER_USE_PARAMETER_STRUCT(FGSAthzSkinCS, FGlobalShader);
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER(uint32, Offset)
+		SHADER_PARAMETER(uint32, Count)
+		SHADER_PARAMETER(uint32, InfluenceAt)
+		SHADER_PARAMETER(uint32, GradientAt)
+		SHADER_PARAMETER_UAV(RWByteAddressBuffer, Scratch)
+		SHADER_PARAMETER_UAV(RWStructuredBuffer<uint>, OutInfluences)
+		SHADER_PARAMETER_UAV(RWStructuredBuffer<uint>, OutGradients)
+	END_SHADER_PARAMETER_STRUCT()
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+};
+IMPLEMENT_GLOBAL_SHADER(FGSAthzSkinCS, "/Plugin/StarLightGS/GSDecode.usf", "GSAthzSkinCS", SF_Compute);
+
 // athenea: a .athc v3 TX cloud's streams into the transfer's buffers.
 class FGSDecodeAthc3TxCS : public FGlobalShader
 {
@@ -246,6 +283,7 @@ class FGSDecodeAthc3TxCS : public FGlobalShader
 		SHADER_PARAMETER_UAV(RWStructuredBuffer<uint>, OutCells)
 		SHADER_PARAMETER_UAV(RWStructuredBuffer<float>, OutField)
 		SHADER_PARAMETER_UAV(RWStructuredBuffer<float>, OutCurvature)
+		SHADER_PARAMETER_UAV(RWStructuredBuffer<float>, OutEmission)
 	END_SHADER_PARAMETER_STRUCT()
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
 	{
@@ -254,6 +292,66 @@ class FGSDecodeAthc3TxCS : public FGlobalShader
 };
 IMPLEMENT_GLOBAL_SHADER(FGSDecodeAthc3TxCS, "/Plugin/StarLightGS/GSDecode.usf", "GSDecodeAthc3TxCS", SF_Compute);
 
+
+// athenea: a skinned cloud posed (GSSkin.usf).
+class FGSSkinCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FGSSkinCS);
+	SHADER_USE_PARAMETER_STRUCT(FGSSkinCS, FGlobalShader);
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER(uint32, Count)
+		SHADER_PARAMETER(uint32, PerSplat)
+		SHADER_PARAMETER(uint32, GradientsIn)
+		SHADER_PARAMETER(float, UnitsToCm)
+		SHADER_PARAMETER(FVector3f, FileAxisX)
+		SHADER_PARAMETER(FVector3f, FileAxisY)
+		SHADER_PARAMETER(FVector3f, FileAxisZ)
+		SHADER_PARAMETER_SRV(StructuredBuffer<float3>, RestPositions)
+		SHADER_PARAMETER_SRV(StructuredBuffer<float4>, RestRotations)
+		SHADER_PARAMETER_SRV(StructuredBuffer<float3>, RestScales)
+		SHADER_PARAMETER_SRV(StructuredBuffer<uint>, Influences)
+		SHADER_PARAMETER_SRV(StructuredBuffer<uint>, Gradients)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, SkinXforms)
+		SHADER_PARAMETER_UAV(RWStructuredBuffer<float3>, OutPositions)
+		SHADER_PARAMETER_UAV(RWStructuredBuffer<float3>, OutScales)
+		SHADER_PARAMETER_UAV(RWStructuredBuffer<float4>, OutOrientations)
+		SHADER_PARAMETER(uint32, VisibilityParts)
+		SHADER_PARAMETER(FVector4f, SunDirection)
+		SHADER_PARAMETER_SRV(StructuredBuffer<float4>, Parts)
+		SHADER_PARAMETER_SRV(StructuredBuffer<uint>, PartOf)
+		SHADER_PARAMETER_SRV(StructuredBuffer<uint>, Texels)
+		SHADER_PARAMETER_SRV(StructuredBuffer<uint>, Ambient)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, PartFrames)
+		SHADER_PARAMETER_UAV(RWStructuredBuffer<float2>, OutVisibility)
+	END_SHADER_PARAMETER_STRUCT()
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+};
+IMPLEMENT_GLOBAL_SHADER(FGSSkinCS, "/Plugin/StarLightGS/GSSkin.usf", "GSSkinCS", SF_Compute);
+
+// athenea: translucent shadows (GSVertexFactory.ush): every gaussian casts,
+// each pixel as often as it is opaque there, rather than the opaque ones alone.
+static TAutoConsoleVariable<int32> CVarGaussiansAtheneaTranslucentShadows(
+	TEXT("r.Gaussians.Athenea.TranslucentShadows"),
+	0,
+	TEXT("1: every gaussian casts a shadow as opaque as it is (a stochastic mask the shadow's filter averages); 0: only those at least 0.9 opaque, whole. Read when a cloud's resource is made."),
+	ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarGaussiansAtheneaShadowClip(
+	TEXT("r.Gaussians.Athenea.ShadowClip"),
+	0.3333f,
+	TEXT("The splats' shadow material's opacity mask clip value, which translucent shadows scale against."),
+	ECVF_RenderThreadSafe);
+// athenea: how far a gaussian's quad in a directional light's shadow map is
+// pushed from the light, in its own deviations along the light: the surface
+// it shades lies at the blend's depth, which half its gaussians are in front
+// of, and unpushed they shadow it in a grain of dots (self-shadow acne).
+static TAutoConsoleVariable<float> CVarGaussiansAtheneaShadowPush(
+	TEXT("r.Gaussians.Athenea.ShadowPush"),
+	8.0f,
+	TEXT("A gaussian's shadow in a directional light pushed away from the light by this many of its deviations along it (0: at its centre). Read when a cloud's resource is made."),
+	ECVF_RenderThreadSafe);
 
 IMPLEMENT_UNIFORM_BUFFER_STRUCT(FGaussianSplatShaderResources, "GSResources")
 IMPLEMENT_UNIFORM_BUFFER_STRUCT(FGaussianSplatPrimitiveShaderResources, "GSPrimitiveResources")
@@ -334,6 +432,25 @@ void FGaussianSplatResource::InitRHI(FRHICommandListBase& RHICmdList)
 			.SetType(FRHIViewDesc::EBufferType::Structured)
 			.SetStride(BytesPerElement));
 
+		return FBufferResources{ Buffer, SRV };
+	};
+
+	// athenea: a buffer the device writes after it is made (a skinned cloud's pose).
+	auto CreateWritable = [&]<typename T>(const TArray<T>& Source, const TCHAR* DebugName, FUnorderedAccessViewRHIRef& OutUAV)
+	{
+		const uint32 Stride = Source.GetTypeSize();
+		const FRHIBufferCreateDesc CreateDesc =
+			FRHIBufferCreateDesc::CreateStructured(DebugName, Stride * Source.Num(), Stride)
+			.AddUsage(EBufferUsageFlags::ShaderResource | EBufferUsageFlags::UnorderedAccess)
+			.SetInitialState(ERHIAccess::SRVMask)
+			.SetInitActionInitializer();
+		FRHIBufferInitializer Initializer = RHICmdList.CreateBufferInitializer(CreateDesc);
+		Initializer.WriteData(Source.GetData(), Stride * Source.Num());
+		FBufferRHIRef Buffer = Initializer.Finalize();
+		FShaderResourceViewRHIRef SRV = RHICmdList.CreateShaderResourceView(Buffer,
+			FRHIViewDesc::CreateBufferSRV().SetType(FRHIViewDesc::EBufferType::Structured).SetStride(Stride));
+		OutUAV = RHICmdList.CreateUnorderedAccessView(Buffer,
+			FRHIViewDesc::CreateBufferUAV().SetType(FRHIViewDesc::EBufferType::Structured).SetStride(Stride));
 		return FBufferResources{ Buffer, SRV };
 	};
 
@@ -429,7 +546,9 @@ void FGaussianSplatResource::InitRHI(FRHICommandListBase& RHICmdList)
 		// An .athz's levels' words, written by the device (GSAthzLodCS) where
 		// a .athc's come from the file.
 		FUnorderedAccessViewRHIRef AthzLodUAV;
-		if (!bAthenea && SplatData.PackedFormat == 6 && SplatData.LodLevels > 0 && S.Num() > 8)
+		// A .athc v3's likewise, from its blocks (GSAthc3LodCS).
+		const bool bAthc3Lod = SplatData.PackedFormat == 5 && SplatData.LodLevels > 0 && SplatData.LodWords.IsEmpty();
+		if (!bAthenea && ((SplatData.PackedFormat == 6 && SplatData.LodLevels > 0 && S.Num() > 8) || bAthc3Lod))
 		{
 			const FRHIBufferCreateDesc LodDesc =
 				FRHIBufferCreateDesc::CreateStructured(TEXT("GaussianSplatLodWords"), Count * 2u * 4u, 4u)
@@ -544,6 +663,16 @@ void FGaussianSplatResource::InitRHI(FRHICommandListBase& RHICmdList)
 			if (bAthc3)
 			{
 				FComputeShaderUtils::Dispatch(Immediate, TShaderMapRef<FGSDecodeAthc3CS>(GetGlobalShaderMap(GMaxRHIFeatureLevel)), Parameters, Groups);
+				if (bAthc3Lod && AthzLodUAV.IsValid())
+				{
+					FGSDecodeFileParameters LodParameters = Parameters;
+					LodParameters.OutLodWords = AthzLodUAV;
+					FComputeShaderUtils::Dispatch(Immediate, TShaderMapRef<FGSAthc3LodCS>(GetGlobalShaderMap(GMaxRHIFeatureLevel)), LodParameters, Groups);
+					if (Offset + Batch >= Count)
+					{
+						Immediate.Transition(FRHITransitionInfo(AthzLodUAV, ERHIAccess::UAVCompute, ERHIAccess::SRVMask));
+					}
+				}
 			}
 			else if (SplatData.PackedFormat == 1)
 			{
@@ -568,7 +697,8 @@ void FGaussianSplatResource::InitRHI(FRHICommandListBase& RHICmdList)
 		if ((SplatData.PackedFormat == 5 || SplatData.PackedFormat == 6) && SplatData.bHasTransfer)
 		{
 			const uint32 Stride = 4u * SplatData.TransferDirectCount;
-			FUnorderedAccessViewRHIRef TransferUAV, MetallicUAV, SurfaceUAV, CellsUAV, FieldUAV, CurvatureUAV;
+			FUnorderedAccessViewRHIRef TransferUAV, MetallicUAV, SurfaceUAV, CellsUAV, FieldUAV, CurvatureUAV, EmissionUAV;
+			PackedEmission = CreateDecoded(sizeof(float), SplatData.bPackedEmission ? Count * 3u : 1u, TEXT("GaussianSplatEmission"), EmissionUAV);
 			PackedCurvature = CreateDecoded(sizeof(float), SplatData.bPackedCurvature ? Count * 3u : 1u, TEXT("GaussianSplatCurvature"), CurvatureUAV);
 			PackedTransfer = CreateDecoded(sizeof(float), Count * Stride, TEXT("GaussianSplatTransfer"), TransferUAV);
 			PackedMetallic = CreateDecoded(sizeof(float), Count, TEXT("GaussianSplatTransferMetallic"), MetallicUAV);
@@ -594,6 +724,7 @@ void FGaussianSplatResource::InitRHI(FRHICommandListBase& RHICmdList)
 				Parameters.OutCells = CellsUAV;
 				Parameters.OutField = FieldUAV;
 				Parameters.OutCurvature = CurvatureUAV;
+				Parameters.OutEmission = EmissionUAV;
 				FComputeShaderUtils::Dispatch(Immediate, TShaderMapRef<FGSDecodeAthc3TxCS>(GetGlobalShaderMap(GMaxRHIFeatureLevel)), Parameters,
 					FIntVector(FMath::DivideAndRoundUp(FMath::Min(Batch, Count - Offset), 64u), 1, 1));
 			}
@@ -604,6 +735,7 @@ void FGaussianSplatResource::InitRHI(FRHICommandListBase& RHICmdList)
 				FRHITransitionInfo(CellsUAV, ERHIAccess::UAVCompute, ERHIAccess::SRVMask),
 				FRHITransitionInfo(FieldUAV, ERHIAccess::UAVCompute, ERHIAccess::SRVMask),
 				FRHITransitionInfo(CurvatureUAV, ERHIAccess::UAVCompute, ERHIAccess::SRVMask),
+				FRHITransitionInfo(EmissionUAV, ERHIAccess::UAVCompute, ERHIAccess::SRVMask),
 			});
 		}
 
@@ -632,6 +764,39 @@ void FGaussianSplatResource::InitRHI(FRHICommandListBase& RHICmdList)
 			FComputeShaderUtils::Dispatch(Immediate, Shader, Parameters, FIntVector(FMath::DivideAndRoundUp(FMath::Min(Batch, Count - Offset), 64u), 1, 1));
 		}
 
+		// athenea: an .athz's layer K (PackedStreams 9-11: the splats'
+		// influences and gradients in the scratch, and how many splats).
+		if (SplatData.bSkinFromDecode && SplatData.PackedFormat == 6 && S.Num() > 11 && S[9] != 0u && ScratchUAV.IsValid())
+		{
+			const uint32 Splats = S[11];
+			FUnorderedAccessViewRHIRef InfluencesUAV, GradientsUAV;
+			SkinInfluencesBuffer = CreateDecoded(sizeof(uint32), Splats * 4u, TEXT("GaussianSplatsSkinInfluences"), InfluencesUAV);
+			SkinGradientsBuffer = CreateDecoded(sizeof(uint32), S[10] != 0u ? Splats * 3u : 1u, TEXT("GaussianSplatsSkinGradients"), GradientsUAV);
+			Immediate.Transition(FRHITransitionInfo(ScratchUAV, ERHIAccess::UAVCompute, ERHIAccess::UAVCompute));
+			for (uint32 First = 0; First < Splats; First += Batch)
+			{
+				FGSAthzSkinCS::FParameters SkinParameters;
+				SkinParameters.Offset = First;
+				SkinParameters.Count = Splats;
+				SkinParameters.InfluenceAt = S[9];
+				SkinParameters.GradientAt = S[10];
+				SkinParameters.Scratch = ScratchUAV;
+				SkinParameters.OutInfluences = InfluencesUAV;
+				SkinParameters.OutGradients = GradientsUAV;
+				FComputeShaderUtils::Dispatch(Immediate, TShaderMapRef<FGSAthzSkinCS>(GetGlobalShaderMap(GMaxRHIFeatureLevel)), SkinParameters,
+					FIntVector(FMath::DivideAndRoundUp(FMath::Min(Batch, Splats - First), 64u), 1, 1));
+			}
+			Immediate.Transition({ FRHITransitionInfo(InfluencesUAV, ERHIAccess::UAVCompute, ERHIAccess::SRVMask),
+				FRHITransitionInfo(GradientsUAV, ERHIAccess::UAVCompute, ERHIAccess::SRVMask) });
+		}
+
+		if (SplatData.IsSkinned() && !bPackedResident)
+		{
+			// athenea: a skinned .athc's decoded buffers are what its pose is written into.
+			SkinPositionsUAV = PositionsUAV;
+			SkinScalesUAV = ScalesUAV;
+			SkinOrientationsUAV = OrientationsUAV;
+		}
 		Immediate.Transition({
 			FRHITransitionInfo(PositionsUAV, ERHIAccess::UAVCompute, ERHIAccess::SRVMask),
 			FRHITransitionInfo(ScalesUAV, ERHIAccess::UAVCompute, ERHIAccess::SRVMask),
@@ -642,9 +807,19 @@ void FGaussianSplatResource::InitRHI(FRHICommandListBase& RHICmdList)
 	}
 	else
 	{
-		PositionsBuffer = CreateBuffer(SplatData.Positions, TEXT("GaussianSplatsPositions"));
-		ScalesBuffer = CreateBuffer(SplatData.Scales, TEXT("GaussianSplatsScales"));
-		OrientationsBuffer = CreateBuffer(SplatData.Orientations, TEXT("GaussianSplatsOrientations"));
+		// athenea: a skinned cloud's buffers are written each frame (GSSkin.usf).
+		if (SplatData.IsSkinned())
+		{
+			PositionsBuffer = CreateWritable(SplatData.Positions, TEXT("GaussianSplatsPositions"), SkinPositionsUAV);
+			ScalesBuffer = CreateWritable(SplatData.Scales, TEXT("GaussianSplatsScales"), SkinScalesUAV);
+			OrientationsBuffer = CreateWritable(SplatData.Orientations, TEXT("GaussianSplatsOrientations"), SkinOrientationsUAV);
+		}
+		else
+		{
+			PositionsBuffer = CreateBuffer(SplatData.Positions, TEXT("GaussianSplatsPositions"));
+			ScalesBuffer = CreateBuffer(SplatData.Scales, TEXT("GaussianSplatsScales"));
+			OrientationsBuffer = CreateBuffer(SplatData.Orientations, TEXT("GaussianSplatsOrientations"));
+		}
 		SHAndOpacitiesBuffer = CreateBuffer(SplatData.ZeroOrderHarmonicsCoefficientsAndOpacities, TEXT("GaussianSplatsSHAndOpacities"));
 		// The rest coefficients, uploaded as floats and packed into halves on
 		// the device (GSPackSHCS), as the decoders write them.
@@ -693,6 +868,74 @@ void FGaussianSplatResource::InitRHI(FRHICommandListBase& RHICmdList)
 	// Uniform buffers do not allow null SRVs, has to point to a valid resource
 	NormalsBuffer = CreateBuffer(SplatData.Normals, TEXT("GaussianSplatsNormals"), SplatData.UseNormals());
 	MetallicRoughnessBuffer = CreateBuffer(SplatData.MetallicRoughness, TEXT("GaussianSplatMetallicRoughness"), SplatData.UseMetallicRoughness());
+	// athenea: A SKINNED CLOUD: its bind pose a copy of the buffers as made
+	// (USD) or decoded (.athc), its influences, gradients and parts' fields.
+	bSkinned = SplatData.IsSkinned() && SkinPositionsUAV.IsValid()
+		&& (SplatData.SkinInfluences.Num() == int32(SplatData.SplatCount * SplatData.SkinPerSplat)
+			|| (SplatData.bSkinFromDecode && SkinInfluencesBuffer.SRV.IsValid()));
+	if (bSkinned)
+	{
+		auto Copy = [&](const FBufferResources& From, const TCHAR* DebugName)
+		{
+			const uint32 Size = From.Buffer->GetSize(), Stride = From.Buffer->GetStride();
+			const FRHIBufferCreateDesc CreateDesc =
+				FRHIBufferCreateDesc::CreateStructured(DebugName, Size, Stride)
+				.AddUsage(EBufferUsageFlags::ShaderResource)
+				.SetInitialState(ERHIAccess::CopyDest);
+			FBufferRHIRef Buffer = RHICmdList.CreateBuffer(CreateDesc);
+			FRHICommandListImmediate& Immediate = FRHICommandListImmediate::Get();
+			Immediate.Transition(FRHITransitionInfo(From.Buffer, ERHIAccess::SRVMask, ERHIAccess::CopySrc));
+			Immediate.CopyBufferRegion(Buffer, 0, From.Buffer, 0, Size);
+			Immediate.Transition({ FRHITransitionInfo(From.Buffer, ERHIAccess::CopySrc, ERHIAccess::SRVMask),
+				FRHITransitionInfo(Buffer, ERHIAccess::CopyDest, ERHIAccess::SRVMask) });
+			return FBufferResources{ Buffer, RHICmdList.CreateShaderResourceView(Buffer,
+				FRHIViewDesc::CreateBufferSRV().SetType(FRHIViewDesc::EBufferType::Structured).SetStride(Stride)) };
+		};
+		SkinRestPositionsBuffer = Copy(PositionsBuffer, TEXT("GaussianSplatsSkinRestPositions"));
+		SkinRestRotationsBuffer = Copy(OrientationsBuffer, TEXT("GaussianSplatsSkinRestRotations"));
+		SkinRestScalesBuffer = Copy(ScalesBuffer, TEXT("GaussianSplatsSkinRestScales"));
+		if (!SplatData.bSkinFromDecode)
+		{
+			SkinInfluencesBuffer = CreateBuffer(SplatData.SkinInfluences, TEXT("GaussianSplatsSkinInfluences"));
+			SkinGradientsBuffer = CreateBuffer(SplatData.SkinGradients, TEXT("GaussianSplatsSkinGradients"), !SplatData.SkinGradients.IsEmpty());
+		}
+		SkinShown = -1.0f;
+		SkinSunShown = FVector4f(0, 0, 0, -1);
+		// The parts' baked visibility, and a factor pair a gaussian (1 until posed).
+		VisParts = SplatData.VisibilityParts.Num() % 12 == 0 && SplatData.VisibilityPartOf.Num() == int32(SplatData.SplatCount)
+			? uint32(SplatData.VisibilityParts.Num() / 12) : 0u;
+		TArray<FVector4f> PartRows;
+		for (uint32 k = 0; k < VisParts; ++k)
+		{
+			const float* P = &SplatData.VisibilityParts[k * 12];
+			PartRows.Add(FVector4f(P[0], P[1], P[2], P[3]));
+			PartRows.Add(FVector4f(P[4], P[5], P[6], P[7]));
+			PartRows.Add(FVector4f(P[8], P[9], P[10], P[11]));
+		}
+		VisPartsBuffer = CreateBuffer(PartRows, TEXT("GaussianSplatsVisParts"), VisParts > 0);
+		VisPartOfBuffer = CreateBuffer(SplatData.VisibilityPartOf, TEXT("GaussianSplatsVisPartOf"), VisParts > 0);
+		VisTexelsBuffer = CreateBuffer(SplatData.VisibilityTexels, TEXT("GaussianSplatsVisTexels"), VisParts > 0);
+		VisAmbientBuffer = CreateBuffer(SplatData.VisibilityAmbient, TEXT("GaussianSplatsVisAmbient"), VisParts > 0);
+		TArray<FVector2f> Ones;
+		Ones.Init(FVector2f(1.0f, 1.0f), VisParts > 0 ? int32(SplatData.SplatCount) : 1);
+		VisibilityBuffer = CreateWritable(Ones, TEXT("GaussianSplatsVisibility"), VisibilityUAV);
+	}
+
+	const uint32 LightLayerCount = uint32(FMath::Min(SplatData.LightLayerNames.Num(), GSMaxLightLayers));
+	const bool bLightLayers = LightLayerCount > 0 && SplatData.LightLayers.Num() >= int32(SplatData.SplatCount * LightLayerCount);
+	LightLayersBuffer = CreateBuffer(SplatData.LightLayers, TEXT("GaussianSplatLightLayers"), bLightLayers);
+	const bool bCrypto = SplatData.CryptoIds.Num() == int32(SplatData.SplatCount);
+	CryptoBuffer = CreateBuffer(SplatData.CryptoIds, TEXT("GaussianSplatCryptoIds"), bCrypto);
+	const bool bHardness = SplatData.Hardness.Num() == int32(SplatData.SplatCount);
+	HardnessBuffer = CreateBuffer(SplatData.Hardness, TEXT("GaussianSplatHardness"), bHardness);
+	// A float cloud says whether it holds a surfel by its scales; a packed one
+	// by its merged levels (HasSurfels).
+	bSurfels = bHardness;
+	for (int32 i = 0; !bSurfels && i < SplatData.Scales.Num(); i++)
+	{
+		const FVector3f& S = SplatData.Scales[i];
+		bSurfels = FMath::Min3(S.X, S.Y, S.Z) == 0.0f;
+	}
 	const bool bDeviceTransfer = SplatData.bPacked && (SplatData.PackedFormat == 5 || SplatData.PackedFormat == 6) && SplatData.bHasTransfer;
 	if (bDeviceTransfer)
 	{
@@ -702,6 +945,7 @@ void FGaussianSplatResource::InitRHI(FRHICommandListBase& RHICmdList)
 		TransferCellsBuffer = PackedCells;
 		TransferFieldBuffer = PackedField;
 		CurvatureBuffer = PackedCurvature;
+		EmissionBuffer = PackedEmission;
 	}
 	else
 	{
@@ -711,6 +955,7 @@ void FGaussianSplatResource::InitRHI(FRHICommandListBase& RHICmdList)
 		TransferCellsBuffer = CreateBuffer(SplatData.TransferCells, TEXT("GaussianSplatTransferCells"), SplatData.CellWords > 0);
 		TransferFieldBuffer = CreateBuffer(SplatData.TransferField, TEXT("GaussianSplatTransferField"), !SplatData.TransferField.IsEmpty());
 		CurvatureBuffer = CreateBuffer(SplatData.TransferCurvature, TEXT("GaussianSplatCurvature"), !SplatData.TransferCurvature.IsEmpty());
+		EmissionBuffer = CreateBuffer(SplatData.Emission, TEXT("GaussianSplatEmission"), !SplatData.Emission.IsEmpty());
 	}
 
 	if (LodWordsBuffer.SRV.IsValid())
@@ -795,6 +1040,27 @@ void FGaussianSplatResource::InitRHI(FRHICommandListBase& RHICmdList)
 	Parameters.TransferField = TransferFieldBuffer.SRV;
 	Parameters.HasCurvature = (SplatData.bHasTransfer && (!SplatData.TransferCurvature.IsEmpty() || (bDeviceTransfer && SplatData.bPackedCurvature))) ? 1u : 0u;
 	Parameters.TransferCurvature = CurvatureBuffer.SRV;
+	Parameters.HasEmission = (SplatData.bHasTransfer && (!SplatData.Emission.IsEmpty() || (bDeviceTransfer && SplatData.bPackedEmission))) ? 1u : 0u;
+	Parameters.Emission = EmissionBuffer.SRV;
+	Parameters.HasHardness = SplatData.Hardness.Num() == int32(SplatData.SplatCount) ? 1u : 0u;
+	Parameters.Hardness = HardnessBuffer.SRV;
+	Parameters.TransferZonal = SplatData.bHasTransfer && SplatData.bTransferZonal ? 1u : 0u;
+	Parameters.Catcher = SplatData.bHasTransfer && SplatData.bShadowCatcher ? 1u : 0u;
+	Parameters.LightCatcher = SplatData.bLightCatcher && SplatData.LightLayerNames.Num() > 0 ? 1u : 0u;
+	Parameters.HasCrypto = SplatData.CryptoIds.Num() == int32(SplatData.SplatCount) ? 1u : 0u;
+	Parameters.ShadowCut = CVarGaussiansAtheneaTranslucentShadows.GetValueOnAnyThread() != 0 ? 1.0f / 255.0f : 0.9f;
+	Parameters.ShadowClip = CVarGaussiansAtheneaShadowClip.GetValueOnAnyThread();
+	Parameters.ShadowPush = FMath::Max(CVarGaussiansAtheneaShadowPush.GetValueOnAnyThread(), 0.0f);
+	Parameters.CryptoIds = CryptoBuffer.SRV;
+	Parameters.HasVisibility = bSkinned && VisParts > 0 ? 1u : 0u;
+	if (!VisibilityBuffer.SRV.IsValid())
+	{
+		VisibilityBuffer = CreateBuffer(TArray<FVector2f>({ FVector2f(1.0f, 1.0f) }), TEXT("GaussianSplatsVisibilityNone"));
+	}
+	Parameters.Visibility = VisibilityBuffer.SRV;
+	Parameters.LightLayerCount = bLightLayers ? LightLayerCount : 0u;
+	Parameters.LightLayerSplats = bLightLayers ? SplatData.SplatCount : 0u;
+	Parameters.LightLayers = LightLayersBuffer.SRV;
 	Parameters.FileUnitsToCm = SplatData.FileUnitsToCm;
 	Parameters.GlassIor = SplatData.GlassIor;
 	Parameters.FileAxisX = SplatData.FileAxisX;
@@ -856,6 +1122,7 @@ void FGaussianSplatResource::InitRHI(FRHICommandListBase& RHICmdList)
 	Parameters.VolumeOn = bVolume ? 1u : 0u;
 	Parameters.VolumeDensityScale = SplatData.VolumeDensityScale;
 	Parameters.VolumeEmissionScale = SplatData.VolumeEmissionScale;
+	Parameters.VolumeAnisotropy = SplatData.VolumeAnisotropy;
 	Parameters.VolumeTemperatureScale = SplatData.VolumeTemperatureScale;
 	Parameters.VolumeTemperatureOffset = SplatData.VolumeTemperatureOffset;
 	Parameters.VolumeAlbedo = SplatData.VolumeAlbedo;
@@ -876,6 +1143,27 @@ void FGaussianSplatResource::ReleaseRHI()
 	PackedField.SafeRelease();
 	PackedCurvature.SafeRelease();
 	CurvatureBuffer.SafeRelease();
+	PackedEmission.SafeRelease();
+	EmissionBuffer.SafeRelease();
+	HardnessBuffer.SafeRelease();
+	LightLayersBuffer.SafeRelease();
+	CryptoBuffer.SafeRelease();
+	SkinRestPositionsBuffer.SafeRelease();
+	SkinRestRotationsBuffer.SafeRelease();
+	SkinRestScalesBuffer.SafeRelease();
+	SkinInfluencesBuffer.SafeRelease();
+	SkinGradientsBuffer.SafeRelease();
+	SkinPositionsUAV.SafeRelease();
+	SkinScalesUAV.SafeRelease();
+	SkinOrientationsUAV.SafeRelease();
+	VisPartsBuffer.SafeRelease();
+	VisPartOfBuffer.SafeRelease();
+	VisTexelsBuffer.SafeRelease();
+	VisAmbientBuffer.SafeRelease();
+	VisibilityBuffer.SafeRelease();
+	VisibilityUAV.SafeRelease();
+	VisParts = 0;
+	bSkinned = false;
 	LodWordsBuffer.SafeRelease();
 	LodGroupStartsBuffer.SafeRelease();
 	PackedPositionsBuffer.SafeRelease();
@@ -904,4 +1192,120 @@ void FGaussianSplatResource::UpdateSplats(FRHICommandListBase& RHICmdList, FGaus
 
 	SplatData = MoveTemp(InSplatData);
 	UpdateRHI(RHICmdList);
+}
+
+void FGaussianSplatResource::Skin_RenderThread(FRDGBuilder& GraphBuilder, float Seconds, const FMatrix& LocalToWorld, const FVector4f& SunToLight)
+{
+	if (!bSkinned || !SkinPositionsUAV.IsValid())
+	{
+		return;
+	}
+	const TArray<float>& Times = SplatData.SkinTimes;
+	const float At = FMath::Clamp(Seconds, Times[0], Times.Last());
+	// The sun in the file's frame: the world's way to it, into the component's
+	// space and onto the file's axes.
+	FVector4f Sun(0, 0, 0, 0);
+	if (SunToLight.W > 0.0f)
+	{
+		const FVector Local = LocalToWorld.InverseTransformVector(FVector(SunToLight.X, SunToLight.Y, SunToLight.Z)).GetSafeNormal();
+		const FVector3f L(Local);
+		Sun = FVector4f(FVector3f(L | SplatData.FileAxisX, L | SplatData.FileAxisY, L | SplatData.FileAxisZ).GetSafeNormal(), 1.0f);
+	}
+	if (At == SkinShown && (VisParts == 0 || Sun.Equals(SkinSunShown, 1.0e-4f)))
+	{
+		return;
+	}
+	SkinShown = At;
+	SkinSunShown = Sun;
+	// The two sampled poses around the instant, blended row by row.
+	int32 Next = 0;
+	while (Next < Times.Num() - 1 && Times[Next] < At)
+	{
+		++Next;
+	}
+	const int32 Prev = FMath::Max(Next - 1, 0);
+	const float Span = Times[Next] - Times[Prev];
+	const float T = Span > 0.0f ? FMath::Clamp((At - Times[Prev]) / Span, 0.0f, 1.0f) : 0.0f;
+	const int32 Rows = int32(SplatData.SkinJoints) * 3;
+	TArray<FVector4f> Xforms;
+	Xforms.SetNumUninitialized(Rows);
+	for (int32 r = 0; r < Rows; ++r)
+	{
+		const FVector4f& A = SplatData.SkinXforms[Prev * Rows + r];
+		Xforms[r] = A + (SplatData.SkinXforms[Next * Rows + r] - A) * T;
+	}
+	FRDGBufferRef XformsBuffer = CreateStructuredBuffer(GraphBuilder, TEXT("GaussianSplatsSkinXforms"), Xforms);
+	// Each part's posed-to-rest map: the inverse of its joint's C = X G
+	// (athenea's visPartFrames).
+	TArray<FVector4f> Frames;
+	for (uint32 k = 0; k < VisParts; ++k)
+	{
+		const uint32 Joint = FMath::Min(uint32(FMath::Max(SplatData.VisibilityParts[k * 12 + 3], 0.0f)), SplatData.SkinJoints - 1u);
+		const FVector4f& R0 = Xforms[Joint * 3], & R1 = Xforms[Joint * 3 + 1], & R2 = Xforms[Joint * 3 + 2];
+		FMatrix44f M = FMatrix44f::Identity;
+		for (int32 c = 0; c < 4; ++c)
+		{
+			M.M[c][0] = R0[c];
+			M.M[c][1] = R1[c];
+			M.M[c][2] = R2[c];
+		}
+		// M is the transpose (row vectors): its inverse, transposed back.
+		const FMatrix44f Inv = M.Inverse();
+		Frames.Add(FVector4f(Inv.M[0][0], Inv.M[1][0], Inv.M[2][0], Inv.M[3][0]));
+		Frames.Add(FVector4f(Inv.M[0][1], Inv.M[1][1], Inv.M[2][1], Inv.M[3][1]));
+		Frames.Add(FVector4f(Inv.M[0][2], Inv.M[1][2], Inv.M[2][2], Inv.M[3][2]));
+	}
+	if (Frames.IsEmpty())
+	{
+		Frames.Add(FVector4f(0, 0, 0, 0));
+	}
+	FRDGBufferRef FramesBuffer = CreateStructuredBuffer(GraphBuilder, TEXT("GaussianSplatsVisFrames"), Frames);
+
+	FGSSkinCS::FParameters* Parameters = GraphBuilder.AllocParameters<FGSSkinCS::FParameters>();
+	// An .athz's layer K poses its splats, the first elements; its merged
+	// groups after them are not drawn while it is skinned.
+	const bool bDecoded = SplatData.bSkinFromDecode && SplatData.PackedStreams.Num() > 11;
+	Parameters->Count = bDecoded ? SplatData.PackedStreams[11] : SplatData.SplatCount;
+	Parameters->PerSplat = SplatData.SkinPerSplat;
+	Parameters->GradientsIn = bDecoded ? (SplatData.PackedStreams[10] != 0u ? 1u : 0u) : (SplatData.SkinGradients.IsEmpty() ? 0u : 1u);
+	Parameters->UnitsToCm = SplatData.FileUnitsToCm;
+	Parameters->FileAxisX = SplatData.FileAxisX;
+	Parameters->FileAxisY = SplatData.FileAxisY;
+	Parameters->FileAxisZ = SplatData.FileAxisZ;
+	Parameters->RestPositions = SkinRestPositionsBuffer.SRV;
+	Parameters->RestRotations = SkinRestRotationsBuffer.SRV;
+	Parameters->RestScales = SkinRestScalesBuffer.SRV;
+	Parameters->Influences = SkinInfluencesBuffer.SRV;
+	Parameters->Gradients = SkinGradientsBuffer.SRV;
+	Parameters->SkinXforms = GraphBuilder.CreateSRV(XformsBuffer);
+	Parameters->OutPositions = SkinPositionsUAV;
+	Parameters->OutScales = SkinScalesUAV;
+	Parameters->OutOrientations = SkinOrientationsUAV;
+	Parameters->VisibilityParts = VisParts;
+	Parameters->SunDirection = Sun;
+	Parameters->Parts = VisPartsBuffer.SRV;
+	Parameters->PartOf = VisPartOfBuffer.SRV;
+	Parameters->Texels = VisTexelsBuffer.SRV;
+	Parameters->Ambient = VisAmbientBuffer.SRV;
+	Parameters->PartFrames = GraphBuilder.CreateSRV(FramesBuffer);
+	Parameters->OutVisibility = VisibilityUAV;
+	FUnorderedAccessViewRHIRef Uavs[4] = { SkinPositionsUAV, SkinScalesUAV, SkinOrientationsUAV, VisibilityUAV };
+	GraphBuilder.AddPass(RDG_EVENT_NAME("Gaussians: skin %u", SplatData.SplatCount), Parameters, ERDGPassFlags::Compute | ERDGPassFlags::NeverCull,
+		[Parameters, Uavs](FRHIComputeCommandList& RHICmdList)
+		{
+			RHICmdList.Transition({
+				FRHITransitionInfo(Uavs[0], ERHIAccess::SRVMask, ERHIAccess::UAVCompute),
+				FRHITransitionInfo(Uavs[1], ERHIAccess::SRVMask, ERHIAccess::UAVCompute),
+				FRHITransitionInfo(Uavs[2], ERHIAccess::SRVMask, ERHIAccess::UAVCompute),
+				FRHITransitionInfo(Uavs[3], ERHIAccess::SRVMask, ERHIAccess::UAVCompute),
+			});
+			FComputeShaderUtils::Dispatch(RHICmdList, TShaderMapRef<FGSSkinCS>(GetGlobalShaderMap(GMaxRHIFeatureLevel)), *Parameters,
+				FIntVector(FMath::DivideAndRoundUp(Parameters->Count, 64u), 1, 1));
+			RHICmdList.Transition({
+				FRHITransitionInfo(Uavs[0], ERHIAccess::UAVCompute, ERHIAccess::SRVMask),
+				FRHITransitionInfo(Uavs[1], ERHIAccess::UAVCompute, ERHIAccess::SRVMask),
+				FRHITransitionInfo(Uavs[2], ERHIAccess::UAVCompute, ERHIAccess::SRVMask),
+				FRHITransitionInfo(Uavs[3], ERHIAccess::UAVCompute, ERHIAccess::SRVMask),
+			});
+		});
 }

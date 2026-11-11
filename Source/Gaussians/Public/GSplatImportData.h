@@ -23,7 +23,7 @@ enum class EGSplatSwizzleAxis : uint8
 /**
  * Cached with the GSplat asset so if it is reimported, the import settings can be recovered
  */
-UCLASS()
+UCLASS(BlueprintType)
 class UGSplatImportData : public UAssetImportData
 {
 	GENERATED_BODY()
@@ -42,20 +42,26 @@ public:
 	UPROPERTY()
 	bool bHasMetallicRoughness = false;
 
-	UPROPERTY()
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Import")
 	bool bImportNormals = false;
-	UPROPERTY()
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Import")
 	bool bImportHighOrderSH = true;
-	UPROPERTY()
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Import")
 	bool bImportMetallicRoughness = false;
 
-	UPROPERTY()
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Import")
 	bool bPopulateMRWithDefault = false;
 
-	UPROPERTY()
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Import")
 	float MetallicDefaultValue = 0.0f;
-	UPROPERTY()
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Import")
 	float RoughnessDefaultValue = 1.0f;
+
+	// athenea: an .athc or .athz written from a right-handed z-up stage (the
+	// files do not record their up axis): mapped to (X, -Y, Z) instead of the
+	// y-up (X, Z, Y).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Import")
+	bool bFileZUp = false;
 
 	// Transformation on import
 	UPROPERTY()

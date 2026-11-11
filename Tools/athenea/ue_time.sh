@@ -35,7 +35,10 @@ for i in $(seq 1 120); do
   last=${size:-0}
 done
 ssh $HOST 'nvidia-smi --query-gpu=clocks.sm,temperature.gpu --format=csv,noheader' | tr -d '\r' | sed 's/^/end: /'
-ssh $HOST 'taskkill /im UnrealEditor.exe /f' >/dev/null 2>&1 || true
+# Only the -game runs of this project (stop_game.ps1, beside the test
+# project): an editor open on the machine is left alone.
+PROJNAME=$(basename "${PROJECT//\\//}" .uproject)
+ssh $HOST "powershell -ExecutionPolicy Bypass -File %USERPROFILE%\\athenea-unreal\\stop_game.ps1 $PROJNAME" >/dev/null 2>&1 || true
 wait || true
 
 scp -q "$HOST:AppData/Local/UnrealEngine/5.8/Saved/Profiling/CSV/$f" "$OUT"
